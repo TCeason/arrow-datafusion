@@ -27,6 +27,7 @@ use substrait::proto::Plan;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 
+#[allow(clippy::suspicious_open_options)]
 pub async fn serialize(sql: &str, ctx: &SessionContext, path: &str) -> Result<()> {
     let protobuf_out = serialize_bytes(sql, ctx).await;
     let mut file = OpenOptions::new().create(true).write(true).open(path)?;
@@ -37,7 +38,7 @@ pub async fn serialize(sql: &str, ctx: &SessionContext, path: &str) -> Result<()
 pub async fn serialize_bytes(sql: &str, ctx: &SessionContext) -> Result<Vec<u8>> {
     let df = ctx.sql(sql).await?;
     let plan = df.into_optimized_plan()?;
-    let proto = producer::to_substrait_plan(&plan, ctx)?;
+    let proto = producer::to_substrait_plan(&plan, &ctx.state())?;
 
     let mut protobuf_out = Vec::<u8>::new();
     proto.encode(&mut protobuf_out).map_err(|e| {

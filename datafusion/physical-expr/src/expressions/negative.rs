@@ -18,11 +18,9 @@
 //! Negation (-) expression
 
 use std::any::Any;
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use std::sync::Arc;
 
-use crate::physical_expr::down_cast_any_ref;
-use crate::sort_properties::SortProperties;
 use crate::PhysicalExpr;
 
 use arrow::{
@@ -30,18 +28,32 @@ use arrow::{
     datatypes::{DataType, Schema},
     record_batch::RecordBatch,
 };
-use datafusion_common::{plan_err, DataFusionError, Result};
+use datafusion_common::{plan_err, Result};
 use datafusion_expr::interval_arithmetic::Interval;
+use datafusion_expr::sort_properties::ExprProperties;
 use datafusion_expr::{
     type_coercion::{is_interval, is_null, is_signed_numeric, is_timestamp},
     ColumnarValue,
 };
 
 /// Negative expression
-#[derive(Debug, Hash)]
+#[derive(Debug, Eq)]
 pub struct NegativeExpr {
     /// Input expression
     arg: Arc<dyn PhysicalExpr>,
+}
+
+// Manually derive PartialEq and Hash to work around https://github.com/rust-lang/rust/issues/78808
+impl PartialEq for NegativeExpr {
+    fn eq(&self, other: &Self) -> bool {
+        self.arg.eq(&other.arg)
+    }
+}
+
+impl Hash for NegativeExpr {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.arg.hash(state);
+    }
 }
 
 impl NegativeExpr {
@@ -89,20 +101,15 @@ impl PhysicalExpr for NegativeExpr {
         }
     }
 
-    fn children(&self) -> Vec<Arc<dyn PhysicalExpr>> {
-        vec![self.arg.clone()]
+    fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+        vec![&self.arg]
     }
 
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn PhysicalExpr>>,
     ) -> Result<Arc<dyn PhysicalExpr>> {
-        Ok(Arc::new(NegativeExpr::new(children[0].clone())))
-    }
-
-    fn dyn_hash(&self, state: &mut dyn Hasher) {
-        let mut s = state;
-        self.hash(&mut s);
+        Ok(Arc::new(NegativeExpr::new(Arc::clone(&children[0]))))
     }
 
     /// Given the child interval of a NegativeExpr, it calculates the NegativeExpr's interval.
@@ -134,17 +141,12 @@ impl PhysicalExpr for NegativeExpr {
     }
 
     /// The ordering of a [`NegativeExpr`] is simply the reverse of its child.
-    fn get_ordering(&self, children: &[SortProperties]) -> SortProperties {
-        -children[0]
-    }
-}
-
-impl PartialEq<dyn Any> for NegativeExpr {
-    fn eq(&self, other: &dyn Any) -> bool {
-        down_cast_any_ref(other)
-            .downcast_ref::<Self>()
-            .map(|x| self.arg.eq(&x.arg))
-            .unwrap_or(false)
+    fn get_properties(&self, children: &[ExprProperties]) -> Result<ExprProperties> {
+        Ok(ExprProperties {
+            sort_properties: -children[0].sort_properties,
+            range: children[0].range.clone().arithmetic_negate()?,
+            preserves_lex_ordering: false,
+        })
     }
 }
 
@@ -179,7 +181,7 @@ mod tests {
     use arrow::datatypes::*;
     use arrow_schema::DataType::{Float32, Float64, Int16, Int32, Int64, Int8};
     use datafusion_common::cast::as_primitive_array;
-    use datafusion_common::Result;
+    use datafusion_common::DataFusionError;
 
     use paste::paste;
 
@@ -221,9 +223,7 @@ mod tests {
 
     #[test]
     fn test_evaluate_bounds() -> Result<()> {
-        let negative_expr = NegativeExpr {
-            arg: Arc::new(Column::new("a", 0)),
-        };
+        let negative_expr = NegativeExpr::new(Arc::new(Column::new("a", 0)));
         let child_interval = Interval::make(Some(-2), Some(1))?;
         let negative_expr_interval = Interval::make(Some(-1), Some(2))?;
         assert_eq!(
@@ -235,9 +235,7 @@ mod tests {
 
     #[test]
     fn test_propagate_constraints() -> Result<()> {
-        let negative_expr = NegativeExpr {
-            arg: Arc::new(Column::new("a", 0)),
-        };
+        let negative_expr = NegativeExpr::new(Arc::new(Column::new("a", 0)));
         let original_child_interval = Interval::make(Some(-2), Some(3))?;
         let negative_expr_interval = Interval::make(Some(0), Some(4))?;
         let after_propagation = Some(vec![Interval::make(Some(-2), Some(0))?]);
@@ -254,7 +252,7 @@ mod tests {
     #[test]
     fn test_negation_valid_types() -> Result<()> {
         let negatable_types = [
-            DataType::Int8,
+            Int8,
             DataType::Timestamp(TimeUnit::Second, None),
             DataType::Interval(IntervalUnit::YearMonth),
         ];

@@ -1,0 +1,197 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+
+#   http://www.apache.org/licenses/LICENSE-2.0
+
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Test push down filter
+
+statement ok
+set datafusion.explain.logical_plan_only = true;
+
+statement ok
+CREATE TABLE IF NOT EXISTS v AS VALUES(1,[1,2,3]),(2,[3,4,5]);
+
+query I
+select uc2 from (select unnest(column2) as uc2, column1 from v) where column1 = 2;
+----
+3
+4
+5
+
+# test push down filter for unnest with filter on non-unnest column
+# filter plan is pushed down into projection plan
+query TT
+explain select uc2 from (select unnest(column2) as uc2, column1 from v) where column1 = 2;
+----
+logical_plan
+01)Projection: __unnest_placeholder(v.column2,depth=1) AS uc2
+02)--Unnest: lists[__unnest_placeholder(v.column2)|depth=1] structs[]
+03)----Projection: v.column2 AS __unnest_placeholder(v.column2), v.column1
+04)------Filter: v.column1 = Int64(2)
+05)--------TableScan: v projection=[column1, column2]
+
+query I
+select uc2 from (select unnest(column2) as uc2, column1 from v) where uc2 > 3;
+----
+4
+5
+
+# test push down filter for unnest with filter on unnest column
+query TT
+explain select uc2 from (select unnest(column2) as uc2, column1 from v) where uc2 > 3;
+----
+logical_plan
+01)Projection: __unnest_placeholder(v.column2,depth=1) AS uc2
+02)--Filter: __unnest_placeholder(v.column2,depth=1) > Int64(3)
+03)----Projection: __unnest_placeholder(v.column2,depth=1)
+04)------Unnest: lists[__unnest_placeholder(v.column2)|depth=1] structs[]
+05)--------Projection: v.column2 AS __unnest_placeholder(v.column2), v.column1
+06)----------TableScan: v projection=[column1, column2]
+
+query II
+select uc2, column1 from  (select unnest(column2) as uc2, column1 from v) where uc2 > 3 AND column1 = 2;
+----
+4 2
+5 2
+
+# Could push the filter (column1 = 2) down below unnest
+query TT
+explain select uc2, column1 from  (select unnest(column2) as uc2, column1 from v) where uc2 > 3 AND column1 = 2;
+----
+logical_plan
+01)Projection: __unnest_placeholder(v.column2,depth=1) AS uc2, v.column1
+02)--Filter: __unnest_placeholder(v.column2,depth=1) > Int64(3)
+03)----Unnest: lists[__unnest_placeholder(v.column2)|depth=1] structs[]
+04)------Projection: v.column2 AS __unnest_placeholder(v.column2), v.column1
+05)--------Filter: v.column1 = Int64(2)
+06)----------TableScan: v projection=[column1, column2]
+
+query II
+select uc2, column1 from  (select unnest(column2) as uc2, column1 from v) where uc2 > 3 OR column1 = 2;
+----
+3 2
+4 2
+5 2
+
+# only non-unnest filter in AND clause could be pushed down
+query TT
+explain select uc2, column1 from  (select unnest(column2) as uc2, column1 from v) where uc2 > 3 OR column1 = 2;
+----
+logical_plan
+01)Projection: __unnest_placeholder(v.column2,depth=1) AS uc2, v.column1
+02)--Filter: __unnest_placeholder(v.column2,depth=1) > Int64(3) OR v.column1 = Int64(2)
+03)----Unnest: lists[__unnest_placeholder(v.column2)|depth=1] structs[]
+04)------Projection: v.column2 AS __unnest_placeholder(v.column2), v.column1
+05)--------TableScan: v projection=[column1, column2]
+
+statement ok
+drop table v;
+
+# test with unnest struct, should not push down filter
+statement ok
+CREATE TABLE d AS VALUES(1,[named_struct('a', 1, 'b', 2)]),(2,[named_struct('a', 3, 'b', 4), named_struct('a', 5, 'b', 6)]);
+
+query I?
+select * from (select column1, unnest(column2) as o from d) where o['a'] = 1;
+----
+1 {a: 1, b: 2}
+
+query TT
+explain select * from (select column1, unnest(column2) as o from d) where o['a'] = 1;
+----
+logical_plan
+01)Projection: d.column1, __unnest_placeholder(d.column2,depth=1) AS o
+02)--Filter: get_field(__unnest_placeholder(d.column2,depth=1), Utf8("a")) = Int64(1)
+03)----Unnest: lists[__unnest_placeholder(d.column2)|depth=1] structs[]
+04)------Projection: d.column1, d.column2 AS __unnest_placeholder(d.column2)
+05)--------TableScan: d projection=[column1, column2]
+
+
+
+statement ok
+drop table d;
+
+
+# Test push down filter with limit for parquet
+statement ok
+set datafusion.execution.parquet.pushdown_filters = true;
+
+# this one is also required to make DF skip second file due to "sufficient" amount of rows
+statement ok
+set datafusion.execution.collect_statistics = true;
+
+# Create a table as a data source
+statement ok
+CREATE TABLE src_table (
+    part_key INT,
+    value INT
+) AS VALUES(1, 0), (1, 1), (1, 100), (2, 0), (2, 2), (2, 2), (2, 100), (3, 4), (3, 5), (3, 6);
+
+
+# There will be more than 2 records filtered from the table to check that `limit 1` actually applied.
+# Setup 3 files, i.e., as many as there are partitions:
+
+# File 1:
+query I
+COPY (SELECT * FROM src_table where part_key = 1)
+TO 'test_files/scratch/parquet/test_filter_with_limit/part-0.parquet'
+STORED AS PARQUET;
+----
+3
+
+# File 2:
+query I
+COPY (SELECT * FROM src_table where part_key = 2)
+TO 'test_files/scratch/parquet/test_filter_with_limit/part-1.parquet'
+STORED AS PARQUET;
+----
+4
+
+# File 3:
+query I
+COPY (SELECT * FROM src_table where part_key = 3)
+TO 'test_files/scratch/parquet/test_filter_with_limit/part-2.parquet'
+STORED AS PARQUET;
+----
+3
+
+statement ok
+CREATE EXTERNAL TABLE test_filter_with_limit
+(
+  part_key INT,
+  value INT
+)
+STORED AS PARQUET
+LOCATION 'test_files/scratch/parquet/test_filter_with_limit/';
+
+query TT
+explain select * from test_filter_with_limit where value = 2 limit 1;
+----
+logical_plan
+01)Limit: skip=0, fetch=1
+02)--TableScan: test_filter_with_limit projection=[part_key, value], full_filters=[test_filter_with_limit.value = Int32(2)], fetch=1
+
+query II
+select * from test_filter_with_limit where value = 2 limit 1;
+----
+2 2
+
+# Tear down test_filter_with_limit table:
+statement ok
+DROP TABLE test_filter_with_limit;
+
+# Tear down src_table table:
+statement ok
+DROP TABLE src_table;

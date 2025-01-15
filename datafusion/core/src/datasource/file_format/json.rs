@@ -18,21 +18,25 @@
 //! [`JsonFormat`]: Line delimited JSON [`FileFormat`] abstractions
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Debug;
 use std::io::BufReader;
 use std::sync::Arc;
 
-use super::write::orchestration::stateless_multipart_put;
-use super::{FileFormat, FileScanConfig};
+use super::write::orchestration::spawn_writer_tasks_and_join;
+use super::{
+    Decoder, DecoderDeserializer, FileFormat, FileFormatFactory, FileScanConfig,
+    DEFAULT_SCHEMA_INFER_MAX_RECORD,
+};
 use crate::datasource::file_format::file_compression_type::FileCompressionType;
+use crate::datasource::file_format::write::demux::DemuxedStreamReceiver;
 use crate::datasource::file_format::write::BatchSerializer;
-use crate::datasource::file_format::DEFAULT_SCHEMA_INFER_MAX_RECORD;
-use crate::datasource::physical_plan::FileGroupDisplay;
+use crate::datasource::physical_plan::{FileGroupDisplay, FileSink};
 use crate::datasource::physical_plan::{FileSinkConfig, NdJsonExec};
 use crate::error::Result;
 use crate::execution::context::SessionState;
-use crate::physical_plan::insert::{DataSink, FileSinkExec};
+use crate::physical_plan::insert::{DataSink, DataSinkExec};
 use crate::physical_plan::{
     DisplayAs, DisplayFormatType, SendableRecordBatchStream, Statistics,
 };
@@ -42,37 +46,113 @@ use arrow::datatypes::SchemaRef;
 use arrow::json;
 use arrow::json::reader::{infer_json_schema_from_iterator, ValueIter};
 use arrow_array::RecordBatch;
-use datafusion_common::{not_impl_err, DataFusionError, FileType};
+use arrow_schema::ArrowError;
+use datafusion_common::config::{ConfigField, ConfigFileType, JsonOptions};
+use datafusion_common::file_options::json_writer::JsonWriterOptions;
+use datafusion_common::{not_impl_err, GetExt, DEFAULT_JSON_EXTENSION};
+use datafusion_common_runtime::SpawnedTask;
 use datafusion_execution::TaskContext;
-use datafusion_physical_expr::{PhysicalExpr, PhysicalSortRequirement};
-use datafusion_physical_plan::metrics::MetricsSet;
+use datafusion_expr::dml::InsertOp;
+use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_plan::ExecutionPlan;
 
 use async_trait::async_trait;
 use bytes::{Buf, Bytes};
+use datafusion_physical_expr_common::sort_expr::LexRequirement;
 use object_store::{GetResultPayload, ObjectMeta, ObjectStore};
 
-/// New line delimited JSON `FileFormat` implementation.
-#[derive(Debug)]
-pub struct JsonFormat {
-    schema_infer_max_rec: Option<usize>,
-    file_compression_type: FileCompressionType,
+#[derive(Default)]
+/// Factory struct used to create [JsonFormat]
+pub struct JsonFormatFactory {
+    /// the options carried by format factory
+    pub options: Option<JsonOptions>,
 }
 
-impl Default for JsonFormat {
-    fn default() -> Self {
+impl JsonFormatFactory {
+    /// Creates an instance of [JsonFormatFactory]
+    pub fn new() -> Self {
+        Self { options: None }
+    }
+
+    /// Creates an instance of [JsonFormatFactory] with customized default options
+    pub fn new_with_options(options: JsonOptions) -> Self {
         Self {
-            schema_infer_max_rec: Some(DEFAULT_SCHEMA_INFER_MAX_RECORD),
-            file_compression_type: FileCompressionType::UNCOMPRESSED,
+            options: Some(options),
         }
     }
 }
 
+impl FileFormatFactory for JsonFormatFactory {
+    fn create(
+        &self,
+        state: &SessionState,
+        format_options: &HashMap<String, String>,
+    ) -> Result<Arc<dyn FileFormat>> {
+        let json_options = match &self.options {
+            None => {
+                let mut table_options = state.default_table_options();
+                table_options.set_config_format(ConfigFileType::JSON);
+                table_options.alter_with_string_hash_map(format_options)?;
+                table_options.json
+            }
+            Some(json_options) => {
+                let mut json_options = json_options.clone();
+                for (k, v) in format_options {
+                    json_options.set(k, v)?;
+                }
+                json_options
+            }
+        };
+
+        Ok(Arc::new(JsonFormat::default().with_options(json_options)))
+    }
+
+    fn default(&self) -> Arc<dyn FileFormat> {
+        Arc::new(JsonFormat::default())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+impl GetExt for JsonFormatFactory {
+    fn get_ext(&self) -> String {
+        // Removes the dot, i.e. ".parquet" -> "parquet"
+        DEFAULT_JSON_EXTENSION[1..].to_string()
+    }
+}
+
+impl Debug for JsonFormatFactory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("JsonFormatFactory")
+            .field("options", &self.options)
+            .finish()
+    }
+}
+
+/// New line delimited JSON `FileFormat` implementation.
+#[derive(Debug, Default)]
+pub struct JsonFormat {
+    options: JsonOptions,
+}
+
 impl JsonFormat {
+    /// Set JSON options
+    pub fn with_options(mut self, options: JsonOptions) -> Self {
+        self.options = options;
+        self
+    }
+
+    /// Retrieve JSON options
+    pub fn options(&self) -> &JsonOptions {
+        &self.options
+    }
+
     /// Set a limit in terms of records to scan to infer the schema
     /// - defaults to `DEFAULT_SCHEMA_INFER_MAX_RECORD`
-    pub fn with_schema_infer_max_rec(mut self, max_rec: Option<usize>) -> Self {
-        self.schema_infer_max_rec = max_rec;
+    pub fn with_schema_infer_max_rec(mut self, max_rec: usize) -> Self {
+        self.options.schema_infer_max_rec = Some(max_rec);
         self
     }
 
@@ -82,7 +162,7 @@ impl JsonFormat {
         mut self,
         file_compression_type: FileCompressionType,
     ) -> Self {
-        self.file_compression_type = file_compression_type;
+        self.options.compression = file_compression_type.into();
         self
     }
 }
@@ -93,6 +173,18 @@ impl FileFormat for JsonFormat {
         self
     }
 
+    fn get_ext(&self) -> String {
+        JsonFormatFactory::new().get_ext()
+    }
+
+    fn get_ext_with_compression(
+        &self,
+        file_compression_type: &FileCompressionType,
+    ) -> Result<String> {
+        let ext = self.get_ext();
+        Ok(format!("{}{}", ext, file_compression_type.get_ext()))
+    }
+
     async fn infer_schema(
         &self,
         _state: &SessionState,
@@ -100,8 +192,11 @@ impl FileFormat for JsonFormat {
         objects: &[ObjectMeta],
     ) -> Result<SchemaRef> {
         let mut schemas = Vec::new();
-        let mut records_to_read = self.schema_infer_max_rec.unwrap_or(usize::MAX);
-        let file_compression_type = self.file_compression_type.to_owned();
+        let mut records_to_read = self
+            .options
+            .schema_infer_max_rec
+            .unwrap_or(DEFAULT_SCHEMA_INFER_MAX_RECORD);
+        let file_compression_type = FileCompressionType::from(self.options.compression);
         for object in objects {
             let mut take_while = || {
                 let should_take = records_to_read > 0;
@@ -154,7 +249,8 @@ impl FileFormat for JsonFormat {
         conf: FileScanConfig,
         _filters: Option<&Arc<dyn PhysicalExpr>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let exec = NdJsonExec::new(conf, self.file_compression_type.to_owned());
+        let exec =
+            NdJsonExec::new(conf, FileCompressionType::from(self.options.compression));
         Ok(Arc::new(exec))
     }
 
@@ -163,28 +259,17 @@ impl FileFormat for JsonFormat {
         input: Arc<dyn ExecutionPlan>,
         _state: &SessionState,
         conf: FileSinkConfig,
-        order_requirements: Option<Vec<PhysicalSortRequirement>>,
+        order_requirements: Option<LexRequirement>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        if conf.overwrite {
+        if conf.insert_op != InsertOp::Append {
             return not_impl_err!("Overwrites are not implemented yet for Json");
         }
 
-        if self.file_compression_type != FileCompressionType::UNCOMPRESSED {
-            return not_impl_err!("Inserting compressed JSON is not implemented yet.");
-        }
-        let sink_schema = conf.output_schema().clone();
-        let sink = Arc::new(JsonSink::new(conf));
+        let writer_options = JsonWriterOptions::try_from(&self.options)?;
 
-        Ok(Arc::new(FileSinkExec::new(
-            input,
-            sink,
-            sink_schema,
-            order_requirements,
-        )) as _)
-    }
+        let sink = Arc::new(JsonSink::new(conf, writer_options));
 
-    fn file_type(&self) -> FileType {
-        FileType::JSON
+        Ok(Arc::new(DataSinkExec::new(input, sink, order_requirements)) as _)
     }
 }
 
@@ -217,6 +302,8 @@ impl BatchSerializer for JsonSerializer {
 pub struct JsonSink {
     /// Config options for writing data
     config: FileSinkConfig,
+    /// Writer options for underlying Json writer
+    writer_options: JsonWriterOptions,
 }
 
 impl Debug for JsonSink {
@@ -239,32 +326,40 @@ impl DisplayAs for JsonSink {
 
 impl JsonSink {
     /// Create from config.
-    pub fn new(config: FileSinkConfig) -> Self {
-        Self { config }
+    pub fn new(config: FileSinkConfig, writer_options: JsonWriterOptions) -> Self {
+        Self {
+            config,
+            writer_options,
+        }
     }
 
-    /// Retrieve the inner [`FileSinkConfig`].
-    pub fn config(&self) -> &FileSinkConfig {
+    /// Retrieve the writer options
+    pub fn writer_options(&self) -> &JsonWriterOptions {
+        &self.writer_options
+    }
+}
+
+#[async_trait]
+impl FileSink for JsonSink {
+    fn config(&self) -> &FileSinkConfig {
         &self.config
     }
 
-    async fn multipartput_all(
+    async fn spawn_writer_tasks_and_join(
         &self,
-        data: SendableRecordBatchStream,
         context: &Arc<TaskContext>,
+        demux_task: SpawnedTask<Result<()>>,
+        file_stream_rx: DemuxedStreamReceiver,
+        object_store: Arc<dyn ObjectStore>,
     ) -> Result<u64> {
-        let writer_options = self.config.file_type_writer_options.try_into_json()?;
-        let compression = &writer_options.compression;
-
-        let get_serializer = move || Arc::new(JsonSerializer::new()) as _;
-
-        stateless_multipart_put(
-            data,
+        let serializer = Arc::new(JsonSerializer::new()) as _;
+        spawn_writer_tasks_and_join(
             context,
-            "json".into(),
-            Box::new(get_serializer),
-            &self.config,
-            (*compression).into(),
+            serializer,
+            self.writer_options.compression.into(),
+            object_store,
+            demux_task,
+            file_stream_rx,
         )
         .await
     }
@@ -276,8 +371,8 @@ impl DataSink for JsonSink {
         self
     }
 
-    fn metrics(&self) -> Option<MetricsSet> {
-        None
+    fn schema(&self) -> &SchemaRef {
+        self.config.output_schema()
     }
 
     async fn write_all(
@@ -285,28 +380,65 @@ impl DataSink for JsonSink {
         data: SendableRecordBatchStream,
         context: &Arc<TaskContext>,
     ) -> Result<u64> {
-        let total_count = self.multipartput_all(data, context).await?;
-        Ok(total_count)
+        FileSink::write_all(self, data, context).await
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct JsonDecoder {
+    inner: json::reader::Decoder,
+}
+
+impl JsonDecoder {
+    pub(crate) fn new(decoder: json::reader::Decoder) -> Self {
+        Self { inner: decoder }
+    }
+}
+
+impl Decoder for JsonDecoder {
+    fn decode(&mut self, buf: &[u8]) -> Result<usize, ArrowError> {
+        self.inner.decode(buf)
+    }
+
+    fn flush(&mut self) -> Result<Option<RecordBatch>, ArrowError> {
+        self.inner.flush()
+    }
+
+    fn can_flush_early(&self) -> bool {
+        false
+    }
+}
+
+impl From<json::reader::Decoder> for DecoderDeserializer<JsonDecoder> {
+    fn from(decoder: json::reader::Decoder) -> Self {
+        DecoderDeserializer::new(JsonDecoder::new(decoder))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::test_util::scan_format;
-    use arrow::util::pretty;
-    use datafusion_common::cast::as_int64_array;
-    use datafusion_common::stats::Precision;
-    use datafusion_common::{assert_batches_eq, internal_err};
-    use futures::StreamExt;
-    use object_store::local::LocalFileSystem;
-    use regex::Regex;
-    use rstest::rstest;
-
     use super::*;
+    use crate::datasource::file_format::{
+        BatchDeserializer, DecoderDeserializer, DeserializerOutput,
+    };
     use crate::execution::options::NdJsonReadOptions;
     use crate::physical_plan::collect;
     use crate::prelude::{SessionConfig, SessionContext};
     use crate::test::object_store::local_unpartitioned_file;
+
+    use arrow::compute::concat_batches;
+    use arrow::json::ReaderBuilder;
+    use arrow::util::pretty;
+    use arrow_schema::{DataType, Field};
+    use datafusion_common::cast::as_int64_array;
+    use datafusion_common::stats::Precision;
+    use datafusion_common::{assert_batches_eq, internal_err};
+
+    use futures::StreamExt;
+    use object_store::local::LocalFileSystem;
+    use regex::Regex;
+    use rstest::rstest;
 
     #[tokio::test]
     async fn read_small_batches() -> Result<()> {
@@ -413,7 +545,7 @@ mod tests {
         let ctx = session.state();
         let store = Arc::new(LocalFileSystem::new()) as _;
         let filename = "tests/data/schema_infer_limit.json";
-        let format = JsonFormat::default().with_schema_infer_max_rec(Some(3));
+        let format = JsonFormat::default().with_schema_infer_max_rec(3);
 
         let file_schema = format
             .infer_schema(&ctx, &store, &[local_unpartitioned_file(filename)])
@@ -465,7 +597,7 @@ mod tests {
         ctx.register_json("json_parallel", table_path, options)
             .await?;
 
-        let query = "SELECT SUM(a) FROM json_parallel;";
+        let query = "SELECT sum(a) FROM json_parallel;";
 
         let result = ctx.sql(query).await?.collect().await?;
         let actual_partitions = count_num_partitions(&ctx, query).await?;
@@ -473,7 +605,7 @@ mod tests {
         #[rustfmt::skip]
         let expected = [
             "+----------------------+",
-            "| SUM(json_parallel.a) |",
+            "| sum(json_parallel.a) |",
             "+----------------------+",
             "| -7                   |",
             "+----------------------+"
@@ -485,13 +617,11 @@ mod tests {
         Ok(())
     }
 
-    #[rstest(n_partitions, case(1), case(2), case(3), case(4))]
     #[tokio::test]
-    async fn it_can_read_empty_ndjson_in_parallel(n_partitions: usize) -> Result<()> {
+    async fn it_can_read_empty_ndjson() -> Result<()> {
         let config = SessionConfig::new()
             .with_repartition_file_scans(true)
-            .with_repartition_file_min_size(0)
-            .with_target_partitions(n_partitions);
+            .with_repartition_file_min_size(0);
 
         let ctx = SessionContext::new_with_config(config);
 
@@ -504,7 +634,6 @@ mod tests {
         let query = "SELECT * FROM json_parallel_empty WHERE random() > 0.5;";
 
         let result = ctx.sql(query).await?.collect().await?;
-        let actual_partitions = count_num_partitions(&ctx, query).await?;
 
         #[rustfmt::skip]
         let expected = [
@@ -513,8 +642,100 @@ mod tests {
         ];
 
         assert_batches_eq!(expected, &result);
-        assert_eq!(1, actual_partitions);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_json_deserializer_finish() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("c1", DataType::Int64, true),
+            Field::new("c2", DataType::Int64, true),
+            Field::new("c3", DataType::Int64, true),
+            Field::new("c4", DataType::Int64, true),
+            Field::new("c5", DataType::Int64, true),
+        ]));
+        let mut deserializer = json_deserializer(1, &schema)?;
+
+        deserializer.digest(r#"{ "c1": 1, "c2": 2, "c3": 3, "c4": 4, "c5": 5 }"#.into());
+        deserializer.digest(r#"{ "c1": 6, "c2": 7, "c3": 8, "c4": 9, "c5": 10 }"#.into());
+        deserializer
+            .digest(r#"{ "c1": 11, "c2": 12, "c3": 13, "c4": 14, "c5": 15 }"#.into());
+        deserializer.finish();
+
+        let mut all_batches = RecordBatch::new_empty(schema.clone());
+        for _ in 0..3 {
+            let output = deserializer.next()?;
+            let DeserializerOutput::RecordBatch(batch) = output else {
+                panic!("Expected RecordBatch, got {:?}", output);
+            };
+            all_batches = concat_batches(&schema, &[all_batches, batch])?
+        }
+        assert_eq!(deserializer.next()?, DeserializerOutput::InputExhausted);
+
+        let expected = [
+            "+----+----+----+----+----+",
+            "| c1 | c2 | c3 | c4 | c5 |",
+            "+----+----+----+----+----+",
+            "| 1  | 2  | 3  | 4  | 5  |",
+            "| 6  | 7  | 8  | 9  | 10 |",
+            "| 11 | 12 | 13 | 14 | 15 |",
+            "+----+----+----+----+----+",
+        ];
+
+        assert_batches_eq!(expected, &[all_batches]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_json_deserializer_no_finish() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("c1", DataType::Int64, true),
+            Field::new("c2", DataType::Int64, true),
+            Field::new("c3", DataType::Int64, true),
+            Field::new("c4", DataType::Int64, true),
+            Field::new("c5", DataType::Int64, true),
+        ]));
+        let mut deserializer = json_deserializer(1, &schema)?;
+
+        deserializer.digest(r#"{ "c1": 1, "c2": 2, "c3": 3, "c4": 4, "c5": 5 }"#.into());
+        deserializer.digest(r#"{ "c1": 6, "c2": 7, "c3": 8, "c4": 9, "c5": 10 }"#.into());
+        deserializer
+            .digest(r#"{ "c1": 11, "c2": 12, "c3": 13, "c4": 14, "c5": 15 }"#.into());
+
+        let mut all_batches = RecordBatch::new_empty(schema.clone());
+        // We get RequiresMoreData after 2 batches because of how json::Decoder works
+        for _ in 0..2 {
+            let output = deserializer.next()?;
+            let DeserializerOutput::RecordBatch(batch) = output else {
+                panic!("Expected RecordBatch, got {:?}", output);
+            };
+            all_batches = concat_batches(&schema, &[all_batches, batch])?
+        }
+        assert_eq!(deserializer.next()?, DeserializerOutput::RequiresMoreData);
+
+        let expected = [
+            "+----+----+----+----+----+",
+            "| c1 | c2 | c3 | c4 | c5 |",
+            "+----+----+----+----+----+",
+            "| 1  | 2  | 3  | 4  | 5  |",
+            "| 6  | 7  | 8  | 9  | 10 |",
+            "+----+----+----+----+----+",
+        ];
+
+        assert_batches_eq!(expected, &[all_batches]);
+
+        Ok(())
+    }
+
+    fn json_deserializer(
+        batch_size: usize,
+        schema: &Arc<Schema>,
+    ) -> Result<impl BatchDeserializer<Bytes>> {
+        let decoder = ReaderBuilder::new(schema.clone())
+            .with_batch_size(batch_size)
+            .build_decoder()?;
+        Ok(DecoderDeserializer::new(JsonDecoder::new(decoder)))
     }
 }

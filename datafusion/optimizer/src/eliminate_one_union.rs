@@ -15,14 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Optimizer rule to eliminate one union.
+//! [`EliminateOneUnion`]  eliminates single element `Union`
+
 use crate::{OptimizerConfig, OptimizerRule};
-use datafusion_common::Result;
+use datafusion_common::{tree_node::Transformed, Result};
 use datafusion_expr::logical_plan::{LogicalPlan, Union};
+use std::sync::Arc;
 
 use crate::optimizer::ApplyOrder;
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 /// An optimization rule that eliminates union with one element.
 pub struct EliminateOneUnion;
 
@@ -34,21 +36,25 @@ impl EliminateOneUnion {
 }
 
 impl OptimizerRule for EliminateOneUnion {
-    fn try_optimize(
-        &self,
-        plan: &LogicalPlan,
-        _config: &dyn OptimizerConfig,
-    ) -> Result<Option<LogicalPlan>> {
-        match plan {
-            LogicalPlan::Union(Union { inputs, .. }) if inputs.len() == 1 => {
-                Ok(inputs.first().map(|input| input.as_ref().clone()))
-            }
-            _ => Ok(None),
-        }
-    }
-
     fn name(&self) -> &str {
         "eliminate_one_union"
+    }
+
+    fn supports_rewrite(&self) -> bool {
+        true
+    }
+
+    fn rewrite(
+        &self,
+        plan: LogicalPlan,
+        _config: &dyn OptimizerConfig,
+    ) -> Result<Transformed<LogicalPlan>> {
+        match plan {
+            LogicalPlan::Union(Union { mut inputs, .. }) if inputs.len() == 1 => Ok(
+                Transformed::yes(Arc::unwrap_or_clone(inputs.pop().unwrap())),
+            ),
+            _ => Ok(Transformed::no(plan)),
+        }
     }
 
     fn apply_order(&self) -> Option<ApplyOrder> {
@@ -63,8 +69,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion_common::ToDFSchema;
     use datafusion_expr::{
-        expr_rewriter::coerce_plan_expr_for_schema,
-        logical_plan::{table_scan, Union},
+        expr_rewriter::coerce_plan_expr_for_schema, logical_plan::table_scan,
     };
     use std::sync::Arc;
 
@@ -76,11 +81,12 @@ mod tests {
         ])
     }
 
-    fn assert_optimized_plan_equal(plan: &LogicalPlan, expected: &str) -> Result<()> {
-        assert_optimized_plan_eq_with_rules(
+    fn assert_optimized_plan_equal(plan: LogicalPlan, expected: &str) -> Result<()> {
+        assert_optimized_plan_with_rules(
             vec![Arc::new(EliminateOneUnion::new())],
             plan,
             expected,
+            true,
         )
     }
 
@@ -88,31 +94,28 @@ mod tests {
     fn eliminate_nothing() -> Result<()> {
         let plan_builder = table_scan(Some("table"), &schema(), None)?;
 
-        let plan = plan_builder
-            .clone()
-            .union(plan_builder.clone().build()?)?
-            .build()?;
+        let plan = plan_builder.clone().union(plan_builder.build()?)?.build()?;
 
         let expected = "\
         Union\
         \n  TableScan: table\
         \n  TableScan: table";
-        assert_optimized_plan_equal(&plan, expected)
+        assert_optimized_plan_equal(plan, expected)
     }
 
     #[test]
     fn eliminate_one_union() -> Result<()> {
         let table_plan = coerce_plan_expr_for_schema(
-            &table_scan(Some("table"), &schema(), None)?.build()?,
+            table_scan(Some("table"), &schema(), None)?.build()?,
             &schema().to_dfschema()?,
         )?;
-        let schema = table_plan.schema().clone();
+        let schema = Arc::clone(table_plan.schema());
         let single_union_plan = LogicalPlan::Union(Union {
             inputs: vec![Arc::new(table_plan)],
             schema,
         });
 
         let expected = "TableScan: table";
-        assert_optimized_plan_equal(&single_union_plan, expected)
+        assert_optimized_plan_equal(single_union_plan, expected)
     }
 }

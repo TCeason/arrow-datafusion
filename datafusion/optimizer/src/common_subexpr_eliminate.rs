@@ -15,387 +15,537 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Eliminate common sub-expression.
+//! [`CommonSubexprEliminate`] to avoid redundant computation of common sub-expressions
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+use std::fmt::Debug;
 use std::sync::Arc;
 
-use crate::utils::is_volatile_expression;
-use crate::{utils, OptimizerConfig, OptimizerRule};
+use crate::{OptimizerConfig, OptimizerRule};
 
-use arrow::datatypes::DataType;
-use datafusion_common::tree_node::{
-    RewriteRecursion, TreeNode, TreeNodeRewriter, TreeNodeVisitor, VisitRecursion,
-};
-use datafusion_common::{
-    internal_err, Column, DFField, DFSchema, DFSchemaRef, DataFusionError, Result,
-};
-use datafusion_expr::expr::Alias;
+use crate::optimizer::ApplyOrder;
+use crate::utils::NamePreserver;
+use datafusion_common::alias::AliasGenerator;
+
+use datafusion_common::cse::{CSEController, FoundCommonNodes, CSE};
+use datafusion_common::tree_node::{Transformed, TreeNode};
+use datafusion_common::{qualified_name, Column, DFSchema, DFSchemaRef, Result};
+use datafusion_expr::expr::{Alias, ScalarFunction};
 use datafusion_expr::logical_plan::{
     Aggregate, Filter, LogicalPlan, Projection, Sort, Window,
 };
-use datafusion_expr::{col, Expr, ExprSchemable};
+use datafusion_expr::{col, BinaryExpr, Case, Expr, Operator, SortExpr};
 
-/// A map from expression's identifier to tuple including
-/// - the expression itself (cloned)
-/// - counter
-/// - DataType of this expression.
-type ExprSet = HashMap<Identifier, (Expr, usize, DataType)>;
+const CSE_PREFIX: &str = "__common_expr";
 
-/// Identifier type. Current implementation use describe of a expression (type String) as
-/// Identifier.
+/// Performs Common Sub-expression Elimination optimization.
 ///
-/// A Identifier should (ideally) be able to "hash", "accumulate", "equal" and "have no
-/// collision (as low as possible)"
+/// This optimization improves query performance by computing expressions that
+/// appear more than once and reusing those results rather than re-computing the
+/// same value
 ///
-/// Since a identifier is likely to be copied many times, it is better that a identifier
-/// is small or "copy". otherwise some kinds of reference count is needed. String description
-/// here is not such a good choose.
-type Identifier = String;
-
-/// Perform Common Sub-expression Elimination optimization.
+/// Currently only common sub-expressions within a single `LogicalPlan` are
+/// eliminated.
 ///
-/// Currently only common sub-expressions within one logical plan will
-/// be eliminated.
+/// # Example
+///
+/// Given a projection that computes the same expensive expression
+/// multiple times such as parsing as string as a date with `to_date` twice:
+///
+/// ```text
+/// ProjectionExec(expr=[extract (day from to_date(c1)), extract (year from to_date(c1))])
+/// ```
+///
+/// This optimization will rewrite the plan to compute the common expression once
+/// using a new `ProjectionExec` and then rewrite the original expressions to
+/// refer to that new column.
+///
+/// ```text
+/// ProjectionExec(exprs=[extract (day from new_col), extract (year from new_col)]) <-- reuse here
+///   ProjectionExec(exprs=[to_date(c1) as new_col]) <-- compute to_date once
+/// ```
+#[derive(Debug)]
 pub struct CommonSubexprEliminate {}
 
 impl CommonSubexprEliminate {
-    fn rewrite_exprs_list(
-        &self,
-        exprs_list: &[&[Expr]],
-        arrays_list: &[&[Vec<(usize, String)>]],
-        expr_set: &ExprSet,
-        affected_id: &mut BTreeSet<Identifier>,
-    ) -> Result<Vec<Vec<Expr>>> {
-        exprs_list
-            .iter()
-            .zip(arrays_list.iter())
-            .map(|(exprs, arrays)| {
-                exprs
-                    .iter()
-                    .cloned()
-                    .zip(arrays.iter())
-                    .map(|(expr, id_array)| {
-                        replace_common_expr(expr, id_array, expr_set, affected_id)
-                    })
-                    .collect::<Result<Vec<_>>>()
-            })
-            .collect::<Result<Vec<_>>>()
+    pub fn new() -> Self {
+        Self {}
     }
 
-    fn rewrite_expr(
+    fn try_optimize_proj(
         &self,
-        exprs_list: &[&[Expr]],
-        arrays_list: &[&[Vec<(usize, String)>]],
-        input: &LogicalPlan,
-        expr_set: &ExprSet,
+        projection: Projection,
         config: &dyn OptimizerConfig,
-    ) -> Result<(Vec<Vec<Expr>>, LogicalPlan)> {
-        let mut affected_id = BTreeSet::<Identifier>::new();
-
-        let rewrite_exprs =
-            self.rewrite_exprs_list(exprs_list, arrays_list, expr_set, &mut affected_id)?;
-
-        let mut new_input = self
-            .try_optimize(input, config)?
-            .unwrap_or_else(|| input.clone());
-        if !affected_id.is_empty() {
-            new_input = build_common_expr_project_plan(new_input, affected_id, expr_set)?;
-        }
-
-        Ok((rewrite_exprs, new_input))
-    }
-
-    fn try_optimize_projection(
-        &self,
-        projection: &Projection,
-        config: &dyn OptimizerConfig,
-    ) -> Result<LogicalPlan> {
-        let Projection { expr, input, .. } = projection;
-        let input_schema = Arc::clone(input.schema());
-        let mut expr_set = ExprSet::new();
-
-        // Visit expr list and build expr identifier to occuring count map (`expr_set`).
-        let arrays = to_arrays(expr, input_schema, &mut expr_set, ExprMask::Normal)?;
-
-        let (mut new_expr, new_input) =
-            self.rewrite_expr(&[expr], &[&arrays], input, &expr_set, config)?;
-
-        // Since projection expr changes, schema changes also. Use try_new method.
-        Projection::try_new(pop_expr(&mut new_expr)?, Arc::new(new_input))
-            .map(LogicalPlan::Projection)
-    }
-
-    fn try_optimize_filter(
-        &self,
-        filter: &Filter,
-        config: &dyn OptimizerConfig,
-    ) -> Result<LogicalPlan> {
-        let mut expr_set = ExprSet::new();
-        let predicate = &filter.predicate;
-        let input_schema = Arc::clone(filter.input.schema());
-        let mut id_array = vec![];
-        expr_to_identifier(
-            predicate,
-            &mut expr_set,
-            &mut id_array,
-            input_schema,
-            ExprMask::Normal,
-        )?;
-
-        let (mut new_expr, new_input) = self.rewrite_expr(
-            &[&[predicate.clone()]],
-            &[&[id_array]],
-            &filter.input,
-            &expr_set,
-            config,
-        )?;
-
-        if let Some(predicate) = pop_expr(&mut new_expr)?.pop() {
-            Ok(LogicalPlan::Filter(Filter::try_new(
-                predicate,
-                Arc::new(new_input),
-            )?))
-        } else {
-            internal_err!("Failed to pop predicate expr")
-        }
-    }
-
-    fn try_optimize_window(
-        &self,
-        window: &Window,
-        config: &dyn OptimizerConfig,
-    ) -> Result<LogicalPlan> {
-        let mut window_exprs = vec![];
-        let mut arrays_per_window = vec![];
-        let mut expr_set = ExprSet::new();
-
-        // Get all window expressions inside the consecutive window operators.
-        // Consecutive window expressions may refer to same complex expression.
-        // If same complex expression is referred more than once by subsequent `WindowAggr`s,
-        // we can cache complex expression by evaluating it with a projection before the
-        // first WindowAggr.
-        // This enables us to cache complex expression "c3+c4" for following plan:
-        // WindowAggr: windowExpr=[[SUM(c9) ORDER BY [c3 + c4] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]
-        // --WindowAggr: windowExpr=[[SUM(c9) ORDER BY [c3 + c4] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]
-        // where, it is referred once by each `WindowAggr` (total of 2) in the plan.
-        let mut plan = LogicalPlan::Window(window.clone());
-        while let LogicalPlan::Window(window) = plan {
-            let Window {
-                input, window_expr, ..
-            } = window;
-            plan = input.as_ref().clone();
-
-            let input_schema = Arc::clone(input.schema());
-            let arrays =
-                to_arrays(&window_expr, input_schema, &mut expr_set, ExprMask::Normal)?;
-
-            window_exprs.push(window_expr);
-            arrays_per_window.push(arrays);
-        }
-
-        let mut window_exprs = window_exprs
-            .iter()
-            .map(|expr| expr.as_slice())
-            .collect::<Vec<_>>();
-        let arrays_per_window = arrays_per_window
-            .iter()
-            .map(|arrays| arrays.as_slice())
-            .collect::<Vec<_>>();
-
-        assert_eq!(window_exprs.len(), arrays_per_window.len());
-        let (mut new_expr, new_input) = self.rewrite_expr(
-            &window_exprs,
-            &arrays_per_window,
-            &plan,
-            &expr_set,
-            config,
-        )?;
-        assert_eq!(window_exprs.len(), new_expr.len());
-
-        // Construct consecutive window operator, with their corresponding new window expressions.
-        plan = new_input;
-        while let Some(new_window_expr) = new_expr.pop() {
-            // Since `new_expr` and `window_exprs` length are same. We can safely `.unwrap` here.
-            let orig_window_expr = window_exprs.pop().unwrap();
-            assert_eq!(new_window_expr.len(), orig_window_expr.len());
-
-            // Rename new re-written window expressions with original name (by giving alias)
-            // Otherwise we may receive schema error, in subsequent operators.
-            let new_window_expr = new_window_expr
-                .into_iter()
-                .zip(orig_window_expr.iter())
-                .map(|(new_window_expr, window_expr)| {
-                    let original_name = window_expr.name_for_alias()?;
-                    new_window_expr.alias_if_changed(original_name)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            plan = LogicalPlan::Window(Window::try_new(new_window_expr, Arc::new(plan))?);
-        }
-
-        Ok(plan)
-    }
-
-    fn try_optimize_aggregate(
-        &self,
-        aggregate: &Aggregate,
-        config: &dyn OptimizerConfig,
-    ) -> Result<LogicalPlan> {
-        let Aggregate {
-            group_expr,
-            aggr_expr,
+    ) -> Result<Transformed<LogicalPlan>> {
+        let Projection {
+            expr,
             input,
+            schema,
             ..
-        } = aggregate;
-        let mut expr_set = ExprSet::new();
-
-        // rewrite inputs
-        let input_schema = Arc::clone(input.schema());
-        let group_arrays = to_arrays(
-            group_expr,
-            Arc::clone(&input_schema),
-            &mut expr_set,
-            ExprMask::Normal,
-        )?;
-        let aggr_arrays =
-            to_arrays(aggr_expr, input_schema, &mut expr_set, ExprMask::Normal)?;
-
-        let (mut new_expr, new_input) = self.rewrite_expr(
-            &[group_expr, aggr_expr],
-            &[&group_arrays, &aggr_arrays],
-            input,
-            &expr_set,
-            config,
-        )?;
-        // note the reversed pop order.
-        let new_aggr_expr = pop_expr(&mut new_expr)?;
-        let new_group_expr = pop_expr(&mut new_expr)?;
-
-        // create potential projection on top
-        let mut expr_set = ExprSet::new();
-        let new_input_schema = Arc::clone(new_input.schema());
-        let aggr_arrays = to_arrays(
-            &new_aggr_expr,
-            new_input_schema.clone(),
-            &mut expr_set,
-            ExprMask::NormalAndAggregates,
-        )?;
-        let mut affected_id = BTreeSet::<Identifier>::new();
-        let mut rewritten = self.rewrite_exprs_list(
-            &[&new_aggr_expr],
-            &[&aggr_arrays],
-            &expr_set,
-            &mut affected_id,
-        )?;
-        let rewritten = pop_expr(&mut rewritten)?;
-
-        if affected_id.is_empty() {
-            // Alias aggregation expressions if they have changed
-            let new_aggr_expr = new_aggr_expr
-                .iter()
-                .zip(aggr_expr.iter())
-                .map(|(new_expr, old_expr)| {
-                    new_expr.clone().alias_if_changed(old_expr.display_name()?)
-                })
-                .collect::<Result<Vec<Expr>>>()?;
-            // Since group_epxr changes, schema changes also. Use try_new method.
-            Aggregate::try_new(Arc::new(new_input), new_group_expr, new_aggr_expr)
-                .map(LogicalPlan::Aggregate)
-        } else {
-            let mut agg_exprs = vec![];
-
-            for id in affected_id {
-                match expr_set.get(&id) {
-                    Some((expr, _, _)) => {
-                        // todo: check `nullable`
-                        agg_exprs.push(expr.clone().alias(&id));
-                    }
-                    _ => {
-                        return internal_err!("expr_set invalid state");
-                    }
-                }
-            }
-
-            let mut proj_exprs = vec![];
-            for expr in &new_group_expr {
-                extract_expressions(expr, &new_input_schema, &mut proj_exprs)?
-            }
-            for (expr_rewritten, expr_orig) in rewritten.into_iter().zip(new_aggr_expr) {
-                if expr_rewritten == expr_orig {
-                    if let Expr::Alias(Alias { expr, name, .. }) = expr_rewritten {
-                        agg_exprs.push(expr.alias(&name));
-                        proj_exprs.push(Expr::Column(Column::from_name(name)));
-                    } else {
-                        let id =
-                            ExprIdentifierVisitor::<'static>::desc_expr(&expr_rewritten);
-                        let out_name =
-                            expr_rewritten.to_field(&new_input_schema)?.qualified_name();
-                        agg_exprs.push(expr_rewritten.alias(&id));
-                        proj_exprs
-                            .push(Expr::Column(Column::from_name(id)).alias(out_name));
-                    }
-                } else {
-                    proj_exprs.push(expr_rewritten);
-                }
-            }
-
-            let agg = LogicalPlan::Aggregate(Aggregate::try_new(
-                Arc::new(new_input),
-                new_group_expr,
-                agg_exprs,
-            )?);
-
-            Ok(LogicalPlan::Projection(Projection::try_new(
-                proj_exprs,
-                Arc::new(agg),
-            )?))
-        }
+        } = projection;
+        let input = Arc::unwrap_or_clone(input);
+        self.try_unary_plan(expr, input, config)?
+            .map_data(|(new_expr, new_input)| {
+                Projection::try_new_with_schema(new_expr, Arc::new(new_input), schema)
+                    .map(LogicalPlan::Projection)
+            })
     }
 
     fn try_optimize_sort(
         &self,
-        sort: &Sort,
+        sort: Sort,
         config: &dyn OptimizerConfig,
-    ) -> Result<LogicalPlan> {
+    ) -> Result<Transformed<LogicalPlan>> {
         let Sort { expr, input, fetch } = sort;
-        let mut expr_set = ExprSet::new();
+        let input = Arc::unwrap_or_clone(input);
+        let (sort_expressions, sort_params): (Vec<_>, Vec<(_, _)>) = expr
+            .into_iter()
+            .map(|sort| (sort.expr, (sort.asc, sort.nulls_first)))
+            .unzip();
+        let new_sort = self
+            .try_unary_plan(sort_expressions, input, config)?
+            .update_data(|(new_expr, new_input)| {
+                LogicalPlan::Sort(Sort {
+                    expr: new_expr
+                        .into_iter()
+                        .zip(sort_params)
+                        .map(|(expr, (asc, nulls_first))| SortExpr {
+                            expr,
+                            asc,
+                            nulls_first,
+                        })
+                        .collect(),
+                    input: Arc::new(new_input),
+                    fetch,
+                })
+            });
+        Ok(new_sort)
+    }
 
-        let input_schema = Arc::clone(input.schema());
-        let arrays = to_arrays(expr, input_schema, &mut expr_set, ExprMask::Normal)?;
+    fn try_optimize_filter(
+        &self,
+        filter: Filter,
+        config: &dyn OptimizerConfig,
+    ) -> Result<Transformed<LogicalPlan>> {
+        let Filter {
+            predicate, input, ..
+        } = filter;
+        let input = Arc::unwrap_or_clone(input);
+        let expr = vec![predicate];
+        self.try_unary_plan(expr, input, config)?
+            .map_data(|(mut new_expr, new_input)| {
+                assert_eq!(new_expr.len(), 1); // passed in vec![predicate]
+                let new_predicate = new_expr.pop().unwrap();
+                Filter::try_new(new_predicate, Arc::new(new_input))
+                    .map(LogicalPlan::Filter)
+            })
+    }
 
-        let (mut new_expr, new_input) =
-            self.rewrite_expr(&[expr], &[&arrays], input, &expr_set, config)?;
+    fn try_optimize_window(
+        &self,
+        window: Window,
+        config: &dyn OptimizerConfig,
+    ) -> Result<Transformed<LogicalPlan>> {
+        // Collects window expressions from consecutive `LogicalPlan::Window` nodes into
+        // a list.
+        let (window_expr_list, window_schemas, input) =
+            get_consecutive_window_exprs(window);
 
-        Ok(LogicalPlan::Sort(Sort {
-            expr: pop_expr(&mut new_expr)?,
-            input: Arc::new(new_input),
-            fetch: *fetch,
-        }))
+        // Extract common sub-expressions from the list.
+
+        match CSE::new(ExprCSEController::new(
+            config.alias_generator().as_ref(),
+            ExprMask::Normal,
+        ))
+        .extract_common_nodes(window_expr_list)?
+        {
+            // If there are common sub-expressions, then the insert a projection node
+            // with the common expressions between the new window nodes and the
+            // original input.
+            FoundCommonNodes::Yes {
+                common_nodes: common_exprs,
+                new_nodes_list: new_exprs_list,
+                original_nodes_list: original_exprs_list,
+            } => build_common_expr_project_plan(input, common_exprs).map(|new_input| {
+                Transformed::yes((new_exprs_list, new_input, Some(original_exprs_list)))
+            }),
+            FoundCommonNodes::No {
+                original_nodes_list: original_exprs_list,
+            } => Ok(Transformed::no((original_exprs_list, input, None))),
+        }?
+        // Recurse into the new input.
+        // (This is similar to what a `ApplyOrder::TopDown` optimizer rule would do.)
+        .transform_data(|(new_window_expr_list, new_input, window_expr_list)| {
+            self.rewrite(new_input, config)?.map_data(|new_input| {
+                Ok((new_window_expr_list, new_input, window_expr_list))
+            })
+        })?
+        // Rebuild the consecutive window nodes.
+        .map_data(|(new_window_expr_list, new_input, window_expr_list)| {
+            // If there were common expressions extracted, then we need to make sure
+            // we restore the original column names.
+            // TODO: Although `find_common_exprs()` inserts aliases around extracted
+            //  common expressions this doesn't mean that the original column names
+            //  (schema) are preserved due to the inserted aliases are not always at
+            //  the top of the expression.
+            //  Let's consider improving `find_common_exprs()` to always keep column
+            //  names and get rid of additional name preserving logic here.
+            if let Some(window_expr_list) = window_expr_list {
+                let name_preserver = NamePreserver::new_for_projection();
+                let saved_names = window_expr_list
+                    .iter()
+                    .map(|exprs| {
+                        exprs
+                            .iter()
+                            .map(|expr| name_preserver.save(expr))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>();
+                new_window_expr_list.into_iter().zip(saved_names).try_rfold(
+                    new_input,
+                    |plan, (new_window_expr, saved_names)| {
+                        let new_window_expr = new_window_expr
+                            .into_iter()
+                            .zip(saved_names)
+                            .map(|(new_window_expr, saved_name)| {
+                                saved_name.restore(new_window_expr)
+                            })
+                            .collect::<Vec<_>>();
+                        Window::try_new(new_window_expr, Arc::new(plan))
+                            .map(LogicalPlan::Window)
+                    },
+                )
+            } else {
+                new_window_expr_list
+                    .into_iter()
+                    .zip(window_schemas)
+                    .try_rfold(new_input, |plan, (new_window_expr, schema)| {
+                        Window::try_new_with_schema(
+                            new_window_expr,
+                            Arc::new(plan),
+                            schema,
+                        )
+                        .map(LogicalPlan::Window)
+                    })
+            }
+        })
+    }
+
+    fn try_optimize_aggregate(
+        &self,
+        aggregate: Aggregate,
+        config: &dyn OptimizerConfig,
+    ) -> Result<Transformed<LogicalPlan>> {
+        let Aggregate {
+            group_expr,
+            aggr_expr,
+            input,
+            schema,
+            ..
+        } = aggregate;
+        let input = Arc::unwrap_or_clone(input);
+        // Extract common sub-expressions from the aggregate and grouping expressions.
+        match CSE::new(ExprCSEController::new(
+            config.alias_generator().as_ref(),
+            ExprMask::Normal,
+        ))
+        .extract_common_nodes(vec![group_expr, aggr_expr])?
+        {
+            // If there are common sub-expressions, then insert a projection node
+            // with the common expressions between the new aggregate node and the
+            // original input.
+            FoundCommonNodes::Yes {
+                common_nodes: common_exprs,
+                new_nodes_list: mut new_exprs_list,
+                original_nodes_list: mut original_exprs_list,
+            } => {
+                let new_aggr_expr = new_exprs_list.pop().unwrap();
+                let new_group_expr = new_exprs_list.pop().unwrap();
+
+                build_common_expr_project_plan(input, common_exprs).map(|new_input| {
+                    let aggr_expr = original_exprs_list.pop().unwrap();
+                    Transformed::yes((
+                        new_aggr_expr,
+                        new_group_expr,
+                        new_input,
+                        Some(aggr_expr),
+                    ))
+                })
+            }
+
+            FoundCommonNodes::No {
+                original_nodes_list: mut original_exprs_list,
+            } => {
+                let new_aggr_expr = original_exprs_list.pop().unwrap();
+                let new_group_expr = original_exprs_list.pop().unwrap();
+
+                Ok(Transformed::no((
+                    new_aggr_expr,
+                    new_group_expr,
+                    input,
+                    None,
+                )))
+            }
+        }?
+        // Recurse into the new input.
+        // (This is similar to what a `ApplyOrder::TopDown` optimizer rule would do.)
+        .transform_data(|(new_aggr_expr, new_group_expr, new_input, aggr_expr)| {
+            self.rewrite(new_input, config)?.map_data(|new_input| {
+                Ok((
+                    new_aggr_expr,
+                    new_group_expr,
+                    aggr_expr,
+                    Arc::new(new_input),
+                ))
+            })
+        })?
+        // Try extracting common aggregate expressions and rebuild the aggregate node.
+        .transform_data(
+            |(new_aggr_expr, new_group_expr, aggr_expr, new_input)| {
+                // Extract common aggregate sub-expressions from the aggregate expressions.
+                match CSE::new(ExprCSEController::new(
+                    config.alias_generator().as_ref(),
+                    ExprMask::NormalAndAggregates,
+                ))
+                .extract_common_nodes(vec![new_aggr_expr])?
+                {
+                    FoundCommonNodes::Yes {
+                        common_nodes: common_exprs,
+                        new_nodes_list: mut new_exprs_list,
+                        original_nodes_list: mut original_exprs_list,
+                    } => {
+                        let rewritten_aggr_expr = new_exprs_list.pop().unwrap();
+                        let new_aggr_expr = original_exprs_list.pop().unwrap();
+
+                        let mut agg_exprs = common_exprs
+                            .into_iter()
+                            .map(|(expr, expr_alias)| expr.alias(expr_alias))
+                            .collect::<Vec<_>>();
+
+                        let mut proj_exprs = vec![];
+                        for expr in &new_group_expr {
+                            extract_expressions(expr, &mut proj_exprs)
+                        }
+                        for (expr_rewritten, expr_orig) in
+                            rewritten_aggr_expr.into_iter().zip(new_aggr_expr)
+                        {
+                            if expr_rewritten == expr_orig {
+                                if let Expr::Alias(Alias { expr, name, .. }) =
+                                    expr_rewritten
+                                {
+                                    agg_exprs.push(expr.alias(&name));
+                                    proj_exprs
+                                        .push(Expr::Column(Column::from_name(name)));
+                                } else {
+                                    let expr_alias =
+                                        config.alias_generator().next(CSE_PREFIX);
+                                    let (qualifier, field_name) =
+                                        expr_rewritten.qualified_name();
+                                    let out_name =
+                                        qualified_name(qualifier.as_ref(), &field_name);
+
+                                    agg_exprs.push(expr_rewritten.alias(&expr_alias));
+                                    proj_exprs.push(
+                                        Expr::Column(Column::from_name(expr_alias))
+                                            .alias(out_name),
+                                    );
+                                }
+                            } else {
+                                proj_exprs.push(expr_rewritten);
+                            }
+                        }
+
+                        let agg = LogicalPlan::Aggregate(Aggregate::try_new(
+                            new_input,
+                            new_group_expr,
+                            agg_exprs,
+                        )?);
+                        Projection::try_new(proj_exprs, Arc::new(agg))
+                            .map(|p| Transformed::yes(LogicalPlan::Projection(p)))
+                    }
+
+                    // If there aren't any common aggregate sub-expressions, then just
+                    // rebuild the aggregate node.
+                    FoundCommonNodes::No {
+                        original_nodes_list: mut original_exprs_list,
+                    } => {
+                        let rewritten_aggr_expr = original_exprs_list.pop().unwrap();
+
+                        // If there were common expressions extracted, then we need to
+                        // make sure we restore the original column names.
+                        // TODO: Although `find_common_exprs()` inserts aliases around
+                        //  extracted common expressions this doesn't mean that the
+                        //  original column names (schema) are preserved due to the
+                        //  inserted aliases are not always at the top of the
+                        //  expression.
+                        //  Let's consider improving `find_common_exprs()` to always
+                        //  keep column names and get rid of additional name
+                        //  preserving logic here.
+                        if let Some(aggr_expr) = aggr_expr {
+                            let name_preserver = NamePreserver::new_for_projection();
+                            let saved_names = aggr_expr
+                                .iter()
+                                .map(|expr| name_preserver.save(expr))
+                                .collect::<Vec<_>>();
+                            let new_aggr_expr = rewritten_aggr_expr
+                                .into_iter()
+                                .zip(saved_names)
+                                .map(|(new_expr, saved_name)| {
+                                    saved_name.restore(new_expr)
+                                })
+                                .collect::<Vec<Expr>>();
+
+                            // Since `group_expr` may have changed, schema may also.
+                            // Use `try_new()` method.
+                            Aggregate::try_new(new_input, new_group_expr, new_aggr_expr)
+                                .map(LogicalPlan::Aggregate)
+                                .map(Transformed::no)
+                        } else {
+                            Aggregate::try_new_with_schema(
+                                new_input,
+                                new_group_expr,
+                                rewritten_aggr_expr,
+                                schema,
+                            )
+                            .map(LogicalPlan::Aggregate)
+                            .map(Transformed::no)
+                        }
+                    }
+                }
+            },
+        )
+    }
+
+    /// Rewrites the expr list and input to remove common subexpressions
+    ///
+    /// # Parameters
+    ///
+    /// * `exprs`: List of expressions in the node
+    /// * `input`: input plan (that produces the columns referred to in `exprs`)
+    ///
+    /// # Return value
+    ///
+    ///  Returns `(rewritten_exprs, new_input)`. `new_input` is either:
+    ///
+    /// 1. The original `input` of no common subexpressions were extracted
+    /// 2. A newly added projection on top of the original input
+    ///    that computes the common subexpressions
+    fn try_unary_plan(
+        &self,
+        exprs: Vec<Expr>,
+        input: LogicalPlan,
+        config: &dyn OptimizerConfig,
+    ) -> Result<Transformed<(Vec<Expr>, LogicalPlan)>> {
+        // Extract common sub-expressions from the expressions.
+        match CSE::new(ExprCSEController::new(
+            config.alias_generator().as_ref(),
+            ExprMask::Normal,
+        ))
+        .extract_common_nodes(vec![exprs])?
+        {
+            FoundCommonNodes::Yes {
+                common_nodes: common_exprs,
+                new_nodes_list: mut new_exprs_list,
+                original_nodes_list: _,
+            } => {
+                let new_exprs = new_exprs_list.pop().unwrap();
+                build_common_expr_project_plan(input, common_exprs)
+                    .map(|new_input| Transformed::yes((new_exprs, new_input)))
+            }
+            FoundCommonNodes::No {
+                original_nodes_list: mut original_exprs_list,
+            } => {
+                let new_exprs = original_exprs_list.pop().unwrap();
+                Ok(Transformed::no((new_exprs, input)))
+            }
+        }?
+        // Recurse into the new input.
+        // (This is similar to what a `ApplyOrder::TopDown` optimizer rule would do.)
+        .transform_data(|(new_exprs, new_input)| {
+            self.rewrite(new_input, config)?
+                .map_data(|new_input| Ok((new_exprs, new_input)))
+        })
     }
 }
 
+/// Get all window expressions inside the consecutive window operators.
+///
+/// Returns the window expressions, and the input to the deepest child
+/// LogicalPlan.
+///
+/// For example, if the input window looks like
+///
+/// ```text
+///   LogicalPlan::Window(exprs=[a, b, c])
+///     LogicalPlan::Window(exprs=[d])
+///       InputPlan
+/// ```
+///
+/// Returns:
+/// *  `window_exprs`: `[[a, b, c], [d]]`
+/// * InputPlan
+///
+/// Consecutive window expressions may refer to same complex expression.
+///
+/// If same complex expression is referred more than once by subsequent
+/// `WindowAggr`s, we can cache complex expression by evaluating it with a
+/// projection before the first WindowAggr.
+///
+/// This enables us to cache complex expression "c3+c4" for following plan:
+///
+/// ```text
+/// WindowAggr: windowExpr=[[sum(c9) ORDER BY [c3 + c4] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]
+/// --WindowAggr: windowExpr=[[sum(c9) ORDER BY [c3 + c4] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]
+/// ```
+///
+/// where, it is referred once by each `WindowAggr` (total of 2) in the plan.
+fn get_consecutive_window_exprs(
+    window: Window,
+) -> (Vec<Vec<Expr>>, Vec<DFSchemaRef>, LogicalPlan) {
+    let mut window_expr_list = vec![];
+    let mut window_schemas = vec![];
+    let mut plan = LogicalPlan::Window(window);
+    while let LogicalPlan::Window(Window {
+        input,
+        window_expr,
+        schema,
+    }) = plan
+    {
+        window_expr_list.push(window_expr);
+        window_schemas.push(schema);
+
+        plan = Arc::unwrap_or_clone(input);
+    }
+    (window_expr_list, window_schemas, plan)
+}
+
 impl OptimizerRule for CommonSubexprEliminate {
-    fn try_optimize(
+    fn supports_rewrite(&self) -> bool {
+        true
+    }
+
+    fn apply_order(&self) -> Option<ApplyOrder> {
+        // This rule handles recursion itself in a `ApplyOrder::TopDown` like manner.
+        // This is because in some cases adjacent nodes are collected (e.g. `Window`) and
+        // CSEd as a group, which can't be done in a simple `ApplyOrder::TopDown` rule.
+        None
+    }
+
+    #[cfg_attr(feature = "recursive_protection", recursive::recursive)]
+    fn rewrite(
         &self,
-        plan: &LogicalPlan,
+        plan: LogicalPlan,
         config: &dyn OptimizerConfig,
-    ) -> Result<Option<LogicalPlan>> {
+    ) -> Result<Transformed<LogicalPlan>> {
+        let original_schema = Arc::clone(plan.schema());
+
         let optimized_plan = match plan {
-            LogicalPlan::Projection(projection) => {
-                Some(self.try_optimize_projection(projection, config)?)
-            }
-            LogicalPlan::Filter(filter) => {
-                Some(self.try_optimize_filter(filter, config)?)
-            }
-            LogicalPlan::Window(window) => {
-                Some(self.try_optimize_window(window, config)?)
-            }
-            LogicalPlan::Aggregate(aggregate) => {
-                Some(self.try_optimize_aggregate(aggregate, config)?)
-            }
-            LogicalPlan::Sort(sort) => Some(self.try_optimize_sort(sort, config)?),
+            LogicalPlan::Projection(proj) => self.try_optimize_proj(proj, config)?,
+            LogicalPlan::Sort(sort) => self.try_optimize_sort(sort, config)?,
+            LogicalPlan::Filter(filter) => self.try_optimize_filter(filter, config)?,
+            LogicalPlan::Window(window) => self.try_optimize_window(window, config)?,
+            LogicalPlan::Aggregate(agg) => self.try_optimize_aggregate(agg, config)?,
             LogicalPlan::Join(_)
-            | LogicalPlan::CrossJoin(_)
             | LogicalPlan::Repartition(_)
             | LogicalPlan::Union(_)
             | LogicalPlan::TableScan(_)
@@ -414,140 +564,27 @@ impl OptimizerRule for CommonSubexprEliminate {
             | LogicalPlan::Dml(_)
             | LogicalPlan::Copy(_)
             | LogicalPlan::Unnest(_)
-            | LogicalPlan::RecursiveQuery(_)
-            | LogicalPlan::Prepare(_) => {
-                // apply the optimization to all inputs of the plan
-                utils::optimize_children(self, plan, config)?
+            | LogicalPlan::RecursiveQuery(_) => {
+                // This rule handles recursion itself in a `ApplyOrder::TopDown` like
+                // manner.
+                plan.map_children(|c| self.rewrite(c, config))?
             }
         };
 
-        let original_schema = plan.schema().clone();
-        match optimized_plan {
-            Some(optimized_plan) if optimized_plan.schema() != &original_schema => {
-                // add an additional projection if the output schema changed.
-                Ok(Some(build_recover_project_plan(
-                    &original_schema,
-                    optimized_plan,
-                )?))
-            }
-            plan => Ok(plan),
+        // If we rewrote the plan, ensure the schema stays the same
+        if optimized_plan.transformed && optimized_plan.data.schema() != &original_schema
+        {
+            optimized_plan.map_data(|optimized_plan| {
+                build_recover_project_plan(&original_schema, optimized_plan)
+            })
+        } else {
+            Ok(optimized_plan)
         }
     }
 
     fn name(&self) -> &str {
         "common_sub_expression_eliminate"
     }
-}
-
-impl Default for CommonSubexprEliminate {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl CommonSubexprEliminate {
-    #[allow(missing_docs)]
-    pub fn new() -> Self {
-        Self {}
-    }
-}
-
-fn pop_expr(new_expr: &mut Vec<Vec<Expr>>) -> Result<Vec<Expr>> {
-    new_expr
-        .pop()
-        .ok_or_else(|| DataFusionError::Internal("Failed to pop expression".to_string()))
-}
-
-fn to_arrays(
-    expr: &[Expr],
-    input_schema: DFSchemaRef,
-    expr_set: &mut ExprSet,
-    expr_mask: ExprMask,
-) -> Result<Vec<Vec<(usize, String)>>> {
-    expr.iter()
-        .map(|e| {
-            let mut id_array = vec![];
-            expr_to_identifier(
-                e,
-                expr_set,
-                &mut id_array,
-                Arc::clone(&input_schema),
-                expr_mask,
-            )?;
-
-            Ok(id_array)
-        })
-        .collect::<Result<Vec<_>>>()
-}
-
-/// Build the "intermediate" projection plan that evaluates the extracted common expressions.
-fn build_common_expr_project_plan(
-    input: LogicalPlan,
-    affected_id: BTreeSet<Identifier>,
-    expr_set: &ExprSet,
-) -> Result<LogicalPlan> {
-    let mut project_exprs = vec![];
-    let mut fields_set = BTreeSet::new();
-
-    for id in affected_id {
-        match expr_set.get(&id) {
-            Some((expr, _, data_type)) => {
-                // todo: check `nullable`
-                let field = DFField::new_unqualified(&id, data_type.clone(), true);
-                fields_set.insert(field.name().to_owned());
-                project_exprs.push(expr.clone().alias(&id));
-            }
-            _ => {
-                return internal_err!("expr_set invalid state");
-            }
-        }
-    }
-
-    for field in input.schema().fields() {
-        if fields_set.insert(field.qualified_name()) {
-            project_exprs.push(Expr::Column(field.qualified_column()));
-        }
-    }
-
-    Ok(LogicalPlan::Projection(Projection::try_new(
-        project_exprs,
-        Arc::new(input),
-    )?))
-}
-
-/// Build the projection plan to eliminate unexpected columns produced by
-/// the "intermediate" projection plan built in [build_common_expr_project_plan].
-///
-/// This is for those plans who don't keep its own output schema like `Filter` or `Sort`.
-fn build_recover_project_plan(
-    schema: &DFSchema,
-    input: LogicalPlan,
-) -> Result<LogicalPlan> {
-    let col_exprs = schema
-        .fields()
-        .iter()
-        .map(|field| Expr::Column(field.qualified_column()))
-        .collect();
-    Ok(LogicalPlan::Projection(Projection::try_new(
-        col_exprs,
-        Arc::new(input),
-    )?))
-}
-
-fn extract_expressions(
-    expr: &Expr,
-    schema: &DFSchema,
-    result: &mut Vec<Expr>,
-) -> Result<()> {
-    if let Expr::GroupingSet(groupings) = expr {
-        for e in groupings.distinct_expr() {
-            result.push(Expr::Column(e.to_field(schema)?.qualified_column()))
-        }
-    } else {
-        result.push(Expr::Column(expr.to_field(schema)?.qualified_column()));
-    }
-
-    Ok(())
 }
 
 /// Which type of [expressions](Expr) should be considered for rewriting?
@@ -559,7 +596,6 @@ enum ExprMask {
     /// - [`Columns`](Expr::Column)
     /// - [`ScalarVariable`](Expr::ScalarVariable)
     /// - [`Alias`](Expr::Alias)
-    /// - [`Sort`](Expr::Sort)
     /// - [`Wildcard`](Expr::Wildcard)
     /// - [`AggregateFunction`](Expr::AggregateFunction)
     Normal,
@@ -568,362 +604,220 @@ enum ExprMask {
     NormalAndAggregates,
 }
 
-impl ExprMask {
-    fn ignores(&self, expr: &Expr) -> bool {
+struct ExprCSEController<'a> {
+    alias_generator: &'a AliasGenerator,
+    mask: ExprMask,
+
+    // how many aliases have we seen so far
+    alias_counter: usize,
+}
+
+impl<'a> ExprCSEController<'a> {
+    fn new(alias_generator: &'a AliasGenerator, mask: ExprMask) -> Self {
+        Self {
+            alias_generator,
+            mask,
+            alias_counter: 0,
+        }
+    }
+}
+
+impl CSEController for ExprCSEController<'_> {
+    type Node = Expr;
+
+    fn conditional_children(node: &Expr) -> Option<(Vec<&Expr>, Vec<&Expr>)> {
+        match node {
+            // In case of `ScalarFunction`s we don't know which children are surely
+            // executed so start visiting all children conditionally and stop the
+            // recursion with `TreeNodeRecursion::Jump`.
+            Expr::ScalarFunction(ScalarFunction { func, args })
+                if func.short_circuits() =>
+            {
+                Some((vec![], args.iter().collect()))
+            }
+
+            // In case of `And` and `Or` the first child is surely executed, but we
+            // account subexpressions as conditional in the second.
+            Expr::BinaryExpr(BinaryExpr {
+                left,
+                op: Operator::And | Operator::Or,
+                right,
+            }) => Some((vec![left.as_ref()], vec![right.as_ref()])),
+
+            // In case of `Case` the optional base expression and the first when
+            // expressions are surely executed, but we account subexpressions as
+            // conditional in the others.
+            Expr::Case(Case {
+                expr,
+                when_then_expr,
+                else_expr,
+            }) => Some((
+                expr.iter()
+                    .map(|e| e.as_ref())
+                    .chain(when_then_expr.iter().take(1).map(|(when, _)| when.as_ref()))
+                    .collect(),
+                when_then_expr
+                    .iter()
+                    .take(1)
+                    .map(|(_, then)| then.as_ref())
+                    .chain(
+                        when_then_expr
+                            .iter()
+                            .skip(1)
+                            .flat_map(|(when, then)| [when.as_ref(), then.as_ref()]),
+                    )
+                    .chain(else_expr.iter().map(|e| e.as_ref()))
+                    .collect(),
+            )),
+            _ => None,
+        }
+    }
+
+    fn is_valid(node: &Expr) -> bool {
+        !node.is_volatile_node()
+    }
+
+    fn is_ignored(&self, node: &Expr) -> bool {
         let is_normal_minus_aggregates = matches!(
-            expr,
+            node,
             Expr::Literal(..)
                 | Expr::Column(..)
                 | Expr::ScalarVariable(..)
                 | Expr::Alias(..)
-                | Expr::Sort { .. }
                 | Expr::Wildcard { .. }
         );
 
-        let is_aggr = matches!(expr, Expr::AggregateFunction(..));
+        let is_aggr = matches!(node, Expr::AggregateFunction(..));
 
-        match self {
-            Self::Normal => is_normal_minus_aggregates || is_aggr,
-            Self::NormalAndAggregates => is_normal_minus_aggregates,
+        match self.mask {
+            ExprMask::Normal => is_normal_minus_aggregates || is_aggr,
+            ExprMask::NormalAndAggregates => is_normal_minus_aggregates,
+        }
+    }
+
+    fn generate_alias(&self) -> String {
+        self.alias_generator.next(CSE_PREFIX)
+    }
+
+    fn rewrite(&mut self, node: &Self::Node, alias: &str) -> Self::Node {
+        // alias the expressions without an `Alias` ancestor node
+        if self.alias_counter > 0 {
+            col(alias)
+        } else {
+            self.alias_counter += 1;
+            col(alias).alias(node.schema_name().to_string())
+        }
+    }
+
+    fn rewrite_f_down(&mut self, node: &Expr) {
+        if matches!(node, Expr::Alias(_)) {
+            self.alias_counter += 1;
+        }
+    }
+    fn rewrite_f_up(&mut self, node: &Expr) {
+        if matches!(node, Expr::Alias(_)) {
+            self.alias_counter -= 1
         }
     }
 }
 
-/// Go through an expression tree and generate identifier.
+impl Default for CommonSubexprEliminate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Build the "intermediate" projection plan that evaluates the extracted common
+/// expressions.
 ///
-/// An identifier contains information of the expression itself and its sub-expression.
-/// This visitor implementation use a stack `visit_stack` to track traversal, which
-/// lets us know when a sub-tree's visiting is finished. When `pre_visit` is called
-/// (traversing to a new node), an `EnterMark` and an `ExprItem` will be pushed into stack.
-/// And try to pop out a `EnterMark` on leaving a node (`post_visit()`). All `ExprItem`
-/// before the first `EnterMark` is considered to be sub-tree of the leaving node.
+/// # Arguments
+/// input: the input plan
 ///
-/// This visitor also records identifier in `id_array`. Makes the following traverse
-/// pass can get the identifier of a node without recalculate it. We assign each node
-/// in the expr tree a series number, start from 1, maintained by `series_number`.
-/// Series number represents the order we left (`post_visit`) a node. Has the property
-/// that child node's series number always smaller than parent's. While `id_array` is
-/// organized in the order we enter (`pre_visit`) a node. `node_count` helps us to
-/// get the index of `id_array` for each node.
+/// common_exprs: which common subexpressions were used (and thus are added to
+/// intermediate projection)
 ///
-/// `Expr` without sub-expr (column, literal etc.) will not have identifier
-/// because they should not be recognized as common sub-expr.
-struct ExprIdentifierVisitor<'a> {
-    // param
-    expr_set: &'a mut ExprSet,
-    /// series number (usize) and identifier.
-    id_array: &'a mut Vec<(usize, Identifier)>,
-    /// input schema for the node that we're optimizing, so we can determine the correct datatype
-    /// for each subexpression
-    input_schema: DFSchemaRef,
-    // inner states
-    visit_stack: Vec<VisitRecord>,
-    /// increased in pre_visit, start from 0.
-    node_count: usize,
-    /// increased in post_visit, start from 1.
-    series_number: usize,
-    /// which expression should be skipped?
-    expr_mask: ExprMask,
-}
+/// expr_stats: the set of common subexpressions
+fn build_common_expr_project_plan(
+    input: LogicalPlan,
+    common_exprs: Vec<(Expr, String)>,
+) -> Result<LogicalPlan> {
+    let mut fields_set = BTreeSet::new();
+    let mut project_exprs = common_exprs
+        .into_iter()
+        .map(|(expr, expr_alias)| {
+            fields_set.insert(expr_alias.clone());
+            Ok(expr.alias(expr_alias))
+        })
+        .collect::<Result<Vec<_>>>()?;
 
-/// Record item that used when traversing a expression tree.
-enum VisitRecord {
-    /// `usize` is the monotone increasing series number assigned in pre_visit().
-    /// Starts from 0. Is used to index the identifier array `id_array` in post_visit().
-    EnterMark(usize),
-    /// Accumulated identifier of sub expression.
-    ExprItem(Identifier),
-}
-
-impl ExprIdentifierVisitor<'_> {
-    fn desc_expr(expr: &Expr) -> String {
-        format!("{expr}")
-    }
-
-    /// Find the first `EnterMark` in the stack, and accumulates every `ExprItem`
-    /// before it.
-    fn pop_enter_mark(&mut self) -> (usize, Identifier) {
-        let mut desc = String::new();
-
-        while let Some(item) = self.visit_stack.pop() {
-            match item {
-                VisitRecord::EnterMark(idx) => {
-                    return (idx, desc);
-                }
-                VisitRecord::ExprItem(s) => {
-                    desc.push_str(&s);
-                }
-            }
-        }
-
-        unreachable!("Enter mark should paired with node number");
-    }
-}
-
-impl TreeNodeVisitor for ExprIdentifierVisitor<'_> {
-    type N = Expr;
-
-    fn pre_visit(&mut self, expr: &Expr) -> Result<VisitRecursion> {
-        // related to https://github.com/apache/arrow-datafusion/issues/8814
-        // If the expr contain volatile expression or is a short-circuit expression, skip it.
-        if expr.short_circuits() || is_volatile_expression(expr)? {
-            return Ok(VisitRecursion::Skip);
-        }
-        self.visit_stack
-            .push(VisitRecord::EnterMark(self.node_count));
-        self.node_count += 1;
-        // put placeholder
-        self.id_array.push((0, "".to_string()));
-        Ok(VisitRecursion::Continue)
-    }
-
-    fn post_visit(&mut self, expr: &Expr) -> Result<VisitRecursion> {
-        self.series_number += 1;
-
-        let (idx, sub_expr_desc) = self.pop_enter_mark();
-        // skip exprs should not be recognize.
-        if self.expr_mask.ignores(expr) {
-            self.id_array[idx].0 = self.series_number;
-            let desc = Self::desc_expr(expr);
-            self.visit_stack.push(VisitRecord::ExprItem(desc));
-            return Ok(VisitRecursion::Continue);
-        }
-        let mut desc = Self::desc_expr(expr);
-        desc.push_str(&sub_expr_desc);
-
-        self.id_array[idx] = (self.series_number, desc.clone());
-        self.visit_stack.push(VisitRecord::ExprItem(desc.clone()));
-
-        let data_type = expr.get_type(&self.input_schema)?;
-
-        self.expr_set
-            .entry(desc)
-            .or_insert_with(|| (expr.clone(), 0, data_type))
-            .1 += 1;
-        Ok(VisitRecursion::Continue)
-    }
-}
-
-/// Go through an expression tree and generate identifier for every node in this tree.
-fn expr_to_identifier(
-    expr: &Expr,
-    expr_set: &mut ExprSet,
-    id_array: &mut Vec<(usize, Identifier)>,
-    input_schema: DFSchemaRef,
-    expr_mask: ExprMask,
-) -> Result<()> {
-    expr.visit(&mut ExprIdentifierVisitor {
-        expr_set,
-        id_array,
-        input_schema,
-        visit_stack: vec![],
-        node_count: 0,
-        series_number: 0,
-        expr_mask,
-    })?;
-
-    Ok(())
-}
-
-/// Rewrite expression by replacing detected common sub-expression with
-/// the corresponding temporary column name. That column contains the
-/// evaluate result of replaced expression.
-struct CommonSubexprRewriter<'a> {
-    expr_set: &'a ExprSet,
-    id_array: &'a [(usize, Identifier)],
-    /// Which identifier is replaced.
-    affected_id: &'a mut BTreeSet<Identifier>,
-
-    /// the max series number we have rewritten. Other expression nodes
-    /// with smaller series number is already replaced and shouldn't
-    /// do anything with them.
-    max_series_number: usize,
-    /// current node's information's index in `id_array`.
-    curr_index: usize,
-}
-
-impl TreeNodeRewriter for CommonSubexprRewriter<'_> {
-    type N = Expr;
-
-    fn pre_visit(&mut self, expr: &Expr) -> Result<RewriteRecursion> {
-        // The `CommonSubexprRewriter` relies on `ExprIdentifierVisitor` to generate
-        // the `id_array`, which records the expr's identifier used to rewrite expr. So if we
-        // skip an expr in `ExprIdentifierVisitor`, we should skip it here, too.
-        if expr.short_circuits() || is_volatile_expression(expr)? {
-            return Ok(RewriteRecursion::Stop);
-        }
-        if self.curr_index >= self.id_array.len()
-            || self.max_series_number > self.id_array[self.curr_index].0
-        {
-            return Ok(RewriteRecursion::Stop);
-        }
-
-        let curr_id = &self.id_array[self.curr_index].1;
-        // skip `Expr`s without identifier (empty identifier).
-        if curr_id.is_empty() {
-            self.curr_index += 1;
-            return Ok(RewriteRecursion::Skip);
-        }
-        match self.expr_set.get(curr_id) {
-            Some((_, counter, _)) => {
-                if *counter > 1 {
-                    self.affected_id.insert(curr_id.clone());
-                    Ok(RewriteRecursion::Mutate)
-                } else {
-                    self.curr_index += 1;
-                    Ok(RewriteRecursion::Skip)
-                }
-            }
-            _ => internal_err!("expr_set invalid state"),
+    for (qualifier, field) in input.schema().iter() {
+        if fields_set.insert(qualified_name(qualifier, field.name())) {
+            project_exprs.push(Expr::from((qualifier, field)));
         }
     }
 
-    fn mutate(&mut self, expr: Expr) -> Result<Expr> {
-        // This expr tree is finished.
-        if self.curr_index >= self.id_array.len() {
-            return Ok(expr);
-        }
-
-        let (series_number, id) = &self.id_array[self.curr_index];
-        self.curr_index += 1;
-        // Skip sub-node of a replaced tree, or without identifier, or is not repeated expr.
-        let expr_set_item = self.expr_set.get(id).ok_or_else(|| {
-            DataFusionError::Internal("expr_set invalid state".to_string())
-        })?;
-        if *series_number < self.max_series_number
-            || id.is_empty()
-            || expr_set_item.1 <= 1
-        {
-            return Ok(expr);
-        }
-
-        self.max_series_number = *series_number;
-        // step index to skip all sub-node (which has smaller series number).
-        while self.curr_index < self.id_array.len()
-            && *series_number > self.id_array[self.curr_index].0
-        {
-            self.curr_index += 1;
-        }
-
-        let expr_name = expr.display_name()?;
-        // Alias this `Column` expr to it original "expr name",
-        // `projection_push_down` optimizer use "expr name" to eliminate useless
-        // projections.
-        Ok(col(id).alias(expr_name))
-    }
+    Projection::try_new(project_exprs, Arc::new(input)).map(LogicalPlan::Projection)
 }
 
-fn replace_common_expr(
-    expr: Expr,
-    id_array: &[(usize, Identifier)],
-    expr_set: &ExprSet,
-    affected_id: &mut BTreeSet<Identifier>,
-) -> Result<Expr> {
-    expr.rewrite(&mut CommonSubexprRewriter {
-        expr_set,
-        id_array,
-        affected_id,
-        max_series_number: 0,
-        curr_index: 0,
-    })
+/// Build the projection plan to eliminate unnecessary columns produced by
+/// the "intermediate" projection plan built in [build_common_expr_project_plan].
+///
+/// This is required to keep the schema the same for plans that pass the input
+/// on to the output, such as `Filter` or `Sort`.
+fn build_recover_project_plan(
+    schema: &DFSchema,
+    input: LogicalPlan,
+) -> Result<LogicalPlan> {
+    let col_exprs = schema.iter().map(Expr::from).collect();
+    Projection::try_new(col_exprs, Arc::new(input)).map(LogicalPlan::Projection)
+}
+
+fn extract_expressions(expr: &Expr, result: &mut Vec<Expr>) {
+    if let Expr::GroupingSet(groupings) = expr {
+        for e in groupings.distinct_expr() {
+            let (qualifier, field_name) = e.qualified_name();
+            let col = Column::new(qualifier, field_name);
+            result.push(Expr::Column(col))
+        }
+    } else {
+        let (qualifier, field_name) = expr.qualified_name();
+        let col = Column::new(qualifier, field_name);
+        result.push(Expr::Column(col));
+    }
 }
 
 #[cfg(test)]
 mod test {
+    use std::any::Any;
     use std::iter;
 
-    use arrow::datatypes::{Field, Schema};
-
-    use datafusion_common::DFSchema;
+    use arrow::datatypes::{DataType, Field, Schema};
     use datafusion_expr::logical_plan::{table_scan, JoinType};
     use datafusion_expr::{
-        avg, col, lit, logical_plan::builder::LogicalPlanBuilder, sum,
+        grouping_set, is_null, not, AccumulatorFactoryFunction, AggregateUDF,
+        ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, SimpleAggregateUDF,
+        Volatility,
     };
-    use datafusion_expr::{
-        grouping_set, AccumulatorFactoryFunction, AggregateUDF, Signature,
-        SimpleAggregateUDF, Volatility,
-    };
-
-    use crate::optimizer::OptimizerContext;
-    use crate::test::*;
+    use datafusion_expr::{lit, logical_plan::builder::LogicalPlanBuilder};
 
     use super::*;
+    use crate::optimizer::OptimizerContext;
+    use crate::test::*;
+    use crate::Optimizer;
+    use datafusion_expr::test::function_stub::{avg, sum};
 
-    fn assert_optimized_plan_eq(expected: &str, plan: &LogicalPlan) {
-        let optimizer = CommonSubexprEliminate {};
-        let optimized_plan = optimizer
-            .try_optimize(plan, &OptimizerContext::new())
-            .unwrap()
-            .expect("failed to optimize plan");
-        let formatted_plan = format!("{optimized_plan:?}");
+    fn assert_optimized_plan_eq(
+        expected: &str,
+        plan: LogicalPlan,
+        config: Option<&dyn OptimizerConfig>,
+    ) {
+        let optimizer =
+            Optimizer::with_rules(vec![Arc::new(CommonSubexprEliminate::new())]);
+        let default_config = OptimizerContext::new();
+        let config = config.unwrap_or(&default_config);
+        let optimized_plan = optimizer.optimize(plan, config, |_, _| ()).unwrap();
+        let formatted_plan = format!("{optimized_plan}");
         assert_eq!(expected, formatted_plan);
-    }
-
-    #[test]
-    fn id_array_visitor() -> Result<()> {
-        let expr = ((sum(col("a") + lit(1))) - avg(col("c"))) * lit(2);
-
-        let schema = Arc::new(DFSchema::new_with_metadata(
-            vec![
-                DFField::new_unqualified("a", DataType::Int64, false),
-                DFField::new_unqualified("c", DataType::Int64, false),
-            ],
-            Default::default(),
-        )?);
-
-        // skip aggregates
-        let mut id_array = vec![];
-        expr_to_identifier(
-            &expr,
-            &mut HashMap::new(),
-            &mut id_array,
-            Arc::clone(&schema),
-            ExprMask::Normal,
-        )?;
-
-        let expected = vec![
-            (9, "(SUM(a + Int32(1)) - AVG(c)) * Int32(2)Int32(2)SUM(a + Int32(1)) - AVG(c)AVG(c)SUM(a + Int32(1))"),
-            (7, "SUM(a + Int32(1)) - AVG(c)AVG(c)SUM(a + Int32(1))"),
-            (4, ""),
-            (3, "a + Int32(1)Int32(1)a"),
-            (1, ""),
-            (2, ""),
-            (6, ""),
-            (5, ""),
-            (8, "")
-        ]
-        .into_iter()
-        .map(|(number, id)| (number, id.into()))
-        .collect::<Vec<_>>();
-        assert_eq!(expected, id_array);
-
-        // include aggregates
-        let mut id_array = vec![];
-        expr_to_identifier(
-            &expr,
-            &mut HashMap::new(),
-            &mut id_array,
-            Arc::clone(&schema),
-            ExprMask::NormalAndAggregates,
-        )?;
-
-        let expected = vec![
-            (9, "(SUM(a + Int32(1)) - AVG(c)) * Int32(2)Int32(2)SUM(a + Int32(1)) - AVG(c)AVG(c)cSUM(a + Int32(1))a + Int32(1)Int32(1)a"),
-            (7, "SUM(a + Int32(1)) - AVG(c)AVG(c)cSUM(a + Int32(1))a + Int32(1)Int32(1)a"),
-            (4, "SUM(a + Int32(1))a + Int32(1)Int32(1)a"),
-            (3, "a + Int32(1)Int32(1)a"),
-            (1, ""),
-            (2, ""),
-            (6, "AVG(c)c"),
-            (5, ""),
-            (8, "")
-        ]
-        .into_iter()
-        .map(|(number, id)| (number, id.into()))
-        .collect::<Vec<_>>();
-        assert_eq!(expected, id_array);
-
-        Ok(())
     }
 
     #[test]
@@ -948,11 +842,31 @@ mod test {
             )?
             .build()?;
 
-        let expected = "Aggregate: groupBy=[[]], aggr=[[SUM(test.a * (Int32(1) - test.b)Int32(1) - test.btest.bInt32(1)test.a AS test.a * Int32(1) - test.b), SUM(test.a * (Int32(1) - test.b)Int32(1) - test.btest.bInt32(1)test.a AS test.a * Int32(1) - test.b * (Int32(1) + test.c))]]\
-        \n  Projection: test.a * (Int32(1) - test.b) AS test.a * (Int32(1) - test.b)Int32(1) - test.btest.bInt32(1)test.a, test.a, test.b, test.c\
+        let expected = "Aggregate: groupBy=[[]], aggr=[[sum(__common_expr_1 AS test.a * Int32(1) - test.b), sum(__common_expr_1 AS test.a * Int32(1) - test.b * (Int32(1) + test.c))]]\
+        \n  Projection: test.a * (Int32(1) - test.b) AS __common_expr_1, test.a, test.b, test.c\
         \n    TableScan: test";
 
-        assert_optimized_plan_eq(expected, &plan);
+        assert_optimized_plan_eq(expected, plan, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn nested_aliases() -> Result<()> {
+        let table_scan = test_table_scan()?;
+
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .project(vec![
+                (col("a") + col("b") - col("c")).alias("alias1") * (col("a") + col("b")),
+                col("a") + col("b"),
+            ])?
+            .build()?;
+
+        let expected = "Projection: __common_expr_1 - test.c AS alias1 * __common_expr_1 AS test.a + test.b, __common_expr_1 AS test.a + test.b\
+        \n  Projection: test.a + test.b AS __common_expr_1, test.a, test.b, test.c\
+        \n    TableScan: test";
+
+        assert_optimized_plan_eq(expected, plan, None);
 
         Ok(())
     }
@@ -963,18 +877,18 @@ mod test {
 
         let return_type = DataType::UInt32;
         let accumulator: AccumulatorFactoryFunction = Arc::new(|_| unimplemented!());
-        let state_type = vec![DataType::UInt32];
         let udf_agg = |inner: Expr| {
             Expr::AggregateFunction(datafusion_expr::expr::AggregateFunction::new_udf(
                 Arc::new(AggregateUDF::from(SimpleAggregateUDF::new_with_signature(
                     "my_agg",
                     Signature::exact(vec![DataType::UInt32], Volatility::Stable),
                     return_type.clone(),
-                    accumulator.clone(),
-                    state_type.clone(),
+                    Arc::clone(&accumulator),
+                    vec![Field::new("value", DataType::UInt32, true)],
                 ))),
                 vec![inner],
                 false,
+                None,
                 None,
                 None,
             ))
@@ -1001,11 +915,11 @@ mod test {
             )?
             .build()?;
 
-        let expected = "Projection: AVG(test.a)test.a AS AVG(test.a) AS col1, AVG(test.a)test.a AS AVG(test.a) AS col2, col3, AVG(test.c) AS AVG(test.c), my_agg(test.a)test.a AS my_agg(test.a) AS col4, my_agg(test.a)test.a AS my_agg(test.a) AS col5, col6, my_agg(test.c) AS my_agg(test.c)\
-        \n  Aggregate: groupBy=[[]], aggr=[[AVG(test.a) AS AVG(test.a)test.a, my_agg(test.a) AS my_agg(test.a)test.a, AVG(test.b) AS col3, AVG(test.c) AS AVG(test.c), my_agg(test.b) AS col6, my_agg(test.c) AS my_agg(test.c)]]\
+        let expected = "Projection: __common_expr_1 AS col1, __common_expr_1 AS col2, col3, __common_expr_3 AS avg(test.c), __common_expr_2 AS col4, __common_expr_2 AS col5, col6, __common_expr_4 AS my_agg(test.c)\
+        \n  Aggregate: groupBy=[[]], aggr=[[avg(test.a) AS __common_expr_1, my_agg(test.a) AS __common_expr_2, avg(test.b) AS col3, avg(test.c) AS __common_expr_3, my_agg(test.b) AS col6, my_agg(test.c) AS __common_expr_4]]\
         \n    TableScan: test";
 
-        assert_optimized_plan_eq(expected, &plan);
+        assert_optimized_plan_eq(expected, plan, None);
 
         // test: trafo after aggregate
         let plan = LogicalPlanBuilder::from(table_scan.clone())
@@ -1020,11 +934,11 @@ mod test {
             )?
             .build()?;
 
-        let expected = "Projection: Int32(1) + AVG(test.a)test.a AS AVG(test.a), Int32(1) - AVG(test.a)test.a AS AVG(test.a), Int32(1) + my_agg(test.a)test.a AS my_agg(test.a), Int32(1) - my_agg(test.a)test.a AS my_agg(test.a)\
-        \n  Aggregate: groupBy=[[]], aggr=[[AVG(test.a) AS AVG(test.a)test.a, my_agg(test.a) AS my_agg(test.a)test.a]]\
+        let expected = "Projection: Int32(1) + __common_expr_1 AS avg(test.a), Int32(1) - __common_expr_1 AS avg(test.a), Int32(1) + __common_expr_2 AS my_agg(test.a), Int32(1) - __common_expr_2 AS my_agg(test.a)\
+        \n  Aggregate: groupBy=[[]], aggr=[[avg(test.a) AS __common_expr_1, my_agg(test.a) AS __common_expr_2]]\
         \n    TableScan: test";
 
-        assert_optimized_plan_eq(expected, &plan);
+        assert_optimized_plan_eq(expected, plan, None);
 
         // test: transformation before aggregate
         let plan = LogicalPlanBuilder::from(table_scan.clone())
@@ -1037,11 +951,11 @@ mod test {
             )?
             .build()?;
 
-        let expected = "Aggregate: groupBy=[[]], aggr=[[AVG(UInt32(1) + test.atest.aUInt32(1) AS UInt32(1) + test.a) AS col1, my_agg(UInt32(1) + test.atest.aUInt32(1) AS UInt32(1) + test.a) AS col2]]\
-        \n  Projection: UInt32(1) + test.a AS UInt32(1) + test.atest.aUInt32(1), test.a, test.b, test.c\
+        let expected = "Aggregate: groupBy=[[]], aggr=[[avg(__common_expr_1) AS col1, my_agg(__common_expr_1) AS col2]]\
+        \n  Projection: UInt32(1) + test.a AS __common_expr_1, test.a, test.b, test.c\
         \n    TableScan: test";
 
-        assert_optimized_plan_eq(expected, &plan);
+        assert_optimized_plan_eq(expected, plan, None);
 
         // test: common between agg and group
         let plan = LogicalPlanBuilder::from(table_scan.clone())
@@ -1054,11 +968,11 @@ mod test {
             )?
             .build()?;
 
-        let expected = "Aggregate: groupBy=[[UInt32(1) + test.atest.aUInt32(1) AS UInt32(1) + test.a]], aggr=[[AVG(UInt32(1) + test.atest.aUInt32(1) AS UInt32(1) + test.a) AS col1, my_agg(UInt32(1) + test.atest.aUInt32(1) AS UInt32(1) + test.a) AS col2]]\
-        \n  Projection: UInt32(1) + test.a AS UInt32(1) + test.atest.aUInt32(1), test.a, test.b, test.c\
+        let expected = "Aggregate: groupBy=[[__common_expr_1 AS UInt32(1) + test.a]], aggr=[[avg(__common_expr_1) AS col1, my_agg(__common_expr_1) AS col2]]\
+        \n  Projection: UInt32(1) + test.a AS __common_expr_1, test.a, test.b, test.c\
         \n    TableScan: test";
 
-        assert_optimized_plan_eq(expected, &plan);
+        assert_optimized_plan_eq(expected, plan, None);
 
         // test: all mixed
         let plan = LogicalPlanBuilder::from(table_scan)
@@ -1075,18 +989,18 @@ mod test {
             )?
             .build()?;
 
-        let expected = "Projection: UInt32(1) + test.a, UInt32(1) + AVG(UInt32(1) + test.atest.aUInt32(1) AS UInt32(1) + test.a)UInt32(1) + test.atest.aUInt32(1) AS UInt32(1) + test.a AS AVG(UInt32(1) + test.a) AS col1, UInt32(1) - AVG(UInt32(1) + test.atest.aUInt32(1) AS UInt32(1) + test.a)UInt32(1) + test.atest.aUInt32(1) AS UInt32(1) + test.a AS AVG(UInt32(1) + test.a) AS col2, AVG(UInt32(1) + test.atest.aUInt32(1) AS UInt32(1) + test.a)UInt32(1) + test.atest.aUInt32(1) AS UInt32(1) + test.a AS AVG(UInt32(1) + test.a), UInt32(1) + my_agg(UInt32(1) + test.atest.aUInt32(1) AS UInt32(1) + test.a)UInt32(1) + test.atest.aUInt32(1) AS UInt32(1) + test.a AS my_agg(UInt32(1) + test.a) AS col3, UInt32(1) - my_agg(UInt32(1) + test.atest.aUInt32(1) AS UInt32(1) + test.a)UInt32(1) + test.atest.aUInt32(1) AS UInt32(1) + test.a AS my_agg(UInt32(1) + test.a) AS col4, my_agg(UInt32(1) + test.atest.aUInt32(1) AS UInt32(1) + test.a)UInt32(1) + test.atest.aUInt32(1) AS UInt32(1) + test.a AS my_agg(UInt32(1) + test.a)\
-        \n  Aggregate: groupBy=[[UInt32(1) + test.atest.aUInt32(1) AS UInt32(1) + test.a]], aggr=[[AVG(UInt32(1) + test.atest.aUInt32(1) AS UInt32(1) + test.a) AS AVG(UInt32(1) + test.atest.aUInt32(1) AS UInt32(1) + test.a)UInt32(1) + test.atest.aUInt32(1) AS UInt32(1) + test.a, my_agg(UInt32(1) + test.atest.aUInt32(1) AS UInt32(1) + test.a) AS my_agg(UInt32(1) + test.atest.aUInt32(1) AS UInt32(1) + test.a)UInt32(1) + test.atest.aUInt32(1) AS UInt32(1) + test.a]]\
-        \n    Projection: UInt32(1) + test.a AS UInt32(1) + test.atest.aUInt32(1), test.a, test.b, test.c\
+        let expected = "Projection: UInt32(1) + test.a, UInt32(1) + __common_expr_2 AS col1, UInt32(1) - __common_expr_2 AS col2, __common_expr_4 AS avg(UInt32(1) + test.a), UInt32(1) + __common_expr_3 AS col3, UInt32(1) - __common_expr_3 AS col4, __common_expr_5 AS my_agg(UInt32(1) + test.a)\
+        \n  Aggregate: groupBy=[[__common_expr_1 AS UInt32(1) + test.a]], aggr=[[avg(__common_expr_1) AS __common_expr_2, my_agg(__common_expr_1) AS __common_expr_3, avg(__common_expr_1 AS UInt32(1) + test.a) AS __common_expr_4, my_agg(__common_expr_1 AS UInt32(1) + test.a) AS __common_expr_5]]\
+        \n    Projection: UInt32(1) + test.a AS __common_expr_1, test.a, test.b, test.c\
         \n      TableScan: test";
 
-        assert_optimized_plan_eq(expected, &plan);
+        assert_optimized_plan_eq(expected, plan, None);
 
         Ok(())
     }
 
     #[test]
-    fn aggregate_with_releations_and_dots() -> Result<()> {
+    fn aggregate_with_relations_and_dots() -> Result<()> {
         let schema = Schema::new(vec![Field::new("col.a", DataType::UInt32, false)]);
         let table_scan = table_scan(Some("table.test"), &schema, None)?.build()?;
 
@@ -1102,12 +1016,12 @@ mod test {
             )?
             .build()?;
 
-        let expected = "Projection: table.test.col.a, UInt32(1) + AVG(UInt32(1) + table.test.col.atable.test.col.aUInt32(1) AS UInt32(1) + table.test.col.a)UInt32(1) + table.test.col.atable.test.col.aUInt32(1) AS UInt32(1) + table.test.col.a AS AVG(UInt32(1) + table.test.col.a), AVG(UInt32(1) + table.test.col.atable.test.col.aUInt32(1) AS UInt32(1) + table.test.col.a)UInt32(1) + table.test.col.atable.test.col.aUInt32(1) AS UInt32(1) + table.test.col.a AS AVG(UInt32(1) + table.test.col.a)\
-        \n  Aggregate: groupBy=[[table.test.col.a]], aggr=[[AVG(UInt32(1) + table.test.col.atable.test.col.aUInt32(1) AS UInt32(1) + table.test.col.a) AS AVG(UInt32(1) + table.test.col.atable.test.col.aUInt32(1) AS UInt32(1) + table.test.col.a)UInt32(1) + table.test.col.atable.test.col.aUInt32(1) AS UInt32(1) + table.test.col.a]]\
-        \n    Projection: UInt32(1) + table.test.col.a AS UInt32(1) + table.test.col.atable.test.col.aUInt32(1), table.test.col.a\
+        let expected = "Projection: table.test.col.a, UInt32(1) + __common_expr_2 AS avg(UInt32(1) + table.test.col.a), __common_expr_2 AS avg(UInt32(1) + table.test.col.a)\
+        \n  Aggregate: groupBy=[[table.test.col.a]], aggr=[[avg(__common_expr_1 AS UInt32(1) + table.test.col.a) AS __common_expr_2]]\
+        \n    Projection: UInt32(1) + table.test.col.a AS __common_expr_1, table.test.col.a\
         \n      TableScan: table.test";
 
-        assert_optimized_plan_eq(expected, &plan);
+        assert_optimized_plan_eq(expected, plan, None);
 
         Ok(())
     }
@@ -1123,11 +1037,11 @@ mod test {
             ])?
             .build()?;
 
-        let expected = "Projection: Int32(1) + test.atest.aInt32(1) AS Int32(1) + test.a AS first, Int32(1) + test.atest.aInt32(1) AS Int32(1) + test.a AS second\
-        \n  Projection: Int32(1) + test.a AS Int32(1) + test.atest.aInt32(1), test.a, test.b, test.c\
+        let expected = "Projection: __common_expr_1 AS first, __common_expr_1 AS second\
+        \n  Projection: Int32(1) + test.a AS __common_expr_1, test.a, test.b, test.c\
         \n    TableScan: test";
 
-        assert_optimized_plan_eq(expected, &plan);
+        assert_optimized_plan_eq(expected, plan, None);
 
         Ok(())
     }
@@ -1140,10 +1054,11 @@ mod test {
             .project(vec![lit(1) + col("a"), col("a") + lit(1)])?
             .build()?;
 
-        let expected = "Projection: Int32(1) + test.a, test.a + Int32(1)\
-        \n  TableScan: test";
+        let expected = "Projection: __common_expr_1 AS Int32(1) + test.a, __common_expr_1 AS test.a + Int32(1)\
+        \n  Projection: Int32(1) + test.a AS __common_expr_1, test.a, test.b, test.c\
+        \n    TableScan: test";
 
-        assert_optimized_plan_eq(expected, &plan);
+        assert_optimized_plan_eq(expected, plan, None);
 
         Ok(())
     }
@@ -1153,50 +1068,39 @@ mod test {
         let table_scan = test_table_scan()?;
 
         let plan = LogicalPlanBuilder::from(table_scan)
-            .project(vec![lit(1) + col("a")])?
+            .project(vec![lit(1) + col("a"), col("a")])?
             .project(vec![lit(1) + col("a")])?
             .build()?;
 
         let expected = "Projection: Int32(1) + test.a\
-        \n  Projection: Int32(1) + test.a\
+        \n  Projection: Int32(1) + test.a, test.a\
         \n    TableScan: test";
 
-        assert_optimized_plan_eq(expected, &plan);
+        assert_optimized_plan_eq(expected, plan, None);
         Ok(())
     }
 
     #[test]
     fn redundant_project_fields() {
         let table_scan = test_table_scan().unwrap();
-        let affected_id: BTreeSet<Identifier> =
-            ["c+a".to_string(), "b+a".to_string()].into_iter().collect();
-        let expr_set_1 = [
-            (
-                "c+a".to_string(),
-                (col("c") + col("a"), 1, DataType::UInt32),
-            ),
-            (
-                "b+a".to_string(),
-                (col("b") + col("a"), 1, DataType::UInt32),
-            ),
-        ]
-        .into_iter()
-        .collect();
-        let expr_set_2 = [
-            ("c+a".to_string(), (col("c+a"), 1, DataType::UInt32)),
-            ("b+a".to_string(), (col("b+a"), 1, DataType::UInt32)),
-        ]
-        .into_iter()
-        .collect();
-        let project =
-            build_common_expr_project_plan(table_scan, affected_id.clone(), &expr_set_1)
-                .unwrap();
-        let project_2 =
-            build_common_expr_project_plan(project, affected_id, &expr_set_2).unwrap();
+        let c_plus_a = col("c") + col("a");
+        let b_plus_a = col("b") + col("a");
+        let common_exprs_1 = vec![
+            (c_plus_a, format!("{CSE_PREFIX}_1")),
+            (b_plus_a, format!("{CSE_PREFIX}_2")),
+        ];
+        let c_plus_a_2 = col(format!("{CSE_PREFIX}_1"));
+        let b_plus_a_2 = col(format!("{CSE_PREFIX}_2"));
+        let common_exprs_2 = vec![
+            (c_plus_a_2, format!("{CSE_PREFIX}_3")),
+            (b_plus_a_2, format!("{CSE_PREFIX}_4")),
+        ];
+        let project = build_common_expr_project_plan(table_scan, common_exprs_1).unwrap();
+        let project_2 = build_common_expr_project_plan(project, common_exprs_2).unwrap();
 
         let mut field_set = BTreeSet::new();
-        for field in project_2.schema().fields() {
-            assert!(field_set.insert(field.qualified_name()));
+        for name in project_2.schema().field_names() {
+            assert!(field_set.insert(name));
         }
     }
 
@@ -1209,43 +1113,24 @@ mod test {
             .unwrap()
             .build()
             .unwrap();
-        let affected_id: BTreeSet<Identifier> =
-            ["test1.c+test1.a".to_string(), "test1.b+test1.a".to_string()]
-                .into_iter()
-                .collect();
-        let expr_set_1 = [
-            (
-                "test1.c+test1.a".to_string(),
-                (col("test1.c") + col("test1.a"), 1, DataType::UInt32),
-            ),
-            (
-                "test1.b+test1.a".to_string(),
-                (col("test1.b") + col("test1.a"), 1, DataType::UInt32),
-            ),
-        ]
-        .into_iter()
-        .collect();
-        let expr_set_2 = [
-            (
-                "test1.c+test1.a".to_string(),
-                (col("test1.c+test1.a"), 1, DataType::UInt32),
-            ),
-            (
-                "test1.b+test1.a".to_string(),
-                (col("test1.b+test1.a"), 1, DataType::UInt32),
-            ),
-        ]
-        .into_iter()
-        .collect();
-        let project =
-            build_common_expr_project_plan(join, affected_id.clone(), &expr_set_1)
-                .unwrap();
-        let project_2 =
-            build_common_expr_project_plan(project, affected_id, &expr_set_2).unwrap();
+        let c_plus_a = col("test1.c") + col("test1.a");
+        let b_plus_a = col("test1.b") + col("test1.a");
+        let common_exprs_1 = vec![
+            (c_plus_a, format!("{CSE_PREFIX}_1")),
+            (b_plus_a, format!("{CSE_PREFIX}_2")),
+        ];
+        let c_plus_a_2 = col(format!("{CSE_PREFIX}_1"));
+        let b_plus_a_2 = col(format!("{CSE_PREFIX}_2"));
+        let common_exprs_2 = vec![
+            (c_plus_a_2, format!("{CSE_PREFIX}_3")),
+            (b_plus_a_2, format!("{CSE_PREFIX}_4")),
+        ];
+        let project = build_common_expr_project_plan(join, common_exprs_1).unwrap();
+        let project_2 = build_common_expr_project_plan(project, common_exprs_2).unwrap();
 
         let mut field_set = BTreeSet::new();
-        for field in project_2.schema().fields() {
-            assert!(field_set.insert(field.qualified_name()));
+        for name in project_2.schema().field_names() {
+            assert!(field_set.insert(name));
         }
     }
 
@@ -1269,11 +1154,10 @@ mod test {
             .unwrap()
             .build()
             .unwrap();
-        let rule = CommonSubexprEliminate {};
-        let optimized_plan = rule
-            .try_optimize(&plan, &OptimizerContext::new())
-            .unwrap()
-            .unwrap();
+        let rule = CommonSubexprEliminate::new();
+        let optimized_plan = rule.rewrite(plan, &OptimizerContext::new()).unwrap();
+        assert!(optimized_plan.transformed);
+        let optimized_plan = optimized_plan.data;
 
         let schema = optimized_plan.schema();
         let fields_with_datatypes: Vec<_> = schema
@@ -1308,10 +1192,11 @@ mod test {
             .build()?;
 
         let expected = "Projection: test.a, test.b, test.c\
-        \n  Filter: Int32(1) + test.atest.aInt32(1) AS Int32(1) + test.a - Int32(10) > Int32(1) + test.atest.aInt32(1) AS Int32(1) + test.a\n    Projection: Int32(1) + test.a AS Int32(1) + test.atest.aInt32(1), test.a, test.b, test.c\
+        \n  Filter: __common_expr_1 - Int32(10) > __common_expr_1\
+        \n    Projection: Int32(1) + test.a AS __common_expr_1, test.a, test.b, test.c\
         \n      TableScan: test";
 
-        assert_optimized_plan_eq(expected, &plan);
+        assert_optimized_plan_eq(expected, plan, None);
 
         Ok(())
     }
@@ -1320,15 +1205,7 @@ mod test {
     fn test_extract_expressions_from_grouping_set() -> Result<()> {
         let mut result = Vec::with_capacity(3);
         let grouping = grouping_set(vec![vec![col("a"), col("b")], vec![col("c")]]);
-        let schema = DFSchema::new_with_metadata(
-            vec![
-                DFField::new_unqualified("a", DataType::Int32, false),
-                DFField::new_unqualified("b", DataType::Int32, false),
-                DFField::new_unqualified("c", DataType::Int32, false),
-            ],
-            HashMap::default(),
-        )?;
-        extract_expressions(&grouping, &schema, &mut result)?;
+        extract_expressions(&grouping, &mut result);
 
         assert!(result.len() == 3);
         Ok(())
@@ -1338,29 +1215,501 @@ mod test {
     fn test_extract_expressions_from_grouping_set_with_identical_expr() -> Result<()> {
         let mut result = Vec::with_capacity(2);
         let grouping = grouping_set(vec![vec![col("a"), col("b")], vec![col("a")]]);
-        let schema = DFSchema::new_with_metadata(
-            vec![
-                DFField::new_unqualified("a", DataType::Int32, false),
-                DFField::new_unqualified("b", DataType::Int32, false),
-            ],
-            HashMap::default(),
-        )?;
-        extract_expressions(&grouping, &schema, &mut result)?;
-
+        extract_expressions(&grouping, &mut result);
         assert!(result.len() == 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_alias_collision() -> Result<()> {
+        let table_scan = test_table_scan()?;
+
+        let config = &OptimizerContext::new();
+        let common_expr_1 = config.alias_generator().next(CSE_PREFIX);
+        let plan = LogicalPlanBuilder::from(table_scan.clone())
+            .project(vec![
+                (col("a") + col("b")).alias(common_expr_1.clone()),
+                col("c"),
+            ])?
+            .project(vec![
+                col(common_expr_1.clone()).alias("c1"),
+                col(common_expr_1).alias("c2"),
+                (col("c") + lit(2)).alias("c3"),
+                (col("c") + lit(2)).alias("c4"),
+            ])?
+            .build()?;
+
+        let expected = "Projection: __common_expr_1 AS c1, __common_expr_1 AS c2, __common_expr_2 AS c3, __common_expr_2 AS c4\
+        \n  Projection: test.c + Int32(2) AS __common_expr_2, __common_expr_1, test.c\
+        \n    Projection: test.a + test.b AS __common_expr_1, test.c\
+        \n      TableScan: test";
+
+        assert_optimized_plan_eq(expected, plan, Some(config));
+
+        let config = &OptimizerContext::new();
+        let _common_expr_1 = config.alias_generator().next(CSE_PREFIX);
+        let common_expr_2 = config.alias_generator().next(CSE_PREFIX);
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .project(vec![
+                (col("a") + col("b")).alias(common_expr_2.clone()),
+                col("c"),
+            ])?
+            .project(vec![
+                col(common_expr_2.clone()).alias("c1"),
+                col(common_expr_2).alias("c2"),
+                (col("c") + lit(2)).alias("c3"),
+                (col("c") + lit(2)).alias("c4"),
+            ])?
+            .build()?;
+
+        let expected = "Projection: __common_expr_2 AS c1, __common_expr_2 AS c2, __common_expr_3 AS c3, __common_expr_3 AS c4\
+        \n  Projection: test.c + Int32(2) AS __common_expr_3, __common_expr_2, test.c\
+        \n    Projection: test.a + test.b AS __common_expr_2, test.c\
+        \n      TableScan: test";
+
+        assert_optimized_plan_eq(expected, plan, Some(config));
+
         Ok(())
     }
 
     #[test]
     fn test_extract_expressions_from_col() -> Result<()> {
         let mut result = Vec::with_capacity(1);
-        let schema = DFSchema::new_with_metadata(
-            vec![DFField::new_unqualified("a", DataType::Int32, false)],
-            HashMap::default(),
-        )?;
-        extract_expressions(&col("a"), &schema, &mut result)?;
-
+        extract_expressions(&col("a"), &mut result);
         assert!(result.len() == 1);
         Ok(())
+    }
+
+    #[test]
+    fn test_short_circuits() -> Result<()> {
+        let table_scan = test_table_scan()?;
+
+        let extracted_short_circuit = col("a").eq(lit(0)).or(col("b").eq(lit(0)));
+        let extracted_short_circuit_leg_1 = (col("a") + col("b")).eq(lit(0));
+        let not_extracted_short_circuit_leg_2 = (col("a") - col("b")).eq(lit(0));
+        let extracted_short_circuit_leg_3 = (col("a") * col("b")).eq(lit(0));
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .project(vec![
+                extracted_short_circuit.clone().alias("c1"),
+                extracted_short_circuit.alias("c2"),
+                extracted_short_circuit_leg_1
+                    .clone()
+                    .or(not_extracted_short_circuit_leg_2.clone())
+                    .alias("c3"),
+                extracted_short_circuit_leg_1
+                    .and(not_extracted_short_circuit_leg_2)
+                    .alias("c4"),
+                extracted_short_circuit_leg_3
+                    .clone()
+                    .or(extracted_short_circuit_leg_3)
+                    .alias("c5"),
+            ])?
+            .build()?;
+
+        let expected = "Projection: __common_expr_1 AS c1, __common_expr_1 AS c2, __common_expr_2 OR test.a - test.b = Int32(0) AS c3, __common_expr_2 AND test.a - test.b = Int32(0) AS c4, __common_expr_3 OR __common_expr_3 AS c5\
+        \n  Projection: test.a = Int32(0) OR test.b = Int32(0) AS __common_expr_1, test.a + test.b = Int32(0) AS __common_expr_2, test.a * test.b = Int32(0) AS __common_expr_3, test.a, test.b, test.c\
+        \n    TableScan: test";
+
+        assert_optimized_plan_eq(expected, plan, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_volatile() -> Result<()> {
+        let table_scan = test_table_scan()?;
+
+        let extracted_child = col("a") + col("b");
+        let rand = rand_func().call(vec![]);
+        let not_extracted_volatile = extracted_child + rand;
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .project(vec![
+                not_extracted_volatile.clone().alias("c1"),
+                not_extracted_volatile.alias("c2"),
+            ])?
+            .build()?;
+
+        let expected = "Projection: __common_expr_1 + random() AS c1, __common_expr_1 + random() AS c2\
+        \n  Projection: test.a + test.b AS __common_expr_1, test.a, test.b, test.c\
+        \n    TableScan: test";
+
+        assert_optimized_plan_eq(expected, plan, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_volatile_short_circuits() -> Result<()> {
+        let table_scan = test_table_scan()?;
+
+        let rand = rand_func().call(vec![]);
+        let extracted_short_circuit_leg_1 = col("a").eq(lit(0));
+        let not_extracted_volatile_short_circuit_1 =
+            extracted_short_circuit_leg_1.or(rand.clone().eq(lit(0)));
+        let not_extracted_short_circuit_leg_2 = col("b").eq(lit(0));
+        let not_extracted_volatile_short_circuit_2 =
+            rand.eq(lit(0)).or(not_extracted_short_circuit_leg_2);
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .project(vec![
+                not_extracted_volatile_short_circuit_1.clone().alias("c1"),
+                not_extracted_volatile_short_circuit_1.alias("c2"),
+                not_extracted_volatile_short_circuit_2.clone().alias("c3"),
+                not_extracted_volatile_short_circuit_2.alias("c4"),
+            ])?
+            .build()?;
+
+        let expected = "Projection: __common_expr_1 OR random() = Int32(0) AS c1, __common_expr_1 OR random() = Int32(0) AS c2, random() = Int32(0) OR test.b = Int32(0) AS c3, random() = Int32(0) OR test.b = Int32(0) AS c4\
+        \n  Projection: test.a = Int32(0) AS __common_expr_1, test.a, test.b, test.c\
+        \n    TableScan: test";
+
+        assert_optimized_plan_eq(expected, plan, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_non_top_level_common_expression() -> Result<()> {
+        let table_scan = test_table_scan()?;
+
+        let common_expr = col("a") + col("b");
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .project(vec![
+                common_expr.clone().alias("c1"),
+                common_expr.alias("c2"),
+            ])?
+            .project(vec![col("c1"), col("c2")])?
+            .build()?;
+
+        let expected = "Projection: c1, c2\
+        \n  Projection: __common_expr_1 AS c1, __common_expr_1 AS c2\
+        \n    Projection: test.a + test.b AS __common_expr_1, test.a, test.b, test.c\
+        \n      TableScan: test";
+
+        assert_optimized_plan_eq(expected, plan, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_nested_common_expression() -> Result<()> {
+        let table_scan = test_table_scan()?;
+
+        let nested_common_expr = col("a") + col("b");
+        let common_expr = nested_common_expr.clone() * nested_common_expr;
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .project(vec![
+                common_expr.clone().alias("c1"),
+                common_expr.alias("c2"),
+            ])?
+            .build()?;
+
+        let expected = "Projection: __common_expr_1 AS c1, __common_expr_1 AS c2\
+        \n  Projection: __common_expr_2 * __common_expr_2 AS __common_expr_1, test.a, test.b, test.c\
+        \n    Projection: test.a + test.b AS __common_expr_2, test.a, test.b, test.c\
+        \n      TableScan: test";
+
+        assert_optimized_plan_eq(expected, plan, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_normalize_add_expression() -> Result<()> {
+        // a + b <=> b + a
+        let table_scan = test_table_scan()?;
+        let expr = ((col("a") + col("b")) * (col("b") + col("a"))).eq(lit(30));
+        let plan = LogicalPlanBuilder::from(table_scan).filter(expr)?.build()?;
+
+        let expected = "Projection: test.a, test.b, test.c\
+        \n  Filter: __common_expr_1 * __common_expr_1 = Int32(30)\
+        \n    Projection: test.a + test.b AS __common_expr_1, test.a, test.b, test.c\
+        \n      TableScan: test";
+        assert_optimized_plan_eq(expected, plan, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_normalize_multi_expression() -> Result<()> {
+        // a * b <=> b * a
+        let table_scan = test_table_scan()?;
+        let expr = ((col("a") * col("b")) + (col("b") * col("a"))).eq(lit(30));
+        let plan = LogicalPlanBuilder::from(table_scan).filter(expr)?.build()?;
+
+        let expected = "Projection: test.a, test.b, test.c\
+        \n  Filter: __common_expr_1 + __common_expr_1 = Int32(30)\
+        \n    Projection: test.a * test.b AS __common_expr_1, test.a, test.b, test.c\
+        \n      TableScan: test";
+        assert_optimized_plan_eq(expected, plan, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_normalize_bitset_and_expression() -> Result<()> {
+        // a & b <=> b & a
+        let table_scan = test_table_scan()?;
+        let expr = ((col("a") & col("b")) + (col("b") & col("a"))).eq(lit(30));
+        let plan = LogicalPlanBuilder::from(table_scan).filter(expr)?.build()?;
+
+        let expected = "Projection: test.a, test.b, test.c\
+        \n  Filter: __common_expr_1 + __common_expr_1 = Int32(30)\
+        \n    Projection: test.a & test.b AS __common_expr_1, test.a, test.b, test.c\
+        \n      TableScan: test";
+        assert_optimized_plan_eq(expected, plan, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_normalize_bitset_or_expression() -> Result<()> {
+        // a | b <=> b | a
+        let table_scan = test_table_scan()?;
+        let expr = ((col("a") | col("b")) + (col("b") | col("a"))).eq(lit(30));
+        let plan = LogicalPlanBuilder::from(table_scan).filter(expr)?.build()?;
+
+        let expected = "Projection: test.a, test.b, test.c\
+        \n  Filter: __common_expr_1 + __common_expr_1 = Int32(30)\
+        \n    Projection: test.a | test.b AS __common_expr_1, test.a, test.b, test.c\
+        \n      TableScan: test";
+        assert_optimized_plan_eq(expected, plan, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_normalize_bitset_xor_expression() -> Result<()> {
+        // a # b <=> b # a
+        let table_scan = test_table_scan()?;
+        let expr = ((col("a") ^ col("b")) + (col("b") ^ col("a"))).eq(lit(30));
+        let plan = LogicalPlanBuilder::from(table_scan).filter(expr)?.build()?;
+
+        let expected = "Projection: test.a, test.b, test.c\
+        \n  Filter: __common_expr_1 + __common_expr_1 = Int32(30)\
+        \n    Projection: test.a BIT_XOR test.b AS __common_expr_1, test.a, test.b, test.c\
+        \n      TableScan: test";
+        assert_optimized_plan_eq(expected, plan, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_normalize_eq_expression() -> Result<()> {
+        // a = b <=> b = a
+        let table_scan = test_table_scan()?;
+        let expr = (col("a").eq(col("b"))).and(col("b").eq(col("a")));
+        let plan = LogicalPlanBuilder::from(table_scan).filter(expr)?.build()?;
+
+        let expected = "Projection: test.a, test.b, test.c\
+        \n  Filter: __common_expr_1 AND __common_expr_1\
+        \n    Projection: test.a = test.b AS __common_expr_1, test.a, test.b, test.c\
+        \n      TableScan: test";
+        assert_optimized_plan_eq(expected, plan, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_normalize_ne_expression() -> Result<()> {
+        // a != b <=> b != a
+        let table_scan = test_table_scan()?;
+        let expr = (col("a").not_eq(col("b"))).and(col("b").not_eq(col("a")));
+        let plan = LogicalPlanBuilder::from(table_scan).filter(expr)?.build()?;
+
+        let expected = "Projection: test.a, test.b, test.c\
+        \n  Filter: __common_expr_1 AND __common_expr_1\
+        \n    Projection: test.a != test.b AS __common_expr_1, test.a, test.b, test.c\
+        \n      TableScan: test";
+        assert_optimized_plan_eq(expected, plan, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_normalize_complex_expression() -> Result<()> {
+        // case1: a + b * c <=> b * c + a
+        let table_scan = test_table_scan()?;
+        let expr = ((col("a") + col("b") * col("c")) - (col("b") * col("c") + col("a")))
+            .eq(lit(30));
+        let plan = LogicalPlanBuilder::from(table_scan).filter(expr)?.build()?;
+
+        let expected = "Projection: test.a, test.b, test.c\
+        \n  Filter: __common_expr_1 - __common_expr_1 = Int32(30)\
+        \n    Projection: test.a + test.b * test.c AS __common_expr_1, test.a, test.b, test.c\
+        \n      TableScan: test";
+        assert_optimized_plan_eq(expected, plan, None);
+
+        // ((c1 + c2 / c3) * c3 <=> c3 * (c2 / c3 + c1))
+        let table_scan = test_table_scan()?;
+        let expr = (((col("a") + col("b") / col("c")) * col("c"))
+            / (col("c") * (col("b") / col("c") + col("a")))
+            + col("a"))
+        .eq(lit(30));
+        let plan = LogicalPlanBuilder::from(table_scan).filter(expr)?.build()?;
+        let expected = "Projection: test.a, test.b, test.c\
+        \n  Filter: __common_expr_1 / __common_expr_1 + test.a = Int32(30)\
+        \n    Projection: (test.a + test.b / test.c) * test.c AS __common_expr_1, test.a, test.b, test.c\
+        \n      TableScan: test";
+        assert_optimized_plan_eq(expected, plan, None);
+
+        // c2 / (c1 + c3) <=> c2 / (c3 + c1)
+        let table_scan = test_table_scan()?;
+        let expr = ((col("b") / (col("a") + col("c")))
+            * (col("b") / (col("c") + col("a"))))
+        .eq(lit(30));
+        let plan = LogicalPlanBuilder::from(table_scan).filter(expr)?.build()?;
+        let expected = "Projection: test.a, test.b, test.c\
+        \n  Filter: __common_expr_1 * __common_expr_1 = Int32(30)\
+        \n    Projection: test.b / (test.a + test.c) AS __common_expr_1, test.a, test.b, test.c\
+        \n      TableScan: test";
+        assert_optimized_plan_eq(expected, plan, None);
+
+        Ok(())
+    }
+
+    #[derive(Debug)]
+    pub struct TestUdf {
+        signature: Signature,
+    }
+
+    impl TestUdf {
+        pub fn new() -> Self {
+            Self {
+                signature: Signature::numeric(1, Volatility::Immutable),
+            }
+        }
+    }
+
+    impl ScalarUDFImpl for TestUdf {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn name(&self) -> &str {
+            "my_udf"
+        }
+
+        fn signature(&self) -> &Signature {
+            &self.signature
+        }
+
+        fn return_type(&self, _: &[DataType]) -> Result<DataType> {
+            Ok(DataType::Int32)
+        }
+
+        fn invoke(&self, _: &[ColumnarValue]) -> Result<ColumnarValue> {
+            panic!("not implemented")
+        }
+    }
+
+    #[test]
+    fn test_normalize_inner_binary_expression() -> Result<()> {
+        // Not(a == b) <=> Not(b == a)
+        let table_scan = test_table_scan()?;
+        let expr1 = not(col("a").eq(col("b")));
+        let expr2 = not(col("b").eq(col("a")));
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .project(vec![expr1, expr2])?
+            .build()?;
+        let expected = "Projection: __common_expr_1 AS NOT test.a = test.b, __common_expr_1 AS NOT test.b = test.a\
+        \n  Projection: NOT test.a = test.b AS __common_expr_1, test.a, test.b, test.c\
+        \n    TableScan: test";
+        assert_optimized_plan_eq(expected, plan, None);
+
+        // is_null(a == b) <=> is_null(b == a)
+        let table_scan = test_table_scan()?;
+        let expr1 = is_null(col("a").eq(col("b")));
+        let expr2 = is_null(col("b").eq(col("a")));
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .project(vec![expr1, expr2])?
+            .build()?;
+        let expected = "Projection: __common_expr_1 AS test.a = test.b IS NULL, __common_expr_1 AS test.b = test.a IS NULL\
+        \n  Projection: test.a = test.b IS NULL AS __common_expr_1, test.a, test.b, test.c\
+        \n    TableScan: test";
+        assert_optimized_plan_eq(expected, plan, None);
+
+        // a + b between 0 and 10 <=> b + a between 0 and 10
+        let table_scan = test_table_scan()?;
+        let expr1 = (col("a") + col("b")).between(lit(0), lit(10));
+        let expr2 = (col("b") + col("a")).between(lit(0), lit(10));
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .project(vec![expr1, expr2])?
+            .build()?;
+        let expected = "Projection: __common_expr_1 AS test.a + test.b BETWEEN Int32(0) AND Int32(10), __common_expr_1 AS test.b + test.a BETWEEN Int32(0) AND Int32(10)\
+        \n  Projection: test.a + test.b BETWEEN Int32(0) AND Int32(10) AS __common_expr_1, test.a, test.b, test.c\
+        \n    TableScan: test";
+        assert_optimized_plan_eq(expected, plan, None);
+
+        // c between a + b and 10 <=> c between b + a and 10
+        let table_scan = test_table_scan()?;
+        let expr1 = col("c").between(col("a") + col("b"), lit(10));
+        let expr2 = col("c").between(col("b") + col("a"), lit(10));
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .project(vec![expr1, expr2])?
+            .build()?;
+        let expected = "Projection: __common_expr_1 AS test.c BETWEEN test.a + test.b AND Int32(10), __common_expr_1 AS test.c BETWEEN test.b + test.a AND Int32(10)\
+        \n  Projection: test.c BETWEEN test.a + test.b AND Int32(10) AS __common_expr_1, test.a, test.b, test.c\
+        \n    TableScan: test";
+        assert_optimized_plan_eq(expected, plan, None);
+
+        // function call with argument <=> function call with argument
+        let udf = ScalarUDF::from(TestUdf::new());
+        let table_scan = test_table_scan()?;
+        let expr1 = udf.call(vec![col("a") + col("b")]);
+        let expr2 = udf.call(vec![col("b") + col("a")]);
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .project(vec![expr1, expr2])?
+            .build()?;
+        let expected = "Projection: __common_expr_1 AS my_udf(test.a + test.b), __common_expr_1 AS my_udf(test.b + test.a)\
+        \n  Projection: my_udf(test.a + test.b) AS __common_expr_1, test.a, test.b, test.c\
+        \n    TableScan: test";
+        assert_optimized_plan_eq(expected, plan, None);
+        Ok(())
+    }
+
+    /// returns a "random" function that is marked volatile (aka each invocation
+    /// returns a different value)
+    ///
+    /// Does not use datafusion_functions::rand to avoid introducing a
+    /// dependency on that crate.
+    fn rand_func() -> ScalarUDF {
+        ScalarUDF::new_from_impl(RandomStub::new())
+    }
+
+    #[derive(Debug)]
+    struct RandomStub {
+        signature: Signature,
+    }
+
+    impl RandomStub {
+        fn new() -> Self {
+            Self {
+                signature: Signature::exact(vec![], Volatility::Volatile),
+            }
+        }
+    }
+    impl ScalarUDFImpl for RandomStub {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn name(&self) -> &str {
+            "random"
+        }
+
+        fn signature(&self) -> &Signature {
+            &self.signature
+        }
+
+        fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+            Ok(DataType::Float64)
+        }
+
+        fn invoke_batch(
+            &self,
+            _args: &[ColumnarValue],
+            _number_rows: usize,
+        ) -> Result<ColumnarValue> {
+            unimplemented!()
+        }
     }
 }

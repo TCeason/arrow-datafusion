@@ -52,8 +52,8 @@ fn main() {
     let statement = &ast[0];
 
     // create a logical query plan
-    let schema_provider = MySchemaProvider::new();
-    let sql_to_rel = SqlToRel::new(&schema_provider);
+    let context_provider = MyContextProvider::new();
+    let sql_to_rel = SqlToRel::new(&context_provider);
     let plan = sql_to_rel.sql_statement_to_plan(statement.clone()).unwrap();
 
     // show the plan
@@ -67,8 +67,8 @@ optimizer that can be applied to plans produced by this crate.
 
 ```
 Sort: state_tax DESC NULLS FIRST
-  Projection: c.id, c.first_name, c.last_name, COUNT(UInt8(1)) AS num_orders, SUM(o.price) AS total_price, SUM(o.price * s.sales_tax) AS state_tax
-    Aggregate: groupBy=[[c.id, c.first_name, c.last_name]], aggr=[[COUNT(UInt8(1)), SUM(o.price), SUM(o.price * s.sales_tax)]]
+  Projection: c.id, c.first_name, c.last_name, COUNT(Int64(1)) AS num_orders, SUM(o.price) AS total_price, SUM(o.price * s.sales_tax) AS state_tax
+    Aggregate: groupBy=[[c.id, c.first_name, c.last_name]], aggr=[[COUNT(Int64(1)), SUM(o.price), SUM(o.price * s.sales_tax)]]
       Filter: o.price > Int64(0) AND c.last_name LIKE Utf8("G%")
         Inner Join: c.id = o.customer_id
           Inner Join: c.state = s.id

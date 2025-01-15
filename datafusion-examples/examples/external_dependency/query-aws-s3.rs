@@ -48,8 +48,7 @@ async fn main() -> Result<()> {
 
     let path = format!("s3://{bucket_name}");
     let s3_url = Url::parse(&path).unwrap();
-    ctx.runtime_env()
-        .register_object_store(&s3_url, Arc::new(s3));
+    ctx.register_object_store(&s3_url, Arc::new(s3));
 
     // cannot query the parquet files from this bucket because the path contains a whitespace
     // and we don't support that yet
@@ -60,6 +59,15 @@ async fn main() -> Result<()> {
 
     // execute the query
     let df = ctx.sql("SELECT * FROM trips LIMIT 10").await?;
+
+    // print the results
+    df.show().await?;
+
+    // dynamic query by the file path
+    let ctx = ctx.enable_url_table();
+    let df = ctx
+        .sql(format!(r#"SELECT * FROM '{}' LIMIT 10"#, &path).as_str())
+        .await?;
 
     // print the results
     df.show().await?;

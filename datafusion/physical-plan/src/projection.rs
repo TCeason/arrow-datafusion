@@ -26,12 +26,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use super::expressions::{Column, PhysicalSortExpr};
+use super::expressions::Column;
 use super::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
-use super::{DisplayAs, RecordBatchStream, SendableRecordBatchStream, Statistics};
-use crate::{
-    ColumnStatistics, DisplayFormatType, ExecutionPlan, Partitioning, PhysicalExpr,
+use super::{
+    DisplayAs, ExecutionPlanProperties, PlanProperties, RecordBatchStream,
+    SendableRecordBatchStream, Statistics,
 };
+use crate::{ColumnStatistics, DisplayFormatType, ExecutionPlan, PhysicalExpr};
 
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
@@ -39,9 +40,9 @@ use datafusion_common::stats::Precision;
 use datafusion_common::Result;
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::equivalence::ProjectionMapping;
-use datafusion_physical_expr::expressions::{Literal, UnKnownColumn};
-use datafusion_physical_expr::EquivalenceProperties;
+use datafusion_physical_expr::expressions::{CastExpr, Literal};
 
+use crate::execution_plan::CardinalityEffect;
 use futures::stream::{Stream, StreamExt};
 use log::trace;
 
@@ -54,13 +55,10 @@ pub struct ProjectionExec {
     schema: SchemaRef,
     /// The input plan
     input: Arc<dyn ExecutionPlan>,
-    /// The output ordering
-    output_ordering: Option<Vec<PhysicalSortExpr>>,
-    /// The mapping used to normalize expressions like Partitioning and
-    /// PhysicalSortExpr that maps input to output
-    projection_mapping: ProjectionMapping,
     /// Execution metrics
     metrics: ExecutionPlanMetricsSet,
+    /// Cache holding plan properties like equivalences, output partitioning etc.
+    cache: PlanProperties,
 }
 
 impl ProjectionExec {
@@ -92,20 +90,16 @@ impl ProjectionExec {
             input_schema.metadata().clone(),
         ));
 
-        // construct a map from the input expressions to the output expression of the Projection
+        // Construct a map from the input expressions to the output expression of the Projection
         let projection_mapping = ProjectionMapping::try_new(&expr, &input_schema)?;
-
-        let input_eqs = input.equivalence_properties();
-        let project_eqs = input_eqs.project(&projection_mapping, schema.clone());
-        let output_ordering = project_eqs.oeq_class().output_ordering();
-
+        let cache =
+            Self::compute_properties(&input, &projection_mapping, Arc::clone(&schema))?;
         Ok(Self {
             expr,
             schema,
             input,
-            output_ordering,
-            projection_mapping,
             metrics: ExecutionPlanMetricsSet::new(),
+            cache,
         })
     }
 
@@ -117,6 +111,30 @@ impl ProjectionExec {
     /// The input plan
     pub fn input(&self) -> &Arc<dyn ExecutionPlan> {
         &self.input
+    }
+
+    /// This function creates the cache object that stores the plan properties such as schema, equivalence properties, ordering, partitioning, etc.
+    fn compute_properties(
+        input: &Arc<dyn ExecutionPlan>,
+        projection_mapping: &ProjectionMapping,
+        schema: SchemaRef,
+    ) -> Result<PlanProperties> {
+        // Calculate equivalence properties:
+        let mut input_eq_properties = input.equivalence_properties().clone();
+        input_eq_properties.substitute_oeq_class(projection_mapping)?;
+        let eq_properties = input_eq_properties.project(projection_mapping, schema);
+
+        // Calculate output partitioning, which needs to respect aliases:
+        let input_partition = input.output_partitioning();
+        let output_partitioning =
+            input_partition.project(projection_mapping, &input_eq_properties);
+
+        Ok(PlanProperties::new(
+            eq_properties,
+            output_partitioning,
+            input.pipeline_behavior(),
+            input.boundedness(),
+        ))
     }
 }
 
@@ -148,62 +166,26 @@ impl DisplayAs for ProjectionExec {
 }
 
 impl ExecutionPlan for ProjectionExec {
+    fn name(&self) -> &'static str {
+        "ProjectionExec"
+    }
+
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
         self
     }
 
-    /// Get the schema for this execution plan
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+    fn properties(&self) -> &PlanProperties {
+        &self.cache
     }
 
-    /// Specifies whether this plan generates an infinite stream of records.
-    /// If the plan does not support pipelining, but its input(s) are
-    /// infinite, returns an error to indicate this.
-    fn unbounded_output(&self, children: &[bool]) -> Result<bool> {
-        Ok(children[0])
-    }
-
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![self.input.clone()]
-    }
-
-    /// Get the output partitioning of this plan
-    fn output_partitioning(&self) -> Partitioning {
-        // Output partition need to respect the alias
-        let input_partition = self.input.output_partitioning();
-        let input_eq_properties = self.input.equivalence_properties();
-        if let Partitioning::Hash(exprs, part) = input_partition {
-            let normalized_exprs = exprs
-                .into_iter()
-                .map(|expr| {
-                    input_eq_properties
-                        .project_expr(&expr, &self.projection_mapping)
-                        .unwrap_or_else(|| {
-                            Arc::new(UnKnownColumn::new(&expr.to_string()))
-                        })
-                })
-                .collect();
-            Partitioning::Hash(normalized_exprs, part)
-        } else {
-            input_partition
-        }
-    }
-
-    fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        self.output_ordering.as_deref()
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
-        // tell optimizer this operator doesn't reorder its input
+        // Tell optimizer this operator doesn't reorder its input
         vec![true]
-    }
-
-    fn equivalence_properties(&self) -> EquivalenceProperties {
-        self.input
-            .equivalence_properties()
-            .project(&self.projection_mapping, self.schema())
     }
 
     fn with_new_children(
@@ -231,8 +213,8 @@ impl ExecutionPlan for ProjectionExec {
     ) -> Result<SendableRecordBatchStream> {
         trace!("Start ProjectionExec::execute for partition {} of context session_id {} and task_id {:?}", partition, context.session_id(), context.task_id());
         Ok(Box::pin(ProjectionStream {
-            schema: self.schema.clone(),
-            expr: self.expr.iter().map(|x| x.0.clone()).collect(),
+            schema: Arc::clone(&self.schema),
+            expr: self.expr.iter().map(|x| Arc::clone(&x.0)).collect(),
             input: self.input.execute(partition, context)?,
             baseline_metrics: BaselineMetrics::new(&self.metrics, partition),
         }))
@@ -246,17 +228,29 @@ impl ExecutionPlan for ProjectionExec {
         Ok(stats_projection(
             self.input.statistics()?,
             self.expr.iter().map(|(e, _)| Arc::clone(e)),
-            self.schema.clone(),
+            Arc::clone(&self.schema),
         ))
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        true
+    }
+
+    fn cardinality_effect(&self) -> CardinalityEffect {
+        CardinalityEffect::Equal
     }
 }
 
-/// If e is a direct column reference, returns the field level
+/// If 'e' is a direct column reference, returns the field level
 /// metadata for that field, if any. Otherwise returns None
-fn get_field_metadata(
+pub(crate) fn get_field_metadata(
     e: &Arc<dyn PhysicalExpr>,
     input_schema: &Schema,
 ) -> Option<HashMap<String, String>> {
+    if let Some(cast) = e.as_any().downcast_ref::<CastExpr>() {
+        return get_field_metadata(cast.expr(), input_schema);
+    }
+
     // Look up field by index in schema (not NAME as there can be more than one
     // column with the same name)
     e.as_any()
@@ -301,7 +295,7 @@ fn stats_projection(
 
 impl ProjectionStream {
     fn batch_project(&self, batch: &RecordBatch) -> Result<RecordBatch> {
-        // records time on drop
+        // Records time on drop
         let _timer = self.baseline_metrics.elapsed_compute().timer();
         let arrays = self
             .expr
@@ -315,10 +309,10 @@ impl ProjectionStream {
         if arrays.is_empty() {
             let options =
                 RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
-            RecordBatch::try_new_with_options(self.schema.clone(), arrays, &options)
+            RecordBatch::try_new_with_options(Arc::clone(&self.schema), arrays, &options)
                 .map_err(Into::into)
         } else {
-            RecordBatch::try_new(self.schema.clone(), arrays).map_err(Into::into)
+            RecordBatch::try_new(Arc::clone(&self.schema), arrays).map_err(Into::into)
         }
     }
 }
@@ -347,7 +341,7 @@ impl Stream for ProjectionStream {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        // same number of record batches
+        // Same number of record batches
         self.input.size_hint()
     }
 }
@@ -355,7 +349,7 @@ impl Stream for ProjectionStream {
 impl RecordBatchStream for ProjectionStream {
     /// Get the schema
     fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+        Arc::clone(&self.schema)
     }
 }
 
@@ -363,7 +357,6 @@ impl RecordBatchStream for ProjectionStream {
 mod tests {
     use super::*;
     use crate::common::collect;
-    use crate::expressions;
     use crate::test;
 
     use arrow_schema::DataType;
@@ -374,10 +367,12 @@ mod tests {
         let task_ctx = Arc::new(TaskContext::default());
 
         let exec = test::scan_partitioned(1);
-        let expected = collect(exec.execute(0, task_ctx.clone())?).await.unwrap();
+        let expected = collect(exec.execute(0, Arc::clone(&task_ctx))?)
+            .await
+            .unwrap();
 
         let projection = ProjectionExec::try_new(vec![], exec)?;
-        let stream = projection.execute(0, task_ctx.clone())?;
+        let stream = projection.execute(0, Arc::clone(&task_ctx))?;
         let output = collect(stream).await.unwrap();
         assert_eq!(output.len(), expected.len());
 
@@ -423,8 +418,8 @@ mod tests {
         let schema = get_schema();
 
         let exprs: Vec<Arc<dyn PhysicalExpr>> = vec![
-            Arc::new(expressions::Column::new("col1", 1)),
-            Arc::new(expressions::Column::new("col0", 0)),
+            Arc::new(Column::new("col1", 1)),
+            Arc::new(Column::new("col0", 0)),
         ];
 
         let result = stats_projection(source, exprs.into_iter(), Arc::new(schema));
@@ -457,8 +452,8 @@ mod tests {
         let schema = get_schema();
 
         let exprs: Vec<Arc<dyn PhysicalExpr>> = vec![
-            Arc::new(expressions::Column::new("col2", 2)),
-            Arc::new(expressions::Column::new("col0", 0)),
+            Arc::new(Column::new("col2", 2)),
+            Arc::new(Column::new("col0", 0)),
         ];
 
         let result = stats_projection(source, exprs.into_iter(), Arc::new(schema));

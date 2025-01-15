@@ -15,16 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! [`EliminateDuplicatedExpr`] Removes redundant expressions
+
 use crate::optimizer::ApplyOrder;
 use crate::{OptimizerConfig, OptimizerRule};
+use datafusion_common::tree_node::Transformed;
 use datafusion_common::Result;
-use datafusion_expr::expr::Sort as ExprSort;
 use datafusion_expr::logical_plan::LogicalPlan;
-use datafusion_expr::{Aggregate, Expr, Sort};
-use hashbrown::HashSet;
+use datafusion_expr::{Aggregate, Expr, Sort, SortExpr};
+use std::hash::{Hash, Hasher};
+
+use indexmap::IndexSet;
 
 /// Optimization rule that eliminate duplicated expr.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct EliminateDuplicatedExpr;
 
 impl EliminateDuplicatedExpr {
@@ -33,77 +37,81 @@ impl EliminateDuplicatedExpr {
         Self {}
     }
 }
-
+// use this structure to avoid initial clone
+#[derive(Eq, Clone, Debug)]
+struct SortExprWrapper(SortExpr);
+impl PartialEq for SortExprWrapper {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.expr == other.0.expr
+    }
+}
+impl Hash for SortExprWrapper {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.expr.hash(state);
+    }
+}
 impl OptimizerRule for EliminateDuplicatedExpr {
-    fn try_optimize(
-        &self,
-        plan: &LogicalPlan,
-        _config: &dyn OptimizerConfig,
-    ) -> Result<Option<LogicalPlan>> {
-        match plan {
-            LogicalPlan::Sort(sort) => {
-                let normalized_sort_keys = sort
-                    .expr
-                    .iter()
-                    .map(|e| match e {
-                        Expr::Sort(ExprSort { expr, .. }) => {
-                            Expr::Sort(ExprSort::new(expr.clone(), true, false))
-                        }
-                        _ => e.clone(),
-                    })
-                    .collect::<Vec<_>>();
-
-                // dedup sort.expr and keep order
-                let mut dedup_expr = Vec::new();
-                let mut dedup_set = HashSet::new();
-                sort.expr.iter().zip(normalized_sort_keys.iter()).for_each(
-                    |(expr, normalized_expr)| {
-                        if !dedup_set.contains(normalized_expr) {
-                            dedup_expr.push(expr);
-                            dedup_set.insert(normalized_expr);
-                        }
-                    },
-                );
-                if dedup_expr.len() == sort.expr.len() {
-                    Ok(None)
-                } else {
-                    Ok(Some(LogicalPlan::Sort(Sort {
-                        expr: dedup_expr.into_iter().cloned().collect::<Vec<_>>(),
-                        input: sort.input.clone(),
-                        fetch: sort.fetch,
-                    })))
-                }
-            }
-            LogicalPlan::Aggregate(agg) => {
-                // dedup agg.groupby and keep order
-                let mut dedup_expr = Vec::new();
-                let mut dedup_set = HashSet::new();
-                agg.group_expr.iter().for_each(|expr| {
-                    if !dedup_set.contains(expr) {
-                        dedup_expr.push(expr.clone());
-                        dedup_set.insert(expr);
-                    }
-                });
-                if dedup_expr.len() == agg.group_expr.len() {
-                    Ok(None)
-                } else {
-                    Ok(Some(LogicalPlan::Aggregate(Aggregate::try_new(
-                        agg.input.clone(),
-                        dedup_expr,
-                        agg.aggr_expr.clone(),
-                    )?)))
-                }
-            }
-            _ => Ok(None),
-        }
-    }
-
-    fn name(&self) -> &str {
-        "eliminate_duplicated_expr"
-    }
-
     fn apply_order(&self) -> Option<ApplyOrder> {
         Some(ApplyOrder::TopDown)
+    }
+
+    fn supports_rewrite(&self) -> bool {
+        true
+    }
+
+    fn rewrite(
+        &self,
+        plan: LogicalPlan,
+        _config: &dyn OptimizerConfig,
+    ) -> Result<Transformed<LogicalPlan>> {
+        match plan {
+            LogicalPlan::Sort(sort) => {
+                let len = sort.expr.len();
+                let unique_exprs: Vec<_> = sort
+                    .expr
+                    .into_iter()
+                    .map(SortExprWrapper)
+                    .collect::<IndexSet<_>>()
+                    .into_iter()
+                    .map(|wrapper| wrapper.0)
+                    .collect();
+
+                let transformed = if len != unique_exprs.len() {
+                    Transformed::yes
+                } else {
+                    Transformed::no
+                };
+
+                Ok(transformed(LogicalPlan::Sort(Sort {
+                    expr: unique_exprs,
+                    input: sort.input,
+                    fetch: sort.fetch,
+                })))
+            }
+            LogicalPlan::Aggregate(agg) => {
+                let len = agg.group_expr.len();
+
+                let unique_exprs: Vec<Expr> = agg
+                    .group_expr
+                    .into_iter()
+                    .collect::<IndexSet<_>>()
+                    .into_iter()
+                    .collect();
+
+                let transformed = if len != unique_exprs.len() {
+                    Transformed::yes
+                } else {
+                    Transformed::no
+                };
+
+                Aggregate::try_new(agg.input, unique_exprs, agg.aggr_expr)
+                    .map(|f| transformed(LogicalPlan::Aggregate(f)))
+            }
+            _ => Ok(Transformed::no(plan)),
+        }
+    }
+    fn name(&self) -> &str {
+        "eliminate_duplicated_expr"
     }
 }
 
@@ -114,7 +122,7 @@ mod tests {
     use datafusion_expr::{col, logical_plan::builder::LogicalPlanBuilder};
     use std::sync::Arc;
 
-    fn assert_optimized_plan_eq(plan: &LogicalPlan, expected: &str) -> Result<()> {
+    fn assert_optimized_plan_eq(plan: LogicalPlan, expected: &str) -> Result<()> {
         crate::test::assert_optimized_plan_eq(
             Arc::new(EliminateDuplicatedExpr::new()),
             plan,
@@ -126,13 +134,13 @@ mod tests {
     fn eliminate_sort_expr() -> Result<()> {
         let table_scan = test_table_scan().unwrap();
         let plan = LogicalPlanBuilder::from(table_scan)
-            .sort(vec![col("a"), col("a"), col("b"), col("c")])?
+            .sort_by(vec![col("a"), col("a"), col("b"), col("c")])?
             .limit(5, Some(10))?
             .build()?;
         let expected = "Limit: skip=5, fetch=10\
-        \n  Sort: test.a, test.b, test.c\
+        \n  Sort: test.a ASC NULLS LAST, test.b ASC NULLS LAST, test.c ASC NULLS LAST\
         \n    TableScan: test";
-        assert_optimized_plan_eq(&plan, expected)
+        assert_optimized_plan_eq(plan, expected)
     }
 
     #[test]
@@ -151,6 +159,6 @@ mod tests {
         let expected = "Limit: skip=5, fetch=10\
         \n  Sort: test.a ASC NULLS FIRST, test.b ASC NULLS LAST\
         \n    TableScan: test";
-        assert_optimized_plan_eq(&plan, expected)
+        assert_optimized_plan_eq(plan, expected)
     }
 }

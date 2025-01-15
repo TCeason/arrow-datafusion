@@ -23,9 +23,12 @@ use std::sync::Arc;
 
 use arrow_array::{ArrayRef, Int32Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use futures::{Future, FutureExt};
 
 use crate::memory::MemoryExec;
+use crate::stream::RecordBatchStreamAdapter;
+use crate::streaming::PartitionStream;
 use crate::ExecutionPlan;
 
 pub mod exec;
@@ -62,7 +65,7 @@ pub fn aggr_test_schema() -> SchemaRef {
     Arc::new(schema)
 }
 
-/// returns record batch with 3 columns of i32 in memory
+/// Returns record batch with 3 columns of i32 in memory
 pub fn build_table_i32(
     a: (&str, &Vec<i32>),
     b: (&str, &Vec<i32>),
@@ -85,7 +88,27 @@ pub fn build_table_i32(
     .unwrap()
 }
 
-/// returns memory table scan wrapped around record batch with 3 columns of i32
+/// Returns record batch with 2 columns of i32 in memory
+pub fn build_table_i32_two_cols(
+    a: (&str, &Vec<i32>),
+    b: (&str, &Vec<i32>),
+) -> RecordBatch {
+    let schema = Schema::new(vec![
+        Field::new(a.0, DataType::Int32, false),
+        Field::new(b.0, DataType::Int32, false),
+    ]);
+
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(Int32Array::from(a.1.clone())),
+            Arc::new(Int32Array::from(b.1.clone())),
+        ],
+    )
+    .unwrap()
+}
+
+/// Returns memory table scan wrapped around record batch with 3 columns of i32
 pub fn build_table_scan_i32(
     a: (&str, &Vec<i32>),
     b: (&str, &Vec<i32>),
@@ -120,4 +143,31 @@ pub fn mem_exec(partitions: usize) -> MemoryExec {
     let schema = data[0][0].schema();
     let projection = None;
     MemoryExec::try_new(&data, schema, projection).unwrap()
+}
+
+// Construct a stream partition for test purposes
+#[derive(Debug)]
+pub struct TestPartitionStream {
+    pub schema: SchemaRef,
+    pub batches: Vec<RecordBatch>,
+}
+
+impl TestPartitionStream {
+    /// Create a new stream partition with the provided batches
+    pub fn new_with_batches(batches: Vec<RecordBatch>) -> Self {
+        let schema = batches[0].schema();
+        Self { schema, batches }
+    }
+}
+impl PartitionStream for TestPartitionStream {
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+    fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+        let stream = futures::stream::iter(self.batches.clone().into_iter().map(Ok));
+        Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&self.schema),
+            stream,
+        ))
+    }
 }

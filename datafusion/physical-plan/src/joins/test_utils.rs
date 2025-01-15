@@ -18,7 +18,6 @@
 //! This file has test utils for hash joins
 
 use std::sync::Arc;
-use std::usize;
 
 use crate::joins::utils::{JoinFilter, JoinOn};
 use crate::joins::{
@@ -26,13 +25,14 @@ use crate::joins::{
 };
 use crate::memory::MemoryExec;
 use crate::repartition::RepartitionExec;
-use crate::{common, ExecutionPlan, Partitioning};
+use crate::{common, ExecutionPlan, ExecutionPlanProperties, Partitioning};
 
 use arrow::util::pretty::pretty_format_batches;
 use arrow_array::{
     ArrayRef, Float64Array, Int32Array, IntervalDayTimeArray, RecordBatch,
     TimestampMillisecondArray,
 };
+use arrow_buffer::IntervalDayTime;
 use arrow_schema::{DataType, Schema};
 use datafusion_common::{Result, ScalarValue};
 use datafusion_execution::TaskContext;
@@ -47,21 +47,23 @@ use rand::prelude::StdRng;
 use rand::{Rng, SeedableRng};
 
 pub fn compare_batches(collected_1: &[RecordBatch], collected_2: &[RecordBatch]) {
+    let left_row_num: usize = collected_1.iter().map(|batch| batch.num_rows()).sum();
+    let right_row_num: usize = collected_2.iter().map(|batch| batch.num_rows()).sum();
+    if left_row_num == 0 && right_row_num == 0 {
+        return;
+    }
     // compare
     let first_formatted = pretty_format_batches(collected_1).unwrap().to_string();
     let second_formatted = pretty_format_batches(collected_2).unwrap().to_string();
 
-    let mut first_formatted_sorted: Vec<&str> = first_formatted.trim().lines().collect();
-    first_formatted_sorted.sort_unstable();
+    let mut first_lines: Vec<&str> = first_formatted.trim().lines().collect();
+    first_lines.sort_unstable();
 
-    let mut second_formatted_sorted: Vec<&str> =
-        second_formatted.trim().lines().collect();
-    second_formatted_sorted.sort_unstable();
+    let mut second_lines: Vec<&str> = second_formatted.trim().lines().collect();
+    second_lines.sort_unstable();
 
-    for (i, (first_line, second_line)) in first_formatted_sorted
-        .iter()
-        .zip(&second_formatted_sorted)
-        .enumerate()
+    for (i, (first_line, second_line)) in
+        first_lines.iter().zip(&second_lines).enumerate()
     {
         assert_eq!((i, first_line), (i, second_line));
     }
@@ -78,31 +80,39 @@ pub async fn partitioned_sym_join_with_filter(
 ) -> Result<Vec<RecordBatch>> {
     let partition_count = 4;
 
-    let left_expr = on.iter().map(|(l, _)| l.clone() as _).collect::<Vec<_>>();
+    let left_expr = on
+        .iter()
+        .map(|(l, _)| Arc::clone(l) as _)
+        .collect::<Vec<_>>();
 
-    let right_expr = on.iter().map(|(_, r)| r.clone() as _).collect::<Vec<_>>();
+    let right_expr = on
+        .iter()
+        .map(|(_, r)| Arc::clone(r) as _)
+        .collect::<Vec<_>>();
 
     let join = SymmetricHashJoinExec::try_new(
         Arc::new(RepartitionExec::try_new(
-            left.clone(),
+            Arc::clone(&left),
             Partitioning::Hash(left_expr, partition_count),
         )?),
         Arc::new(RepartitionExec::try_new(
-            right.clone(),
+            Arc::clone(&right),
             Partitioning::Hash(right_expr, partition_count),
         )?),
         on,
         filter,
         join_type,
         null_equals_null,
-        left.output_ordering().map(|p| p.to_vec()),
-        right.output_ordering().map(|p| p.to_vec()),
+        left.output_ordering().map(|p| LexOrdering::new(p.to_vec())),
+        right
+            .output_ordering()
+            .map(|p| LexOrdering::new(p.to_vec())),
         StreamJoinPartitionMode::Partitioned,
     )?;
 
     let mut batches = vec![];
     for i in 0..partition_count {
-        let stream = join.execute(i, context.clone())?;
+        let stream = join.execute(i, Arc::clone(&context))?;
         let more_batches = common::collect(stream).await?;
         batches.extend(
             more_batches
@@ -127,7 +137,7 @@ pub async fn partitioned_hash_join_with_filter(
     let partition_count = 4;
     let (left_expr, right_expr) = on
         .iter()
-        .map(|(l, r)| (l.clone() as _, r.clone() as _))
+        .map(|(l, r)| (Arc::clone(l) as _, Arc::clone(r) as _))
         .unzip();
 
     let join = Arc::new(HashJoinExec::try_new(
@@ -142,13 +152,14 @@ pub async fn partitioned_hash_join_with_filter(
         on,
         filter,
         join_type,
+        None,
         PartitionMode::Partitioned,
         null_equals_null,
     )?);
 
     let mut batches = vec![];
     for i in 0..partition_count {
-        let stream = join.execute(i, context.clone())?;
+        let stream = join.execute(i, Arc::clone(&context))?;
         let more_batches = common::collect(stream).await?;
         batches.extend(
             more_batches
@@ -282,7 +293,7 @@ macro_rules! join_expr_tests {
                     ScalarValue::$SCALAR(Some(10 as $type)),
                     (Operator::Gt, Operator::Lt),
                 ),
-                // left_col - 1 > right_col + 5 AND left_col + 3 < right_col + 10
+                // left_col - 1 > right_col + 3 AND left_col + 3 < right_col + 15
                 1 => gen_conjunctive_numerical_expr(
                     left_col,
                     right_col,
@@ -293,9 +304,9 @@ macro_rules! join_expr_tests {
                         Operator::Plus,
                     ),
                     ScalarValue::$SCALAR(Some(1 as $type)),
-                    ScalarValue::$SCALAR(Some(5 as $type)),
                     ScalarValue::$SCALAR(Some(3 as $type)),
-                    ScalarValue::$SCALAR(Some(10 as $type)),
+                    ScalarValue::$SCALAR(Some(3 as $type)),
+                    ScalarValue::$SCALAR(Some(15 as $type)),
                     (Operator::Gt, Operator::Lt),
                 ),
                 // left_col - 1 > right_col + 5 AND left_col - 3 < right_col + 10
@@ -346,7 +357,8 @@ macro_rules! join_expr_tests {
                     ScalarValue::$SCALAR(Some(3 as $type)),
                     (Operator::Gt, Operator::Lt),
                 ),
-                // left_col - 2 >= right_col - 5 AND left_col - 7 <= right_col - 3
+                // left_col - 2 >= right_col + 5 AND left_col + 7 <= right_col - 3
+                // (filters all input rows)
                 5 => gen_conjunctive_numerical_expr(
                     left_col,
                     right_col,
@@ -362,7 +374,7 @@ macro_rules! join_expr_tests {
                     ScalarValue::$SCALAR(Some(3 as $type)),
                     (Operator::GtEq, Operator::LtEq),
                 ),
-                // left_col - 28 >= right_col - 11 AND left_col - 21 <= right_col - 39
+                // left_col + 28 >= right_col - 11 AND left_col + 21 <= right_col + 39
                 6 => gen_conjunctive_numerical_expr(
                     left_col,
                     right_col,
@@ -378,7 +390,7 @@ macro_rules! join_expr_tests {
                     ScalarValue::$SCALAR(Some(39 as $type)),
                     (Operator::Gt, Operator::LtEq),
                 ),
-                // left_col - 28 >= right_col - 11 AND left_col - 21 <= right_col + 39
+                // left_col + 28 >= right_col - 11 AND left_col - 21 <= right_col + 39
                 7 => gen_conjunctive_numerical_expr(
                     left_col,
                     right_col,
@@ -461,8 +473,11 @@ pub fn build_sides_record_batches(
     ));
     let interval_time: ArrayRef = Arc::new(IntervalDayTimeArray::from(
         initial_range
-            .map(|x| x as i64 * 100) // x * 100ms
-            .collect::<Vec<i64>>(),
+            .map(|x| IntervalDayTime {
+                days: 0,
+                milliseconds: x * 100,
+            }) // x * 100ms
+            .collect::<Vec<_>>(),
     ));
 
     let float_asc = Arc::new(Float64Array::from_iter_values(
@@ -471,20 +486,29 @@ pub fn build_sides_record_batches(
     ));
 
     let left = RecordBatch::try_from_iter(vec![
-        ("la1", ordered.clone()),
-        ("lb1", cardinality.clone()),
+        ("la1", Arc::clone(&ordered)),
+        ("lb1", Arc::clone(&cardinality) as ArrayRef),
         ("lc1", cardinality_key_left),
-        ("lt1", time.clone()),
-        ("la2", ordered.clone()),
-        ("la1_des", ordered_des.clone()),
-        ("l_asc_null_first", ordered_asc_null_first.clone()),
-        ("l_asc_null_last", ordered_asc_null_last.clone()),
-        ("l_desc_null_first", ordered_desc_null_first.clone()),
-        ("li1", interval_time.clone()),
-        ("l_float", float_asc.clone()),
+        ("lt1", Arc::clone(&time) as ArrayRef),
+        ("la2", Arc::clone(&ordered)),
+        ("la1_des", Arc::clone(&ordered_des) as ArrayRef),
+        (
+            "l_asc_null_first",
+            Arc::clone(&ordered_asc_null_first) as ArrayRef,
+        ),
+        (
+            "l_asc_null_last",
+            Arc::clone(&ordered_asc_null_last) as ArrayRef,
+        ),
+        (
+            "l_desc_null_first",
+            Arc::clone(&ordered_desc_null_first) as ArrayRef,
+        ),
+        ("li1", Arc::clone(&interval_time)),
+        ("l_float", Arc::clone(&float_asc) as ArrayRef),
     ])?;
     let right = RecordBatch::try_from_iter(vec![
-        ("ra1", ordered.clone()),
+        ("ra1", Arc::clone(&ordered)),
         ("rb1", cardinality),
         ("rc1", cardinality_key_right),
         ("rt1", time),
@@ -507,10 +531,10 @@ pub fn create_memory_table(
 ) -> Result<(Arc<dyn ExecutionPlan>, Arc<dyn ExecutionPlan>)> {
     let left_schema = left_partition[0].schema();
     let left = MemoryExec::try_new(&[left_partition], left_schema, None)?
-        .with_sort_information(left_sorted);
+        .try_with_sort_information(left_sorted)?;
     let right_schema = right_partition[0].schema();
     let right = MemoryExec::try_new(&[right_partition], right_schema, None)?
-        .with_sort_information(right_sorted);
+        .try_with_sort_information(right_sorted)?;
     Ok((Arc::new(left), Arc::new(right)))
 }
 

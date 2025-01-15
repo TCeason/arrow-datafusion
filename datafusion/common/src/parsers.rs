@@ -16,10 +16,11 @@
 // under the License.
 
 //! Interval parsing logic
-use sqlparser::parser::ParserError;
 
-use std::result;
+use std::fmt::Display;
 use std::str::FromStr;
+
+use sqlparser::parser::ParserError;
 
 /// Readable file compression type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -39,7 +40,7 @@ pub enum CompressionTypeVariant {
 impl FromStr for CompressionTypeVariant {
     type Err = ParserError;
 
-    fn from_str(s: &str) -> result::Result<Self, ParserError> {
+    fn from_str(s: &str) -> Result<Self, ParserError> {
         let s = s.to_uppercase();
         match s.as_str() {
             "GZIP" | "GZ" => Ok(Self::GZIP),
@@ -54,16 +55,16 @@ impl FromStr for CompressionTypeVariant {
     }
 }
 
-impl ToString for CompressionTypeVariant {
-    fn to_string(&self) -> String {
-        match self {
+impl Display for CompressionTypeVariant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let str = match self {
             Self::GZIP => "GZIP",
             Self::BZIP2 => "BZIP2",
             Self::XZ => "XZ",
             Self::ZSTD => "ZSTD",
             Self::UNCOMPRESSED => "",
-        }
-        .to_string()
+        };
+        write!(f, "{}", str)
     }
 }
 

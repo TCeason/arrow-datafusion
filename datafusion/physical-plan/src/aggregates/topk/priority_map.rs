@@ -25,16 +25,11 @@ use datafusion_common::Result;
 
 /// A `Map<K, V>` / `PriorityQueue` combo that evicts the worst values after reaching `capacity`
 pub struct PriorityMap {
-    map: Box<dyn ArrowHashTable>,
-    heap: Box<dyn ArrowHeap>,
+    map: Box<dyn ArrowHashTable + Send>,
+    heap: Box<dyn ArrowHeap + Send>,
     capacity: usize,
     mapper: Vec<(usize, usize)>,
 }
-
-// JUSTIFICATION
-//  Benefit:  ~15% speedup + required to index into RawTable from binary heap
-//  Soundness: it is only accessed by one thread at a time, and indexes are kept up to date
-unsafe impl Send for PriorityMap {}
 
 impl PriorityMap {
     pub fn new(
@@ -117,8 +112,7 @@ mod tests {
     use arrow_array::{Int64Array, RecordBatch, StringArray};
     use arrow_schema::Field;
     use arrow_schema::Schema;
-    use arrow_schema::{DataType, SchemaRef};
-    use datafusion_common::Result;
+    use arrow_schema::SchemaRef;
     use std::sync::Arc;
 
     #[test]

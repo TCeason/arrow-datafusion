@@ -33,7 +33,7 @@ pub fn new(input: LogicalPlan) -> LogicalPlan {
     LogicalPlan::Extension(Extension { node })
 }
 
-#[derive(PartialEq, Eq, Hash)]
+#[derive(PartialEq, Eq, PartialOrd, Hash)]
 struct TestUserDefinedPlanNode {
     input: LogicalPlan,
 }
@@ -65,11 +65,19 @@ impl UserDefinedLogicalNodeCore for TestUserDefinedPlanNode {
         write!(f, "TestUserDefined")
     }
 
-    fn from_template(&self, exprs: &[Expr], inputs: &[LogicalPlan]) -> Self {
+    fn with_exprs_and_inputs(
+        &self,
+        exprs: Vec<Expr>,
+        mut inputs: Vec<LogicalPlan>,
+    ) -> datafusion_common::Result<Self> {
         assert_eq!(inputs.len(), 1, "input size inconsistent");
         assert_eq!(exprs.len(), 0, "expression size inconsistent");
-        Self {
-            input: inputs[0].clone(),
-        }
+        Ok(Self {
+            input: inputs.swap_remove(0),
+        })
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        false // Disallow limit push-down by default
     }
 }

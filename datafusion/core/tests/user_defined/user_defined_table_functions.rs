@@ -21,14 +21,14 @@ use arrow::csv::ReaderBuilder;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::datasource::function::TableFunctionImpl;
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result;
-use datafusion::execution::context::SessionState;
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::memory::MemoryExec;
 use datafusion::physical_plan::{collect, ExecutionPlan};
 use datafusion::prelude::SessionContext;
+use datafusion_catalog::Session;
+use datafusion_catalog::TableFunctionImpl;
 use datafusion_common::{assert_batches_eq, DFSchema, ScalarValue};
 use datafusion_expr::{EmptyRelation, Expr, LogicalPlan, Projection, TableType};
 use std::fs::File;
@@ -90,6 +90,22 @@ async fn test_simple_read_csv_udtf() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn test_deregister_udtf() -> Result<()> {
+    let ctx = SessionContext::new();
+
+    ctx.register_udtf("read_csv", Arc::new(SimpleCsvTableFunc {}));
+
+    assert!(ctx.state().table_functions().contains_key("read_csv"));
+
+    ctx.deregister_udtf("read_csv");
+
+    assert!(!ctx.state().table_functions().contains_key("read_csv"));
+
+    Ok(())
+}
+
+#[derive(Debug)]
 struct SimpleCsvTable {
     schema: SchemaRef,
     exprs: Vec<Expr>,
@@ -112,7 +128,7 @@ impl TableProvider for SimpleCsvTable {
 
     async fn scan(
         &self,
-        state: &SessionState,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,
@@ -146,7 +162,7 @@ impl TableProvider for SimpleCsvTable {
 }
 
 impl SimpleCsvTable {
-    async fn interpreter_expr(&self, state: &SessionState) -> Result<i64> {
+    async fn interpreter_expr(&self, state: &dyn Session) -> Result<i64> {
         use datafusion::logical_expr::expr_rewriter::normalize_col;
         use datafusion::logical_expr::utils::columnize_expr;
         let plan = LogicalPlan::EmptyRelation(EmptyRelation {
@@ -156,8 +172,8 @@ impl SimpleCsvTable {
         let logical_plan = Projection::try_new(
             vec![columnize_expr(
                 normalize_col(self.exprs[0].clone(), &plan)?,
-                plan.schema(),
-            )],
+                &plan,
+            )?],
             Arc::new(plan),
         )
         .map(LogicalPlan::Projection)?;
@@ -176,6 +192,7 @@ impl SimpleCsvTable {
     }
 }
 
+#[derive(Debug)]
 struct SimpleCsvTableFunc {}
 
 impl TableFunctionImpl for SimpleCsvTableFunc {
@@ -185,7 +202,7 @@ impl TableFunctionImpl for SimpleCsvTableFunc {
         for expr in exprs {
             match expr {
                 Expr::Literal(ScalarValue::Utf8(Some(ref path))) => {
-                    filepath = path.clone()
+                    filepath.clone_from(path);
                 }
                 expr => new_exprs.push(expr.clone()),
             }
@@ -211,8 +228,8 @@ fn read_csv_batches(csv_path: impl AsRef<Path>) -> Result<(SchemaRef, Vec<Record
         .with_header(true)
         .build(file)?;
     let mut batches = vec![];
-    for bacth in reader {
-        batches.push(bacth?);
+    for batch in reader {
+        batches.push(batch?);
     }
     let schema = Arc::new(schema);
     Ok((schema, batches))

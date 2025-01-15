@@ -20,26 +20,27 @@ use arrow::{
     array::{Int32Array, StringArray},
     record_batch::RecordBatch,
 };
+use arrow_array::types::Int32Type;
+use arrow_array::ListArray;
 use arrow_schema::SchemaRef;
 use std::sync::Arc;
-
-use datafusion::dataframe::DataFrame;
 
 use datafusion::error::Result;
 
 use datafusion::prelude::*;
 
-use datafusion::execution::context::SessionContext;
-
 use datafusion::assert_batches_eq;
-use datafusion_common::DFSchema;
+use datafusion_common::{DFSchema, ScalarValue};
 use datafusion_expr::expr::Alias;
-use datafusion_expr::{approx_median, cast, ExprSchemable};
+use datafusion_expr::ExprSchemable;
+use datafusion_functions_aggregate::expr_fn::{approx_median, approx_percentile_cont};
+use datafusion_functions_nested::map::map;
 
 fn test_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("a", DataType::Utf8, false),
         Field::new("b", DataType::Int32, false),
+        Field::new("l", DataType::new_list(DataType::Int32, true), true),
     ]))
 }
 
@@ -57,6 +58,12 @@ async fn create_test_table() -> Result<DataFrame> {
                 "123AbcDef",
             ])),
             Arc::new(Int32Array::from(vec![1, 10, 10, 100])),
+            Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+                Some(vec![Some(0), Some(1), Some(2)]),
+                None,
+                Some(vec![Some(3), None, Some(5)]),
+                Some(vec![Some(6), Some(7)]),
+            ])),
         ],
     )?;
 
@@ -67,7 +74,7 @@ async fn create_test_table() -> Result<DataFrame> {
     ctx.table("test").await
 }
 
-/// Excutes an expression on the test dataframe as a select.
+/// Executes an expression on the test dataframe as a select.
 /// Compares formatted output of a record batch with an expected
 /// vector of strings, using the assert_batch_eq! macro
 macro_rules! assert_fn_batches {
@@ -157,12 +164,187 @@ async fn test_fn_btrim_with_chars() -> Result<()> {
 }
 
 #[tokio::test]
+async fn test_fn_nullif() -> Result<()> {
+    let expr = nullif(col("a"), lit("abcDEF"));
+
+    let expected = [
+        "+-------------------------------+",
+        "| nullif(test.a,Utf8(\"abcDEF\")) |",
+        "+-------------------------------+",
+        "|                               |",
+        "| abc123                        |",
+        "| CBAdef                        |",
+        "| 123AbcDef                     |",
+        "+-------------------------------+",
+    ];
+
+    assert_fn_batches!(expr, expected);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_fn_arrow_cast() -> Result<()> {
+    let expr = arrow_typeof(arrow_cast(col("b"), lit("Float64")));
+
+    let expected = [
+        "+--------------------------------------------------+",
+        "| arrow_typeof(arrow_cast(test.b,Utf8(\"Float64\"))) |",
+        "+--------------------------------------------------+",
+        "| Float64                                          |",
+        "| Float64                                          |",
+        "| Float64                                          |",
+        "| Float64                                          |",
+        "+--------------------------------------------------+",
+    ];
+
+    assert_fn_batches!(expr, expected);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_nvl() -> Result<()> {
+    let lit_null = lit(ScalarValue::Utf8(None));
+    // nvl(CASE WHEN a = 'abcDEF' THEN NULL ELSE a END, 'TURNED_NULL')
+    let expr = nvl(
+        when(col("a").eq(lit("abcDEF")), lit_null)
+            .otherwise(col("a"))
+            .unwrap(),
+        lit("TURNED_NULL"),
+    )
+    .alias("nvl_expr");
+
+    let expected = [
+        "+-------------+",
+        "| nvl_expr    |",
+        "+-------------+",
+        "| TURNED_NULL |",
+        "| abc123      |",
+        "| CBAdef      |",
+        "| 123AbcDef   |",
+        "+-------------+",
+    ];
+
+    assert_fn_batches!(expr, expected);
+
+    Ok(())
+}
+#[tokio::test]
+async fn test_nvl2() -> Result<()> {
+    let lit_null = lit(ScalarValue::Utf8(None));
+    // nvl2(CASE WHEN a = 'abcDEF' THEN NULL ELSE a END, 'NON_NUll', 'TURNED_NULL')
+    let expr = nvl2(
+        when(col("a").eq(lit("abcDEF")), lit_null)
+            .otherwise(col("a"))
+            .unwrap(),
+        lit("NON_NULL"),
+        lit("TURNED_NULL"),
+    )
+    .alias("nvl2_expr");
+
+    let expected = [
+        "+-------------+",
+        "| nvl2_expr   |",
+        "+-------------+",
+        "| TURNED_NULL |",
+        "| NON_NULL    |",
+        "| NON_NULL    |",
+        "| NON_NULL    |",
+        "+-------------+",
+    ];
+
+    assert_fn_batches!(expr, expected);
+
+    Ok(())
+}
+#[tokio::test]
+async fn test_fn_arrow_typeof() -> Result<()> {
+    let expr = arrow_typeof(col("l"));
+
+    let expected = [
+        "+------------------------------------------------------------------------------------------------------------------+",
+        "| arrow_typeof(test.l)                                                                                             |",
+        "+------------------------------------------------------------------------------------------------------------------+",
+        "| List(Field { name: \"item\", data_type: Int32, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }) |",
+        "| List(Field { name: \"item\", data_type: Int32, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }) |",
+        "| List(Field { name: \"item\", data_type: Int32, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }) |",
+        "| List(Field { name: \"item\", data_type: Int32, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }) |",
+        "+------------------------------------------------------------------------------------------------------------------+",
+    ];
+
+    assert_fn_batches!(expr, expected);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_fn_struct() -> Result<()> {
+    let expr = r#struct(vec![col("a"), col("b")]);
+
+    let expected = [
+        "+--------------------------+",
+        "| struct(test.a,test.b)    |",
+        "+--------------------------+",
+        "| {c0: abcDEF, c1: 1}      |",
+        "| {c0: abc123, c1: 10}     |",
+        "| {c0: CBAdef, c1: 10}     |",
+        "| {c0: 123AbcDef, c1: 100} |",
+        "+--------------------------+",
+    ];
+
+    assert_fn_batches!(expr, expected);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_fn_named_struct() -> Result<()> {
+    let expr = named_struct(vec![lit("column_a"), col("a"), lit("column_b"), col("b")]);
+
+    let expected = [
+        "+---------------------------------------------------------------+",
+        "| named_struct(Utf8(\"column_a\"),test.a,Utf8(\"column_b\"),test.b) |",
+        "+---------------------------------------------------------------+",
+        "| {column_a: abcDEF, column_b: 1}                               |",
+        "| {column_a: abc123, column_b: 10}                              |",
+        "| {column_a: CBAdef, column_b: 10}                              |",
+        "| {column_a: 123AbcDef, column_b: 100}                          |",
+        "+---------------------------------------------------------------+",
+    ];
+
+    assert_fn_batches!(expr, expected);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_fn_coalesce() -> Result<()> {
+    let expr = coalesce(vec![lit(ScalarValue::Utf8(None)), lit("ab")]);
+
+    let expected = [
+        "+---------------------------------+",
+        "| coalesce(Utf8(NULL),Utf8(\"ab\")) |",
+        "+---------------------------------+",
+        "| ab                              |",
+        "| ab                              |",
+        "| ab                              |",
+        "| ab                              |",
+        "+---------------------------------+",
+    ];
+
+    assert_fn_batches!(expr, expected);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_fn_approx_median() -> Result<()> {
     let expr = approx_median(col("b"));
 
     let expected = [
         "+-----------------------+",
-        "| APPROX_MEDIAN(test.b) |",
+        "| approx_median(test.b) |",
         "+-----------------------+",
         "| 10                    |",
         "+-----------------------+",
@@ -178,11 +360,11 @@ async fn test_fn_approx_median() -> Result<()> {
 
 #[tokio::test]
 async fn test_fn_approx_percentile_cont() -> Result<()> {
-    let expr = approx_percentile_cont(col("b"), lit(0.5));
+    let expr = approx_percentile_cont(col("b"), lit(0.5), None);
 
     let expected = [
         "+---------------------------------------------+",
-        "| APPROX_PERCENTILE_CONT(test.b,Float64(0.5)) |",
+        "| approx_percentile_cont(test.b,Float64(0.5)) |",
         "+---------------------------------------------+",
         "| 10                                          |",
         "+---------------------------------------------+",
@@ -199,15 +381,30 @@ async fn test_fn_approx_percentile_cont() -> Result<()> {
         None::<&str>,
         "arg_2".to_string(),
     ));
-    let expr = approx_percentile_cont(col("b"), alias_expr);
+    let expr = approx_percentile_cont(col("b"), alias_expr, None);
     let df = create_test_table().await?;
     let expected = [
         "+--------------------------------------+",
-        "| APPROX_PERCENTILE_CONT(test.b,arg_2) |",
+        "| approx_percentile_cont(test.b,arg_2) |",
         "+--------------------------------------+",
         "| 10                                   |",
         "+--------------------------------------+",
     ];
+    let batches = df.aggregate(vec![], vec![expr]).unwrap().collect().await?;
+
+    assert_batches_eq!(expected, &batches);
+
+    // with number of centroids set
+    let expr = approx_percentile_cont(col("b"), lit(0.5), Some(lit(2)));
+    let expected = [
+        "+------------------------------------------------------+",
+        "| approx_percentile_cont(test.b,Float64(0.5),Int32(2)) |",
+        "+------------------------------------------------------+",
+        "| 30                                                   |",
+        "+------------------------------------------------------+",
+    ];
+
+    let df = create_test_table().await?;
     let batches = df.aggregate(vec![], vec![expr]).unwrap().collect().await?;
 
     assert_batches_eq!(expected, &batches);
@@ -266,26 +463,6 @@ async fn test_fn_initcap() -> Result<()> {
         "| Cbadef          |",
         "| 123abcdef       |",
         "+-----------------+",
-    ];
-
-    assert_fn_batches!(expr, expected);
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_fn_instr() -> Result<()> {
-    let expr = instr(col("a"), lit("b"));
-
-    let expected = [
-        "+-------------------------+",
-        "| instr(test.a,Utf8(\"b\")) |",
-        "+-------------------------+",
-        "| 2                       |",
-        "| 2                       |",
-        "| 0                       |",
-        "| 5                       |",
-        "+-------------------------+",
     ];
 
     assert_fn_batches!(expr, expected);
@@ -378,7 +555,7 @@ async fn test_fn_lpad_with_string() -> Result<()> {
 
 #[tokio::test]
 async fn test_fn_ltrim() -> Result<()> {
-    let expr = ltrim(lit("      a b c             "));
+    let expr = ltrim(vec![lit("      a b c             ")]);
 
     let expected = [
         "+-----------------------------------------+",
@@ -395,7 +572,7 @@ async fn test_fn_ltrim() -> Result<()> {
 
 #[tokio::test]
 async fn test_fn_ltrim_with_columns() -> Result<()> {
-    let expr = ltrim(col("a"));
+    let expr = ltrim(vec![col("a")]);
 
     let expected = [
         "+---------------+",
@@ -436,8 +613,44 @@ async fn test_fn_md5() -> Result<()> {
 
 #[tokio::test]
 #[cfg(feature = "unicode_expressions")]
+async fn test_fn_regexp_like() -> Result<()> {
+    let expr = regexp_like(col("a"), lit("[a-z]"), None);
+
+    let expected = [
+        "+-----------------------------------+",
+        "| regexp_like(test.a,Utf8(\"[a-z]\")) |",
+        "+-----------------------------------+",
+        "| true                              |",
+        "| true                              |",
+        "| true                              |",
+        "| true                              |",
+        "+-----------------------------------+",
+    ];
+
+    assert_fn_batches!(expr, expected);
+
+    let expr = regexp_like(col("a"), lit("abc"), Some(lit("i")));
+
+    let expected = [
+        "+-------------------------------------------+",
+        "| regexp_like(test.a,Utf8(\"abc\"),Utf8(\"i\")) |",
+        "+-------------------------------------------+",
+        "| true                                      |",
+        "| true                                      |",
+        "| false                                     |",
+        "| true                                      |",
+        "+-------------------------------------------+",
+    ];
+
+    assert_fn_batches!(expr, expected);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg(feature = "unicode_expressions")]
 async fn test_fn_regexp_match() -> Result<()> {
-    let expr = regexp_match(vec![col("a"), lit("[a-z]")]);
+    let expr = regexp_match(col("a"), lit("[a-z]"), None);
 
     let expected = [
         "+------------------------------------+",
@@ -452,13 +665,28 @@ async fn test_fn_regexp_match() -> Result<()> {
 
     assert_fn_batches!(expr, expected);
 
+    let expr = regexp_match(col("a"), lit("[A-Z]"), Some(lit("i")));
+
+    let expected = [
+        "+----------------------------------------------+",
+        "| regexp_match(test.a,Utf8(\"[A-Z]\"),Utf8(\"i\")) |",
+        "+----------------------------------------------+",
+        "| [a]                                          |",
+        "| [a]                                          |",
+        "| [C]                                          |",
+        "| [A]                                          |",
+        "+----------------------------------------------+",
+    ];
+
+    assert_fn_batches!(expr, expected);
+
     Ok(())
 }
 
 #[tokio::test]
 #[cfg(feature = "unicode_expressions")]
 async fn test_fn_regexp_replace() -> Result<()> {
-    let expr = regexp_replace(vec![col("a"), lit("[a-z]"), lit("x"), lit("g")]);
+    let expr = regexp_replace(col("a"), lit("[a-z]"), lit("x"), Some(lit("g")));
 
     let expected = [
         "+----------------------------------------------------------+",
@@ -469,6 +697,21 @@ async fn test_fn_regexp_replace() -> Result<()> {
         "| CBAxxx                                                   |",
         "| 123AxxDxx                                                |",
         "+----------------------------------------------------------+",
+    ];
+
+    assert_fn_batches!(expr, expected);
+
+    let expr = regexp_replace(col("a"), lit("[a-z]"), lit("x"), None);
+
+    let expected = [
+        "+------------------------------------------------+",
+        "| regexp_replace(test.a,Utf8(\"[a-z]\"),Utf8(\"x\")) |",
+        "+------------------------------------------------+",
+        "| xbcDEF                                         |",
+        "| xbc123                                         |",
+        "| CBAxef                                         |",
+        "| 123AxcDef                                      |",
+        "+------------------------------------------------+",
     ];
 
     assert_fn_batches!(expr, expected);
@@ -836,6 +1079,46 @@ async fn test_fn_decode() -> Result<()> {
         "| CBAdef                                         |",
         "| 123AbcDef                                      |",
         "+------------------------------------------------+",
+    ];
+    assert_fn_batches!(expr, expected);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_fn_array_to_string() -> Result<()> {
+    let expr = array_to_string(col("l"), lit("***"));
+
+    let expected = [
+        "+-------------------------------------+",
+        "| array_to_string(test.l,Utf8(\"***\")) |",
+        "+-------------------------------------+",
+        "| 0***1***2                           |",
+        "|                                     |",
+        "| 3***5                               |",
+        "| 6***7                               |",
+        "+-------------------------------------+",
+    ];
+    assert_fn_batches!(expr, expected);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_fn_map() -> Result<()> {
+    let expr = map(
+        vec![lit("a"), lit("b"), lit("c")],
+        vec![lit(1), lit(2), lit(3)],
+    );
+    let expected = [
+        "+---------------------------------------------------------------------------------------+",
+        "| map(make_array(Utf8(\"a\"),Utf8(\"b\"),Utf8(\"c\")),make_array(Int32(1),Int32(2),Int32(3))) |",
+        "+---------------------------------------------------------------------------------------+",
+        "| {a: 1, b: 2, c: 3}                                                                    |",
+        "| {a: 1, b: 2, c: 3}                                                                    |",
+        "| {a: 1, b: 2, c: 3}                                                                    |",
+        "| {a: 1, b: 2, c: 3}                                                                    |",
+        "+---------------------------------------------------------------------------------------+",
     ];
     assert_fn_batches!(expr, expected);
 

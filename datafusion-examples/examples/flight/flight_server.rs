@@ -18,7 +18,7 @@
 use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator};
 use std::sync::Arc;
 
-use arrow_flight::SchemaAsIpc;
+use arrow_flight::{PollInfo, SchemaAsIpc};
 use datafusion::arrow::error::ArrowError;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{ListingOptions, ListingTableUrl};
@@ -105,7 +105,7 @@ impl FlightService for FlightServiceImpl {
                 }
 
                 // add an initial FlightData message that sends schema
-                let options = datafusion::arrow::ipc::writer::IpcWriteOptions::default();
+                let options = arrow::ipc::writer::IpcWriteOptions::default();
                 let schema_flight_data = SchemaAsIpc::new(&schema, &options);
 
                 let mut flights = vec![FlightData::from(schema_flight_data)];
@@ -175,6 +175,13 @@ impl FlightService for FlightServiceImpl {
         &self,
         _request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoExchangeStream>, Status> {
+        Err(Status::unimplemented("Not yet implemented"))
+    }
+
+    async fn poll_flight_info(
+        &self,
+        _request: Request<FlightDescriptor>,
+    ) -> Result<Response<PollInfo>, Status> {
         Err(Status::unimplemented("Not yet implemented"))
     }
 }

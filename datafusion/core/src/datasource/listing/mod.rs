@@ -22,9 +22,9 @@ mod helpers;
 mod table;
 mod url;
 
-use crate::error::Result;
 use chrono::TimeZone;
-use datafusion_common::ScalarValue;
+use datafusion_common::Result;
+use datafusion_common::{ScalarValue, Statistics};
 use futures::Stream;
 use object_store::{path::Path, ObjectMeta};
 use std::pin::Pin;
@@ -48,6 +48,13 @@ pub struct FileRange {
     pub end: i64,
 }
 
+impl FileRange {
+    /// returns true if this file range contains the specified offset
+    pub fn contains(&self, offset: i64) -> bool {
+        offset >= self.start && offset < self.end
+    }
+}
+
 #[derive(Debug, Clone)]
 /// A single file or part of a file that should be read, along with its schema, statistics
 /// and partition column values that need to be appended to each row.
@@ -67,9 +74,17 @@ pub struct PartitionedFile {
     pub partition_values: Vec<ScalarValue>,
     /// An optional file range for a more fine-grained parallel execution
     pub range: Option<FileRange>,
+    /// Optional statistics that describe the data in this file if known.
+    ///
+    /// DataFusion relies on these statistics for planning (in particular to sort file groups),
+    /// so if they are incorrect, incorrect answers may result.
+    pub statistics: Option<Statistics>,
     /// An optional field for user defined per object metadata
     pub extensions: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    /// The estimated size of the parquet metadata, in bytes
+    pub metadata_size_hint: Option<usize>,
 }
+
 impl PartitionedFile {
     /// Create a simple file without metadata or partition
     pub fn new(path: impl Into<String>, size: u64) -> Self {
@@ -83,7 +98,9 @@ impl PartitionedFile {
             },
             partition_values: vec![],
             range: None,
+            statistics: None,
             extensions: None,
+            metadata_size_hint: None,
         }
     }
 
@@ -98,10 +115,20 @@ impl PartitionedFile {
                 version: None,
             },
             partition_values: vec![],
-            range: None,
+            range: Some(FileRange { start, end }),
+            statistics: None,
             extensions: None,
+            metadata_size_hint: None,
         }
         .with_range(start, end)
+    }
+
+    /// Provide a hint to the size of the file metadata. If a hint is provided
+    /// the reader will try and fetch the last `size_hint` bytes of the parquet file optimistically.
+    /// Without an appropriate hint, two read may be required to fetch the metadata.
+    pub fn with_metadata_size_hint(mut self, metadata_size_hint: usize) -> Self {
+        self.metadata_size_hint = Some(metadata_size_hint);
+        self
     }
 
     /// Return a file reference from the given path
@@ -120,6 +147,17 @@ impl PartitionedFile {
         self.range = Some(FileRange { start, end });
         self
     }
+
+    /// Update the user defined extensions for this file.
+    ///
+    /// This can be used to pass reader specific information.
+    pub fn with_extensions(
+        mut self,
+        extensions: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Self {
+        self.extensions = Some(extensions);
+        self
+    }
 }
 
 impl From<ObjectMeta> for PartitionedFile {
@@ -128,19 +166,21 @@ impl From<ObjectMeta> for PartitionedFile {
             object_meta,
             partition_values: vec![],
             range: None,
+            statistics: None,
             extensions: None,
+            metadata_size_hint: None,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::datasource::listing::ListingTableUrl;
+    use super::ListingTableUrl;
     use datafusion_execution::object_store::{
         DefaultObjectStoreRegistry, ObjectStoreRegistry,
     };
-    use object_store::local::LocalFileSystem;
-    use std::sync::Arc;
+    use object_store::{local::LocalFileSystem, path::Path};
+    use std::{ops::Not, sync::Arc};
     use url::Url;
 
     #[test]
@@ -184,5 +224,57 @@ mod tests {
         let sut = DefaultObjectStoreRegistry::default();
         let url = ListingTableUrl::parse("../").unwrap();
         sut.get_store(url.as_ref()).unwrap();
+    }
+
+    #[test]
+    fn test_url_contains() {
+        let url = ListingTableUrl::parse("file:///var/data/mytable/").unwrap();
+
+        // standard case with default config
+        assert!(url.contains(
+            &Path::parse("/var/data/mytable/data.parquet").unwrap(),
+            true
+        ));
+
+        // standard case with `ignore_subdirectory` set to false
+        assert!(url.contains(
+            &Path::parse("/var/data/mytable/data.parquet").unwrap(),
+            false
+        ));
+
+        // as per documentation, when `ignore_subdirectory` is true, we should ignore files that aren't
+        // a direct child of the `url`
+        assert!(url
+            .contains(
+                &Path::parse("/var/data/mytable/mysubfolder/data.parquet").unwrap(),
+                true
+            )
+            .not());
+
+        // when we set `ignore_subdirectory` to false, we should not ignore the file
+        assert!(url.contains(
+            &Path::parse("/var/data/mytable/mysubfolder/data.parquet").unwrap(),
+            false
+        ));
+
+        // as above, `ignore_subdirectory` is false, so we include the file
+        assert!(url.contains(
+            &Path::parse("/var/data/mytable/year=2024/data.parquet").unwrap(),
+            false
+        ));
+
+        // in this case, we include the file even when `ignore_subdirectory` is true because the
+        // path segment is a hive partition which doesn't count as a subdirectory for the purposes
+        // of `Url::contains`
+        assert!(url.contains(
+            &Path::parse("/var/data/mytable/year=2024/data.parquet").unwrap(),
+            true
+        ));
+
+        // testing an empty path with default config
+        assert!(url.contains(&Path::parse("/var/data/mytable/").unwrap(), true));
+
+        // testing an empty path with `ignore_subdirectory` set to false
+        assert!(url.contains(&Path::parse("/var/data/mytable/").unwrap(), false));
     }
 }

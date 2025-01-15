@@ -17,37 +17,28 @@
 
 //! Rewrite for order by expressions
 
-use crate::expr::{Alias, Sort};
+use crate::expr::Alias;
 use crate::expr_rewriter::normalize_col;
-use crate::{Cast, Expr, ExprSchemable, LogicalPlan, TryCast};
-use datafusion_common::tree_node::{Transformed, TreeNode};
+use crate::{expr::Sort, Cast, Expr, LogicalPlan, TryCast};
+
+use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{Column, Result};
 
 /// Rewrite sort on aggregate expressions to sort on the column of aggregate output
-/// For example, `max(x)` is written to `col("MAX(x)")`
+/// For example, `max(x)` is written to `col("max(x)")`
 pub fn rewrite_sort_cols_by_aggs(
-    exprs: impl IntoIterator<Item = impl Into<Expr>>,
+    sorts: impl IntoIterator<Item = impl Into<Sort>>,
     plan: &LogicalPlan,
-) -> Result<Vec<Expr>> {
-    exprs
+) -> Result<Vec<Sort>> {
+    sorts
         .into_iter()
         .map(|e| {
-            let expr = e.into();
-            match expr {
-                Expr::Sort(Sort {
-                    expr,
-                    asc,
-                    nulls_first,
-                }) => {
-                    let sort = Expr::Sort(Sort::new(
-                        Box::new(rewrite_sort_col_by_aggs(*expr, plan)?),
-                        asc,
-                        nulls_first,
-                    ));
-                    Ok(sort)
-                }
-                expr => Ok(expr),
-            }
+            let sort = e.into();
+            Ok(Sort::new(
+                rewrite_sort_col_by_aggs(sort.expr, plan)?,
+                sort.asc,
+                sort.nulls_first,
+            ))
         })
         .collect()
 }
@@ -83,15 +74,12 @@ fn rewrite_in_terms_of_projection(
 ) -> Result<Expr> {
     // assumption is that each item in exprs, such as "b + c" is
     // available as an output column named "b + c"
-    expr.transform(&|expr| {
+    expr.transform(|expr| {
         // search for unnormalized names first such as "c1" (such as aliases)
         if let Some(found) = proj_exprs.iter().find(|a| (**a) == expr) {
-            let col = Expr::Column(
-                found
-                    .to_field(input.schema())
-                    .map(|f| f.qualified_column())?,
-            );
-            return Ok(Transformed::Yes(col));
+            let (qualifier, field_name) = found.qualified_name();
+            let col = Expr::Column(Column::new(qualifier, field_name));
+            return Ok(Transformed::yes(col));
         }
 
         // if that doesn't work, try to match the expression as an
@@ -103,12 +91,12 @@ fn rewrite_in_terms_of_projection(
             e
         } else {
             // The expr is not based on Aggregate plan output. Skip it.
-            return Ok(Transformed::No(expr));
+            return Ok(Transformed::no(expr));
         };
 
         // expr is an actual expr like min(t.c2), but we are looking
         // for a column with the same "MIN(C2)", so translate there
-        let name = normalized_expr.display_name()?;
+        let name = normalized_expr.schema_name().to_string();
 
         let search_col = Expr::Column(Column {
             relation: None,
@@ -118,7 +106,7 @@ fn rewrite_in_terms_of_projection(
         // look for the column named the same as this expr
         if let Some(found) = proj_exprs.iter().find(|a| expr_match(&search_col, a)) {
             let found = found.clone();
-            return Ok(Transformed::Yes(match normalized_expr {
+            return Ok(Transformed::yes(match normalized_expr {
                 Expr::Cast(Cast { expr: _, data_type }) => Expr::Cast(Cast {
                     expr: Box::new(found),
                     data_type,
@@ -131,8 +119,9 @@ fn rewrite_in_terms_of_projection(
             }));
         }
 
-        Ok(Transformed::No(expr))
+        Ok(Transformed::no(expr))
     })
+    .data()
 }
 
 /// Does the underlying expr match e?
@@ -154,11 +143,13 @@ mod test {
     use arrow::datatypes::{DataType, Field, Schema};
 
     use crate::{
-        avg, cast, col, lit, logical_plan::builder::LogicalTableSource, min, try_cast,
+        cast, col, lit, logical_plan::builder::LogicalTableSource, try_cast,
         LogicalPlanBuilder,
     };
 
     use super::*;
+    use crate::test::function_stub::avg;
+    use crate::test::function_stub::min;
 
     #[test]
     fn rewrite_sort_cols_by_agg() {
@@ -233,20 +224,20 @@ mod test {
                 expected: sort(col("c1")),
             },
             TestCase {
-                desc: r#"min(c2) --> "MIN(c2)" -- (column *named* "min(t.c2)"!)"#,
+                desc: r#"min(c2) --> "min(c2)" -- (column *named* "min(t.c2)"!)"#,
                 input: sort(min(col("c2"))),
-                expected: sort(col("MIN(t.c2)")),
+                expected: sort(col("min(t.c2)")),
             },
             TestCase {
-                desc: r#"c1 + min(c2) --> "c1 + MIN(c2)" -- (column *named* "min(t.c2)"!)"#,
+                desc: r#"c1 + min(c2) --> "c1 + min(c2)" -- (column *named* "min(t.c2)"!)"#,
                 input: sort(col("c1") + min(col("c2"))),
                 // should be "c1" not t.c1
-                expected: sort(col("c1") + col("MIN(t.c2)")),
+                expected: sort(col("c1") + col("min(t.c2)")),
             },
             TestCase {
-                desc: r#"avg(c3) --> "AVG(t.c3)" as average (column *named* "AVG(t.c3)", aliased)"#,
+                desc: r#"avg(c3) --> "avg(t.c3)" as average (column *named* "avg(t.c3)", aliased)"#,
                 input: sort(avg(col("c3"))),
-                expected: sort(col("AVG(t.c3)").alias("average")),
+                expected: sort(col("avg(t.c3)").alias("average")),
             },
         ];
 
@@ -285,8 +276,8 @@ mod test {
 
     struct TestCase {
         desc: &'static str,
-        input: Expr,
-        expected: Expr,
+        input: Sort,
+        expected: Sort,
     }
 
     impl TestCase {
@@ -328,7 +319,7 @@ mod test {
         .unwrap()
     }
 
-    fn sort(expr: Expr) -> Expr {
+    fn sort(expr: Expr) -> Sort {
         let asc = true;
         let nulls_first = true;
         expr.sort(asc, nulls_first)

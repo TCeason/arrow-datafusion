@@ -20,21 +20,22 @@ use arrow::csv::ReaderBuilder;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::datasource::function::TableFunctionImpl;
+use datafusion::catalog::Session;
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result;
-use datafusion::execution::context::{ExecutionProps, SessionState};
+use datafusion::execution::context::ExecutionProps;
 use datafusion::physical_plan::memory::MemoryExec;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
-use datafusion_common::{plan_err, DataFusionError, ScalarValue};
+use datafusion_catalog::TableFunctionImpl;
+use datafusion_common::{plan_err, ScalarValue};
+use datafusion_expr::simplify::SimplifyContext;
 use datafusion_expr::{Expr, TableType};
-use datafusion_optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
+use datafusion_optimizer::simplify_expressions::ExprSimplifier;
 use std::fs::File;
 use std::io::Seek;
 use std::path::Path;
 use std::sync::Arc;
-
 // To define your own table function, you only need to do the following 3 things:
 // 1. Implement your own [`TableProvider`]
 // 2. Implement your own [`TableFunctionImpl`] and return your [`TableProvider`]
@@ -72,6 +73,7 @@ async fn main() -> Result<()> {
 /// Usage: `read_csv(filename, [limit])`
 ///
 /// [`read_csv`]: https://duckdb.org/docs/data/csv/overview.html
+#[derive(Debug)]
 struct LocalCsvTable {
     schema: SchemaRef,
     limit: Option<usize>,
@@ -94,7 +96,7 @@ impl TableProvider for LocalCsvTable {
 
     async fn scan(
         &self,
-        _state: &SessionState,
+        _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,
@@ -126,6 +128,7 @@ impl TableProvider for LocalCsvTable {
     }
 }
 
+#[derive(Debug)]
 struct LocalCsvTableFunc {}
 
 impl TableFunctionImpl for LocalCsvTableFunc {
@@ -137,7 +140,7 @@ impl TableFunctionImpl for LocalCsvTableFunc {
         let limit = exprs
             .get(1)
             .map(|expr| {
-                // try to simpify the expression, so 1+2 becomes 3, for example
+                // try to simplify the expression, so 1+2 becomes 3, for example
                 let execution_props = ExecutionProps::new();
                 let info = SimplifyContext::new(&execution_props);
                 let expr = ExprSimplifier::new(info).simplify(expr.clone())?;
@@ -170,8 +173,8 @@ fn read_csv_batches(csv_path: impl AsRef<Path>) -> Result<(SchemaRef, Vec<Record
         .with_header(true)
         .build(file)?;
     let mut batches = vec![];
-    for bacth in reader {
-        batches.push(bacth?);
+    for batch in reader {
+        batches.push(batch?);
     }
     let schema = Arc::new(schema);
     Ok((schema, batches))

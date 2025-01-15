@@ -19,18 +19,18 @@ use std::collections::HashMap;
 use std::env;
 use std::path::Path;
 use std::process::ExitCode;
-use std::str::FromStr;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock};
 
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::SessionConfig;
-use datafusion::execution::memory_pool::{FairSpillPool, GreedyMemoryPool};
-use datafusion::execution::runtime_env::{RuntimeConfig, RuntimeEnv};
+use datafusion::execution::memory_pool::{FairSpillPool, GreedyMemoryPool, MemoryPool};
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::prelude::SessionContext;
-use datafusion_cli::catalog::DynamicFileCatalog;
+use datafusion_cli::catalog::DynamicObjectStoreCatalog;
 use datafusion_cli::functions::ParquetMetadataFunc;
 use datafusion_cli::{
     exec,
+    pool_type::PoolType,
     print_format::PrintFormat,
     print_options::{MaxRows, PrintOptions},
     DATAFUSION_CLI_VERSION,
@@ -42,24 +42,6 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-#[derive(PartialEq, Debug)]
-enum PoolType {
-    Greedy,
-    Fair,
-}
-
-impl FromStr for PoolType {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "Greedy" | "greedy" => Ok(PoolType::Greedy),
-            "Fair" | "fair" => Ok(PoolType::Fair),
-            _ => Err(format!("Invalid memory pool type '{}'", s)),
-        }
-    }
-}
-
 #[derive(Debug, Parser, PartialEq)]
 #[clap(author, version, about, long_about= None)]
 struct Args {
@@ -67,7 +49,7 @@ struct Args {
         short = 'p',
         long,
         help = "Path to your data, default to current directory",
-        validator(is_valid_data_dir)
+        value_parser(parse_valid_data_dir)
     )]
     data_path: Option<String>,
 
@@ -75,15 +57,16 @@ struct Args {
         short = 'b',
         long,
         help = "The batch size of each query, or use DataFusion default",
-        validator(is_valid_batch_size)
+        value_parser(parse_batch_size)
     )]
     batch_size: Option<usize>,
 
     #[clap(
         short = 'c',
         long,
-        multiple_values = true,
-        help = "Execute the given command string(s), then exit"
+        num_args = 0..,
+        help = "Execute the given command string(s), then exit. Commands are expected to be non empty.",
+        value_parser(parse_command)
     )]
     command: Vec<String>,
 
@@ -91,30 +74,30 @@ struct Args {
         short = 'm',
         long,
         help = "The memory pool limitation (e.g. '10g'), default to None (no limit)",
-        validator(is_valid_memory_pool_size)
+        value_parser(extract_memory_pool_size)
     )]
-    memory_limit: Option<String>,
+    memory_limit: Option<usize>,
 
     #[clap(
         short,
         long,
-        multiple_values = true,
+        num_args = 0..,
         help = "Execute commands from file(s), then exit",
-        validator(is_valid_file)
+        value_parser(parse_valid_file)
     )]
     file: Vec<String>,
 
     #[clap(
         short = 'r',
         long,
-        multiple_values = true,
+        num_args = 0..,
         help = "Run the provided files on startup instead of ~/.datafusionrc",
-        validator(is_valid_file),
+        value_parser(parse_valid_file),
         conflicts_with = "file"
     )]
     rc: Option<Vec<String>>,
 
-    #[clap(long, arg_enum, default_value_t = PrintFormat::Automatic)]
+    #[clap(long, value_enum, default_value_t = PrintFormat::Automatic)]
     format: PrintFormat,
 
     #[clap(
@@ -126,13 +109,14 @@ struct Args {
 
     #[clap(
         long,
-        help = "Specify the memory pool type 'greedy' or 'fair', default to 'greedy'"
+        help = "Specify the memory pool type 'greedy' or 'fair'",
+        default_value_t = PoolType::Greedy
     )]
-    mem_pool_type: Option<PoolType>,
+    mem_pool_type: PoolType,
 
     #[clap(
         long,
-        help = "The max number of rows to display for 'Table' format\n[default: 40] [possible values: numbers(0/10/...), inf(no limit)]",
+        help = "The max number of rows to display for 'Table' format\n[possible values: numbers(0/10/...), inf(no limit)]",
         default_value = "40"
     )]
     maxrows: MaxRows,
@@ -172,35 +156,26 @@ async fn main_inner() -> Result<()> {
         session_config = session_config.with_batch_size(batch_size);
     };
 
-    let rt_config = RuntimeConfig::new();
-    let rt_config =
-        // set memory pool size
-        if let Some(memory_limit) = args.memory_limit {
-            let memory_limit = extract_memory_pool_size(&memory_limit).unwrap();
-            // set memory pool type
-            if let Some(mem_pool_type) = args.mem_pool_type {
-                match mem_pool_type {
-                    PoolType::Greedy => rt_config
-                        .with_memory_pool(Arc::new(GreedyMemoryPool::new(memory_limit))),
-                    PoolType::Fair => rt_config
-                        .with_memory_pool(Arc::new(FairSpillPool::new(memory_limit))),
-                }
-            } else {
-                rt_config
-                .with_memory_pool(Arc::new(GreedyMemoryPool::new(memory_limit)))
-            }
-        } else {
-            rt_config
+    let mut rt_builder = RuntimeEnvBuilder::new();
+    // set memory pool size
+    if let Some(memory_limit) = args.memory_limit {
+        // set memory pool type
+        let pool: Arc<dyn MemoryPool> = match args.mem_pool_type {
+            PoolType::Fair => Arc::new(FairSpillPool::new(memory_limit)),
+            PoolType::Greedy => Arc::new(GreedyMemoryPool::new(memory_limit)),
         };
+        rt_builder = rt_builder.with_memory_pool(pool)
+    }
 
-    let runtime_env = create_runtime_env(rt_config.clone())?;
+    let runtime_env = rt_builder.build_arc()?;
 
-    let mut ctx =
-        SessionContext::new_with_config_rt(session_config.clone(), Arc::new(runtime_env));
+    // enable dynamic file query
+    let ctx = SessionContext::new_with_config_rt(session_config, runtime_env)
+        .enable_url_table();
     ctx.refresh_catalogs().await?;
-    // install dynamic catalog provider that knows how to open files
-    ctx.register_catalog_list(Arc::new(DynamicFileCatalog::new(
-        ctx.state().catalog_list(),
+    // install dynamic catalog provider that can register required object stores
+    ctx.register_catalog_list(Arc::new(DynamicObjectStoreCatalog::new(
+        ctx.state().catalog_list().clone(),
         ctx.state_weak_ref(),
     )));
     // register `parquet_metadata` table function to get metadata from parquet files
@@ -232,56 +207,53 @@ async fn main_inner() -> Result<()> {
 
     if commands.is_empty() && files.is_empty() {
         if !rc.is_empty() {
-            exec::exec_from_files(&mut ctx, rc, &print_options).await?;
+            exec::exec_from_files(&ctx, rc, &print_options).await?;
         }
         // TODO maybe we can have thiserror for cli but for now let's keep it simple
-        return exec::exec_from_repl(&mut ctx, &mut print_options)
+        return exec::exec_from_repl(&ctx, &mut print_options)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)));
     }
 
     if !files.is_empty() {
-        exec::exec_from_files(&mut ctx, files, &print_options).await?;
+        exec::exec_from_files(&ctx, files, &print_options).await?;
     }
 
     if !commands.is_empty() {
-        exec::exec_from_commands(&mut ctx, commands, &print_options).await?;
+        exec::exec_from_commands(&ctx, commands, &print_options).await?;
     }
 
     Ok(())
 }
 
-fn create_runtime_env(rn_config: RuntimeConfig) -> Result<RuntimeEnv> {
-    RuntimeEnv::new(rn_config)
-}
-
-fn is_valid_file(dir: &str) -> Result<(), String> {
+fn parse_valid_file(dir: &str) -> Result<String, String> {
     if Path::new(dir).is_file() {
-        Ok(())
+        Ok(dir.to_string())
     } else {
         Err(format!("Invalid file '{}'", dir))
     }
 }
 
-fn is_valid_data_dir(dir: &str) -> Result<(), String> {
+fn parse_valid_data_dir(dir: &str) -> Result<String, String> {
     if Path::new(dir).is_dir() {
-        Ok(())
+        Ok(dir.to_string())
     } else {
         Err(format!("Invalid data directory '{}'", dir))
     }
 }
 
-fn is_valid_batch_size(size: &str) -> Result<(), String> {
+fn parse_batch_size(size: &str) -> Result<usize, String> {
     match size.parse::<usize>() {
-        Ok(size) if size > 0 => Ok(()),
+        Ok(size) if size > 0 => Ok(size),
         _ => Err(format!("Invalid batch size '{}'", size)),
     }
 }
 
-fn is_valid_memory_pool_size(size: &str) -> Result<(), String> {
-    match extract_memory_pool_size(size) {
-        Ok(_) => Ok(()),
-        Err(e) => Err(e),
+fn parse_command(command: &str) -> Result<String, String> {
+    if !command.is_empty() {
+        Ok(command.to_string())
+    } else {
+        Err("-c flag expects only non empty commands".to_string())
     }
 }
 
@@ -295,7 +267,7 @@ enum ByteUnit {
 }
 
 impl ByteUnit {
-    fn multiplier(&self) -> usize {
+    fn multiplier(&self) -> u64 {
         match self {
             ByteUnit::Byte => 1,
             ByteUnit::KiB => 1 << 10,
@@ -307,9 +279,8 @@ impl ByteUnit {
 }
 
 fn extract_memory_pool_size(size: &str) -> Result<usize, String> {
-    fn byte_suffixes() -> &'static HashMap<&'static str, ByteUnit> {
-        static BYTE_SUFFIXES: OnceLock<HashMap<&'static str, ByteUnit>> = OnceLock::new();
-        BYTE_SUFFIXES.get_or_init(|| {
+    static BYTE_SUFFIXES: LazyLock<HashMap<&'static str, ByteUnit>> =
+        LazyLock::new(|| {
             let mut m = HashMap::new();
             m.insert("b", ByteUnit::Byte);
             m.insert("k", ByteUnit::KiB);
@@ -321,27 +292,28 @@ fn extract_memory_pool_size(size: &str) -> Result<usize, String> {
             m.insert("t", ByteUnit::TiB);
             m.insert("tb", ByteUnit::TiB);
             m
-        })
-    }
+        });
 
-    fn suffix_re() -> &'static regex::Regex {
-        static SUFFIX_REGEX: OnceLock<regex::Regex> = OnceLock::new();
-        SUFFIX_REGEX.get_or_init(|| regex::Regex::new(r"^(-?[0-9]+)([a-z]+)?$").unwrap())
-    }
+    static SUFFIX_REGEX: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"^(-?[0-9]+)([a-z]+)?$").unwrap());
 
     let lower = size.to_lowercase();
-    if let Some(caps) = suffix_re().captures(&lower) {
+    if let Some(caps) = SUFFIX_REGEX.captures(&lower) {
         let num_str = caps.get(1).unwrap().as_str();
         let num = num_str.parse::<usize>().map_err(|_| {
             format!("Invalid numeric value in memory pool size '{}'", size)
         })?;
 
         let suffix = caps.get(2).map(|m| m.as_str()).unwrap_or("b");
-        let unit = byte_suffixes()
+        let unit = &BYTE_SUFFIXES
             .get(suffix)
             .ok_or_else(|| format!("Invalid memory pool size '{}'", size))?;
+        let memory_pool_size = usize::try_from(unit.multiplier())
+            .ok()
+            .and_then(|multiplier| num.checked_mul(multiplier))
+            .ok_or_else(|| format!("Memory pool size '{}' is too large", size))?;
 
-        Ok(num * unit.multiplier())
+        Ok(memory_pool_size)
     } else {
         Err(format!("Invalid memory pool size '{}'", size))
     }

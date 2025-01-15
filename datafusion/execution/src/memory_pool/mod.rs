@@ -18,11 +18,15 @@
 //! [`MemoryPool`] for memory management during query execution, [`proxy]` for
 //! help with allocation accounting.
 
-use datafusion_common::Result;
+use datafusion_common::{internal_err, Result};
 use std::{cmp::Ordering, sync::Arc};
 
 mod pool;
-pub mod proxy;
+pub mod proxy {
+    pub use datafusion_common::utils::proxy::{
+        HashTableAllocExt, RawTableAllocExt, VecAllocExt,
+    };
+}
 
 pub use pool::*;
 
@@ -66,20 +70,44 @@ pub use pool::*;
 /// Note that a `MemoryPool` can be shared by concurrently executing plans,
 /// which can be used to control memory usage in a multi-tenant system.
 ///
+/// # How MemoryPool works by example
+///
+/// Scenario 1:
+/// For `Filter` operator, `RecordBatch`es will stream through it, so it
+/// don't have to keep track of memory usage through [`MemoryPool`].
+///
+/// Scenario 2:
+/// For `CrossJoin` operator, if the input size gets larger, the intermediate
+/// state will also grow. So `CrossJoin` operator will use [`MemoryPool`] to
+/// limit the memory usage.
+/// 2.1 `CrossJoin` operator has read a new batch, asked memory pool for
+/// additional memory. Memory pool updates the usage and returns success.
+/// 2.2 `CrossJoin` has read another batch, and tries to reserve more memory
+/// again, memory pool does not have enough memory. Since `CrossJoin` operator
+/// has not implemented spilling, it will stop execution and return an error.
+///
+/// Scenario 3:
+/// For `Aggregate` operator, its intermediate states will also accumulate as
+/// the input size gets larger, but with spilling capability. When it tries to
+/// reserve more memory from the memory pool, and the memory pool has already
+/// reached the memory limit, it will return an error. Then, `Aggregate`
+/// operator will spill the intermediate buffers to disk, and release memory
+/// from the memory pool, and continue to retry memory reservation.
+///
 /// # Implementing `MemoryPool`
 ///
 /// You can implement a custom allocation policy by implementing the
 /// [`MemoryPool`] trait and configuring a `SessionContext` appropriately.
-/// However, mDataFusion comes with the following simple memory pool implementations that
+/// However, DataFusion comes with the following simple memory pool implementations that
 /// handle many common cases:
 ///
 /// * [`UnboundedMemoryPool`]: no memory limits (the default)
 ///
 /// * [`GreedyMemoryPool`]: Limits memory usage to a fixed size using a "first
-/// come first served" policy
+///   come first served" policy
 ///
 /// * [`FairSpillPool`]: Limits memory usage to a fixed size, allocating memory
-/// to all spilling operators fairly
+///   to all spilling operators fairly
 pub trait MemoryPool: Send + Sync + std::fmt::Debug {
     /// Registers a new [`MemoryConsumer`]
     ///
@@ -115,7 +143,7 @@ pub trait MemoryPool: Send + Sync + std::fmt::Debug {
 /// For help with allocation accounting, see the [proxy] module.
 ///
 /// [proxy]: crate::memory_pool::proxy
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct MemoryConsumer {
     name: String,
     can_spill: bool,
@@ -218,6 +246,23 @@ impl MemoryReservation {
         self.size = new_size
     }
 
+    /// Tries to free `capacity` bytes from this reservation
+    /// if `capacity` does not exceed [`Self::size`]
+    /// Returns new reservation size
+    /// or error if shrinking capacity is more than allocated size
+    pub fn try_shrink(&mut self, capacity: usize) -> Result<usize> {
+        if let Some(new_size) = self.size.checked_sub(capacity) {
+            self.registration.pool.shrink(self, capacity);
+            self.size = new_size;
+            Ok(new_size)
+        } else {
+            internal_err!(
+                "Cannot free the capacity {capacity} out of allocated size {}",
+                self.size
+            )
+        }
+    }
+
     /// Sets the size of this reservation to `capacity`
     pub fn resize(&mut self, capacity: usize) {
         match capacity.cmp(&self.size) {
@@ -266,7 +311,7 @@ impl MemoryReservation {
         self.size = self.size.checked_sub(capacity).unwrap();
         Self {
             size: capacity,
-            registration: self.registration.clone(),
+            registration: Arc::clone(&self.registration),
         }
     }
 
@@ -274,7 +319,7 @@ impl MemoryReservation {
     pub fn new_empty(&self) -> Self {
         Self {
             size: 0,
-            registration: self.registration.clone(),
+            registration: Arc::clone(&self.registration),
         }
     }
 
@@ -291,13 +336,17 @@ impl Drop for MemoryReservation {
     }
 }
 
-const TB: u64 = 1 << 40;
-const GB: u64 = 1 << 30;
-const MB: u64 = 1 << 20;
-const KB: u64 = 1 << 10;
+pub mod units {
+    pub const TB: u64 = 1 << 40;
+    pub const GB: u64 = 1 << 30;
+    pub const MB: u64 = 1 << 20;
+    pub const KB: u64 = 1 << 10;
+}
 
 /// Present size in human readable form
 pub fn human_readable_size(size: usize) -> String {
+    use units::*;
+
     let size = size as u64;
     let (value, unit) = {
         if size >= 2 * TB {

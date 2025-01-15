@@ -17,7 +17,13 @@
 
 //! File Compression type abstraction
 
+use std::str::FromStr;
+
 use crate::error::{DataFusionError, Result};
+
+use datafusion_common::parsers::CompressionTypeVariant::{self, *};
+use datafusion_common::GetExt;
+
 #[cfg(feature = "compression")]
 use async_compression::tokio::bufread::{
     BzDecoder as AsyncBzDecoder, BzEncoder as AsyncBzEncoder,
@@ -31,15 +37,13 @@ use async_compression::tokio::write::{BzEncoder, GzipEncoder, XzEncoder, ZstdEnc
 use bytes::Bytes;
 #[cfg(feature = "compression")]
 use bzip2::read::MultiBzDecoder;
-use datafusion_common::{parsers::CompressionTypeVariant, FileType, GetExt};
 #[cfg(feature = "compression")]
 use flate2::read::MultiGzDecoder;
-
 use futures::stream::BoxStream;
 use futures::StreamExt;
 #[cfg(feature = "compression")]
 use futures::TryStreamExt;
-use std::str::FromStr;
+use object_store::buffered::BufWriter;
 use tokio::io::AsyncWrite;
 #[cfg(feature = "compression")]
 use tokio_util::io::{ReaderStream, StreamReader};
@@ -47,7 +51,6 @@ use tokio_util::io::{ReaderStream, StreamReader};
 use xz2::read::XzDecoder;
 #[cfg(feature = "compression")]
 use zstd::Decoder as ZstdDecoder;
-use CompressionTypeVariant::*;
 
 /// Readable file compression type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +73,12 @@ impl GetExt for FileCompressionType {
 impl From<CompressionTypeVariant> for FileCompressionType {
     fn from(t: CompressionTypeVariant) -> Self {
         Self { variant: t }
+    }
+}
+
+impl From<FileCompressionType> for CompressionTypeVariant {
+    fn from(t: FileCompressionType) -> Self {
+        t.variant
     }
 }
 
@@ -103,16 +112,21 @@ impl FileCompressionType {
         variant: UNCOMPRESSED,
     };
 
+    /// Read only access to self.variant
+    pub fn get_variant(&self) -> &CompressionTypeVariant {
+        &self.variant
+    }
+
     /// The file is compressed or not
     pub const fn is_compressed(&self) -> bool {
         self.variant.is_compressed()
     }
 
     /// Given a `Stream`, create a `Stream` which data are compressed with `FileCompressionType`.
-    pub fn convert_to_compress_stream(
+    pub fn convert_to_compress_stream<'a>(
         &self,
-        s: BoxStream<'static, Result<Bytes>>,
-    ) -> Result<BoxStream<'static, Result<Bytes>>> {
+        s: BoxStream<'a, Result<Bytes>>,
+    ) -> Result<BoxStream<'a, Result<Bytes>>> {
         Ok(match self.variant {
             #[cfg(feature = "compression")]
             GZIP => ReaderStream::new(AsyncGzEncoder::new(StreamReader::new(s)))
@@ -140,11 +154,11 @@ impl FileCompressionType {
         })
     }
 
-    /// Wrap the given `AsyncWrite` so that it performs compressed writes
+    /// Wrap the given `BufWriter` so that it performs compressed writes
     /// according to this `FileCompressionType`.
     pub fn convert_async_writer(
         &self,
-        w: Box<dyn AsyncWrite + Send + Unpin>,
+        w: BufWriter,
     ) -> Result<Box<dyn AsyncWrite + Send + Unpin>> {
         Ok(match self.variant {
             #[cfg(feature = "compression")]
@@ -161,20 +175,25 @@ impl FileCompressionType {
                     "Compression feature is not enabled".to_owned(),
                 ))
             }
-            UNCOMPRESSED => w,
+            UNCOMPRESSED => Box::new(w),
         })
     }
 
     /// Given a `Stream`, create a `Stream` which data are decompressed with `FileCompressionType`.
-    pub fn convert_stream(
+    pub fn convert_stream<'a>(
         &self,
-        s: BoxStream<'static, Result<Bytes>>,
-    ) -> Result<BoxStream<'static, Result<Bytes>>> {
+        s: BoxStream<'a, Result<Bytes>>,
+    ) -> Result<BoxStream<'a, Result<Bytes>>> {
         Ok(match self.variant {
             #[cfg(feature = "compression")]
-            GZIP => ReaderStream::new(AsyncGzDecoder::new(StreamReader::new(s)))
-                .map_err(DataFusionError::from)
-                .boxed(),
+            GZIP => {
+                let mut decoder = AsyncGzDecoder::new(StreamReader::new(s));
+                decoder.multiple_members(true);
+
+                ReaderStream::new(decoder)
+                    .map_err(DataFusionError::from)
+                    .boxed()
+            }
             #[cfg(feature = "compression")]
             BZIP2 => ReaderStream::new(AsyncBzDecoder::new(StreamReader::new(s)))
                 .map_err(DataFusionError::from)
@@ -231,84 +250,15 @@ pub trait FileTypeExt {
     fn get_ext_with_compression(&self, c: FileCompressionType) -> Result<String>;
 }
 
-impl FileTypeExt for FileType {
-    fn get_ext_with_compression(&self, c: FileCompressionType) -> Result<String> {
-        let ext = self.get_ext();
-
-        match self {
-            FileType::JSON | FileType::CSV => Ok(format!("{}{}", ext, c.get_ext())),
-            FileType::AVRO | FileType::ARROW => match c.variant {
-                UNCOMPRESSED => Ok(ext),
-                _ => Err(DataFusionError::Internal(
-                    "FileCompressionType can be specified for CSV/JSON FileType.".into(),
-                )),
-            },
-            #[cfg(feature = "parquet")]
-            FileType::PARQUET => match c.variant {
-                UNCOMPRESSED => Ok(ext),
-                _ => Err(DataFusionError::Internal(
-                    "FileCompressionType can be specified for CSV/JSON FileType.".into(),
-                )),
-            },
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use crate::datasource::file_format::file_compression_type::{
-        FileCompressionType, FileTypeExt,
-    };
-    use crate::error::DataFusionError;
-    use datafusion_common::file_options::file_type::FileType;
     use std::str::FromStr;
 
-    #[test]
-    fn get_ext_with_compression() {
-        for (file_type, compression, extension) in [
-            (FileType::CSV, FileCompressionType::UNCOMPRESSED, ".csv"),
-            (FileType::CSV, FileCompressionType::GZIP, ".csv.gz"),
-            (FileType::CSV, FileCompressionType::XZ, ".csv.xz"),
-            (FileType::CSV, FileCompressionType::BZIP2, ".csv.bz2"),
-            (FileType::CSV, FileCompressionType::ZSTD, ".csv.zst"),
-            (FileType::JSON, FileCompressionType::UNCOMPRESSED, ".json"),
-            (FileType::JSON, FileCompressionType::GZIP, ".json.gz"),
-            (FileType::JSON, FileCompressionType::XZ, ".json.xz"),
-            (FileType::JSON, FileCompressionType::BZIP2, ".json.bz2"),
-            (FileType::JSON, FileCompressionType::ZSTD, ".json.zst"),
-        ] {
-            assert_eq!(
-                file_type.get_ext_with_compression(compression).unwrap(),
-                extension
-            );
-        }
+    use crate::datasource::file_format::file_compression_type::FileCompressionType;
+    use crate::error::DataFusionError;
 
-        let mut ty_ext_tuple = vec![];
-        ty_ext_tuple.push((FileType::AVRO, ".avro"));
-        #[cfg(feature = "parquet")]
-        ty_ext_tuple.push((FileType::PARQUET, ".parquet"));
-
-        // Cannot specify compression for these file types
-        for (file_type, extension) in ty_ext_tuple {
-            assert_eq!(
-                file_type
-                    .get_ext_with_compression(FileCompressionType::UNCOMPRESSED)
-                    .unwrap(),
-                extension
-            );
-            for compression in [
-                FileCompressionType::GZIP,
-                FileCompressionType::XZ,
-                FileCompressionType::BZIP2,
-                FileCompressionType::ZSTD,
-            ] {
-                assert!(matches!(
-                    file_type.get_ext_with_compression(compression),
-                    Err(DataFusionError::Internal(_))
-                ));
-            }
-        }
-    }
+    use bytes::Bytes;
+    use futures::StreamExt;
 
     #[test]
     fn from_str() {
@@ -339,5 +289,46 @@ mod tests {
             FileCompressionType::from_str("Unknown"),
             Err(DataFusionError::NotImplemented(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn test_bgzip_stream_decoding() -> Result<(), DataFusionError> {
+        // As described in https://samtools.github.io/hts-specs/SAMv1.pdf ("The BGZF compression format")
+
+        // Ignore rust formatting so the byte array is easier to read
+        #[rustfmt::skip]
+        let data = [
+            // Block header
+            0x1f, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x06, 0x00, 0x42, 0x43,
+            0x02, 0x00,
+            // Block 0, literal: 42
+            0x1e, 0x00, 0x33, 0x31, 0xe2, 0x02, 0x00, 0x31, 0x29, 0x86, 0xd1, 0x03, 0x00, 0x00, 0x00,
+            // Block header
+            0x1f, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x06, 0x00, 0x42, 0x43,
+            0x02, 0x00,
+            // Block 1, literal: 42
+            0x1e, 0x00, 0x33, 0x31, 0xe2, 0x02, 0x00, 0x31, 0x29, 0x86, 0xd1, 0x03, 0x00, 0x00, 0x00,
+            // EOF
+            0x1f, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x06, 0x00, 0x42, 0x43,
+            0x02, 0x00, 0x1b, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+
+        // Create a byte stream
+        let stream = futures::stream::iter(vec![Ok::<Bytes, DataFusionError>(
+            Bytes::from(data.to_vec()),
+        )]);
+        let converted_stream =
+            FileCompressionType::GZIP.convert_stream(stream.boxed())?;
+
+        let vec = converted_stream
+            .map(|r| r.unwrap())
+            .collect::<Vec<Bytes>>()
+            .await;
+
+        let string_value = String::from_utf8_lossy(&vec[0]);
+
+        assert_eq!(string_value, "42\n42\n");
+
+        Ok(())
     }
 }

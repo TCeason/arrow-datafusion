@@ -19,13 +19,13 @@
 
 use std::fmt::{self, Debug, Display};
 
-use crate::ScalarValue;
+use crate::{Result, ScalarValue};
 
-use arrow_schema::Schema;
+use arrow_schema::{Schema, SchemaRef};
 
 /// Represents a value with a degree of certainty. `Precision` is used to
 /// propagate information the precision of statistical values.
-#[derive(Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq, Default, Copy)]
 pub enum Precision<T: Debug + Clone + PartialEq + Eq + PartialOrd> {
     /// The exact value is known
     Exact(T),
@@ -190,7 +190,7 @@ impl Precision<ScalarValue> {
     }
 }
 
-impl<T: fmt::Debug + Clone + PartialEq + Eq + PartialOrd> Debug for Precision<T> {
+impl<T: Debug + Clone + PartialEq + Eq + PartialOrd> Debug for Precision<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Precision::Exact(inner) => write!(f, "Exact({:?})", inner),
@@ -200,7 +200,7 @@ impl<T: fmt::Debug + Clone + PartialEq + Eq + PartialOrd> Debug for Precision<T>
     }
 }
 
-impl<T: fmt::Debug + Clone + PartialEq + Eq + PartialOrd> Display for Precision<T> {
+impl<T: Debug + Clone + PartialEq + Eq + PartialOrd> Display for Precision<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Precision::Exact(inner) => write!(f, "Exact({:?})", inner),
@@ -221,7 +221,7 @@ pub struct Statistics {
     /// Total bytes of the table rows.
     pub total_byte_size: Precision<usize>,
     /// Statistics on a column level. It contains a [`ColumnStatistics`] for
-    /// each field in the schema of the the table to which the [`Statistics`] refer.
+    /// each field in the schema of the table to which the [`Statistics`] refer.
     pub column_statistics: Vec<ColumnStatistics>,
 }
 
@@ -247,26 +247,143 @@ impl Statistics {
 
     /// If the exactness of a [`Statistics`] instance is lost, this function relaxes
     /// the exactness of all information by converting them [`Precision::Inexact`].
-    pub fn into_inexact(self) -> Self {
-        Statistics {
-            num_rows: self.num_rows.to_inexact(),
-            total_byte_size: self.total_byte_size.to_inexact(),
-            column_statistics: self
-                .column_statistics
-                .into_iter()
-                .map(|cs| ColumnStatistics {
-                    null_count: cs.null_count.to_inexact(),
-                    max_value: cs.max_value.to_inexact(),
-                    min_value: cs.min_value.to_inexact(),
-                    distinct_count: cs.distinct_count.to_inexact(),
-                })
-                .collect::<Vec<_>>(),
+    pub fn to_inexact(mut self) -> Self {
+        self.num_rows = self.num_rows.to_inexact();
+        self.total_byte_size = self.total_byte_size.to_inexact();
+        self.column_statistics = self
+            .column_statistics
+            .into_iter()
+            .map(|s| s.to_inexact())
+            .collect();
+        self
+    }
+
+    /// Project the statistics to the given column indices.
+    ///
+    /// For example, if we had statistics for columns `{"a", "b", "c"}`,
+    /// projecting to `vec![2, 1]` would return statistics for columns `{"c",
+    /// "b"}`.
+    pub fn project(mut self, projection: Option<&Vec<usize>>) -> Self {
+        let Some(projection) = projection else {
+            return self;
+        };
+
+        enum Slot {
+            /// The column is taken and put into the specified statistics location
+            Taken(usize),
+            /// The original columns is present
+            Present(ColumnStatistics),
         }
+
+        // Convert to Vec<Slot> so we can avoid copying the statistics
+        let mut columns: Vec<_> = std::mem::take(&mut self.column_statistics)
+            .into_iter()
+            .map(Slot::Present)
+            .collect();
+
+        for idx in projection {
+            let next_idx = self.column_statistics.len();
+            let slot = std::mem::replace(
+                columns.get_mut(*idx).expect("projection out of bounds"),
+                Slot::Taken(next_idx),
+            );
+            match slot {
+                // The column was there, so just move it
+                Slot::Present(col) => self.column_statistics.push(col),
+                // The column was taken, so copy from the previous location
+                Slot::Taken(prev_idx) => self
+                    .column_statistics
+                    .push(self.column_statistics[prev_idx].clone()),
+            }
+        }
+
+        self
+    }
+
+    /// Calculates the statistics after `fetch` and `skip` operations apply.
+    /// Here, `self` denotes per-partition statistics. Use the `n_partitions`
+    /// parameter to compute global statistics in a multi-partition setting.
+    pub fn with_fetch(
+        mut self,
+        schema: SchemaRef,
+        fetch: Option<usize>,
+        skip: usize,
+        n_partitions: usize,
+    ) -> Result<Self> {
+        let fetch_val = fetch.unwrap_or(usize::MAX);
+
+        self.num_rows = match self {
+            Statistics {
+                num_rows: Precision::Exact(nr),
+                ..
+            }
+            | Statistics {
+                num_rows: Precision::Inexact(nr),
+                ..
+            } => {
+                // Here, the inexact case gives us an upper bound on the number of rows.
+                if nr <= skip {
+                    // All input data will be skipped:
+                    Precision::Exact(0)
+                } else if nr <= fetch_val && skip == 0 {
+                    // If the input does not reach the `fetch` globally, and `skip`
+                    // is zero (meaning the input and output are identical), return
+                    // input stats as is.
+                    // TODO: Can input stats still be used, but adjusted, when `skip`
+                    //       is non-zero?
+                    return Ok(self);
+                } else if nr - skip <= fetch_val {
+                    // After `skip` input rows are skipped, the remaining rows are
+                    // less than or equal to the `fetch` values, so `num_rows` must
+                    // equal the remaining rows.
+                    check_num_rows(
+                        (nr - skip).checked_mul(n_partitions),
+                        // We know that we have an estimate for the number of rows:
+                        self.num_rows.is_exact().unwrap(),
+                    )
+                } else {
+                    // At this point we know that we were given a `fetch` value
+                    // as the `None` case would go into the branch above. Since
+                    // the input has more rows than `fetch + skip`, the number
+                    // of rows will be the `fetch`, but we won't be able to
+                    // predict the other statistics.
+                    check_num_rows(
+                        fetch_val.checked_mul(n_partitions),
+                        // We know that we have an estimate for the number of rows:
+                        self.num_rows.is_exact().unwrap(),
+                    )
+                }
+            }
+            Statistics {
+                num_rows: Precision::Absent,
+                ..
+            } => check_num_rows(fetch.and_then(|v| v.checked_mul(n_partitions)), false),
+        };
+        self.column_statistics = Statistics::unknown_column(&schema);
+        self.total_byte_size = Precision::Absent;
+        Ok(self)
+    }
+}
+
+/// Creates an estimate of the number of rows in the output using the given
+/// optional value and exactness flag.
+fn check_num_rows(value: Option<usize>, is_exact: bool) -> Precision<usize> {
+    if let Some(value) = value {
+        if is_exact {
+            Precision::Exact(value)
+        } else {
+            // If the input stats are inexact, so are the output stats.
+            Precision::Inexact(value)
+        }
+    } else {
+        // If the estimate is not available (e.g. due to an overflow), we can
+        // not produce a reliable estimate.
+        Precision::Absent
     }
 }
 
 impl Display for Statistics {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // string of column statistics
         let column_stats = self
             .column_statistics
@@ -336,13 +453,24 @@ impl ColumnStatistics {
     }
 
     /// Returns a [`ColumnStatistics`] instance having all [`Precision::Absent`] parameters.
-    pub fn new_unknown() -> ColumnStatistics {
-        ColumnStatistics {
+    pub fn new_unknown() -> Self {
+        Self {
             null_count: Precision::Absent,
             max_value: Precision::Absent,
             min_value: Precision::Absent,
             distinct_count: Precision::Absent,
         }
+    }
+
+    /// If the exactness of a [`ColumnStatistics`] instance is lost, this
+    /// function relaxes the exactness of all information by converting them
+    /// [`Precision::Inexact`].
+    pub fn to_inexact(mut self) -> Self {
+        self.null_count = self.null_count.to_inexact();
+        self.max_value = self.max_value.to_inexact();
+        self.min_value = self.min_value.to_inexact();
+        self.distinct_count = self.distinct_count.to_inexact();
+        self
     }
 }
 
@@ -417,9 +545,9 @@ mod tests {
         let inexact_precision = Precision::Inexact(42);
         let absent_precision = Precision::<i32>::Absent;
 
-        assert_eq!(exact_precision.clone().to_inexact(), inexact_precision);
-        assert_eq!(inexact_precision.clone().to_inexact(), inexact_precision);
-        assert_eq!(absent_precision.clone().to_inexact(), absent_precision);
+        assert_eq!(exact_precision.to_inexact(), inexact_precision);
+        assert_eq!(inexact_precision.to_inexact(), inexact_precision);
+        assert_eq!(absent_precision.to_inexact(), absent_precision);
     }
 
     #[test]
@@ -458,5 +586,67 @@ mod tests {
         assert_eq!(precision1.multiply(&precision3), Precision::Exact(30));
         assert_eq!(precision2.multiply(&precision3), Precision::Inexact(15));
         assert_eq!(precision1.multiply(&absent_precision), Precision::Absent);
+    }
+
+    #[test]
+    fn test_precision_cloning() {
+        // Precision<usize> is copy
+        let precision: Precision<usize> = Precision::Exact(42);
+        let p2 = precision;
+        assert_eq!(precision, p2);
+
+        // Precision<ScalarValue> is not copy (requires .clone())
+        let precision: Precision<ScalarValue> =
+            Precision::Exact(ScalarValue::Int64(Some(42)));
+        // Clippy would complain about this if it were Copy
+        #[allow(clippy::redundant_clone)]
+        let p2 = precision.clone();
+        assert_eq!(precision, p2);
+    }
+
+    #[test]
+    fn test_project_none() {
+        let projection = None;
+        let stats = make_stats(vec![10, 20, 30]).project(projection.as_ref());
+        assert_eq!(stats, make_stats(vec![10, 20, 30]));
+    }
+
+    #[test]
+    fn test_project_empty() {
+        let projection = Some(vec![]);
+        let stats = make_stats(vec![10, 20, 30]).project(projection.as_ref());
+        assert_eq!(stats, make_stats(vec![]));
+    }
+
+    #[test]
+    fn test_project_swap() {
+        let projection = Some(vec![2, 1]);
+        let stats = make_stats(vec![10, 20, 30]).project(projection.as_ref());
+        assert_eq!(stats, make_stats(vec![30, 20]));
+    }
+
+    #[test]
+    fn test_project_repeated() {
+        let projection = Some(vec![1, 2, 1, 1, 0, 2]);
+        let stats = make_stats(vec![10, 20, 30]).project(projection.as_ref());
+        assert_eq!(stats, make_stats(vec![20, 30, 20, 20, 10, 30]));
+    }
+
+    // Make a Statistics structure with the specified null counts for each column
+    fn make_stats(counts: impl IntoIterator<Item = usize>) -> Statistics {
+        Statistics {
+            num_rows: Precision::Exact(42),
+            total_byte_size: Precision::Exact(500),
+            column_statistics: counts.into_iter().map(col_stats_i64).collect(),
+        }
+    }
+
+    fn col_stats_i64(null_count: usize) -> ColumnStatistics {
+        ColumnStatistics {
+            null_count: Precision::Exact(null_count),
+            max_value: Precision::Exact(ScalarValue::Int64(Some(42))),
+            min_value: Precision::Exact(ScalarValue::Int64(Some(64))),
+            distinct_count: Precision::Exact(100),
+        }
     }
 }

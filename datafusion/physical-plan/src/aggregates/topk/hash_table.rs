@@ -17,7 +17,7 @@
 
 //! A wrapper around `hashbrown::RawTable` that allows entries to be tracked by index
 
-use crate::aggregates::group_values::primitive::HashValue;
+use crate::aggregates::group_values::HashValue;
 use crate::aggregates::topk::heap::Comparable;
 use ahash::RandomState;
 use arrow::datatypes::i256;
@@ -26,6 +26,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::{
     downcast_primitive, Array, ArrayRef, ArrowPrimitiveType, PrimitiveArray, StringArray,
 };
+use arrow_buffer::{IntervalDayTime, IntervalMonthDayNano};
 use arrow_schema::DataType;
 use datafusion_common::DataFusionError;
 use datafusion_common::Result;
@@ -108,7 +109,7 @@ impl StringHashTable {
         Self {
             owned,
             map: TopKHashTable::new(limit, limit * 10),
-            rnd: ahash::RandomState::default(),
+            rnd: RandomState::default(),
         }
     }
 }
@@ -180,7 +181,7 @@ where
         Self {
             owned,
             map: TopKHashTable::new(limit, limit * 10),
-            rnd: ahash::RandomState::default(),
+            rnd: RandomState::default(),
         }
     }
 }
@@ -363,9 +364,13 @@ macro_rules! has_integer {
 
 has_integer!(i8, i16, i32, i64, i128, i256);
 has_integer!(u8, u16, u32, u64);
+has_integer!(IntervalDayTime, IntervalMonthDayNano);
 hash_float!(f16, f32, f64);
 
-pub fn new_hash_table(limit: usize, kt: DataType) -> Result<Box<dyn ArrowHashTable>> {
+pub fn new_hash_table(
+    limit: usize,
+    kt: DataType,
+) -> Result<Box<dyn ArrowHashTable + Send>> {
     macro_rules! downcast_helper {
         ($kt:ty, $d:ident) => {
             return Ok(Box::new(PrimitiveHashTable::<$kt>::new(limit)))
@@ -386,7 +391,6 @@ pub fn new_hash_table(limit: usize, kt: DataType) -> Result<Box<dyn ArrowHashTab
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion_common::Result;
     use std::collections::BTreeMap;
 
     #[test]

@@ -24,13 +24,12 @@
 use std::collections::VecDeque;
 use std::mem;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Instant;
 
 use crate::datasource::listing::PartitionedFile;
-use crate::datasource::physical_plan::{
-    FileMeta, FileScanConfig, PartitionColumnProjector,
-};
+use crate::datasource::physical_plan::file_scan_config::PartitionColumnProjector;
+use crate::datasource::physical_plan::{FileMeta, FileScanConfig};
 use crate::error::Result;
 use crate::physical_plan::metrics::{
     BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, Time,
@@ -40,6 +39,7 @@ use crate::physical_plan::RecordBatchStream;
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
+use datafusion_common::instant::Instant;
 use datafusion_common::ScalarValue;
 
 use futures::future::BoxFuture;
@@ -253,7 +253,7 @@ impl<F: FileOpener> FileStream<F> {
     ) -> Result<Self> {
         let (projected_schema, ..) = config.project();
         let pc_projector = PartitionColumnProjector::new(
-            projected_schema.clone(),
+            Arc::clone(&projected_schema),
             &config
                 .table_partition_cols
                 .iter()
@@ -296,6 +296,7 @@ impl<F: FileOpener> FileStream<F> {
             object_meta: part_file.object_meta,
             range: part_file.range,
             extensions: part_file.extensions,
+            metadata_size_hint: part_file.metadata_size_hint,
         };
 
         Some(
@@ -510,7 +511,7 @@ impl<F: FileOpener> Stream for FileStream<F> {
 
 impl<F: FileOpener> RecordBatchStream for FileStream<F> {
     fn schema(&self) -> SchemaRef {
-        self.projected_schema.clone()
+        Arc::clone(&self.projected_schema)
     }
 }
 
@@ -520,21 +521,12 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::datasource::file_format::write::BatchSerializer;
     use crate::datasource::object_store::ObjectStoreUrl;
-    use crate::datasource::physical_plan::FileMeta;
-    use crate::physical_plan::metrics::ExecutionPlanMetricsSet;
     use crate::prelude::SessionContext;
-    use crate::{
-        error::Result,
-        test::{make_partition, object_store::register_test_store},
-    };
+    use crate::test::{make_partition, object_store::register_test_store};
 
     use arrow_schema::Schema;
-    use datafusion_common::{internal_err, DataFusionError, Statistics};
-
-    use bytes::Bytes;
-    use futures::StreamExt;
+    use datafusion_common::internal_err;
 
     /// Test `FileOpener` which will simulate errors during file opening or scanning
     #[derive(Default)]
@@ -653,16 +645,12 @@ mod tests {
 
             let on_error = self.on_error;
 
-            let config = FileScanConfig {
-                object_store_url: ObjectStoreUrl::parse("test:///").unwrap(),
-                statistics: Statistics::new_unknown(&file_schema),
+            let config = FileScanConfig::new(
+                ObjectStoreUrl::parse("test:///").unwrap(),
                 file_schema,
-                file_groups: vec![file_group],
-                projection: None,
-                limit: self.limit,
-                table_partition_cols: vec![],
-                output_ordering: vec![],
-            };
+            )
+            .with_file_group(file_group)
+            .with_limit(self.limit);
             let metrics_set = ExecutionPlanMetricsSet::new();
             let file_stream = FileStream::new(&config, 0, self.opener, &metrics_set)
                 .unwrap()
@@ -980,15 +968,5 @@ mod tests {
         ], &batches);
 
         Ok(())
-    }
-
-    struct TestSerializer {
-        bytes: Bytes,
-    }
-
-    impl BatchSerializer for TestSerializer {
-        fn serialize(&self, _batch: RecordBatch, _initial: bool) -> Result<Bytes> {
-            Ok(self.bytes.clone())
-        }
     }
 }

@@ -20,18 +20,15 @@
 #[cfg(feature = "parquet")]
 mod parquet;
 
-use std::any::Any;
-use std::sync::Arc;
-
-use crate::arrow::datatypes::{Schema, SchemaRef};
 use crate::arrow::record_batch::RecordBatch;
 use crate::arrow::util::pretty;
+use crate::datasource::file_format::csv::CsvFormatFactory;
+use crate::datasource::file_format::format_as_file_type;
+use crate::datasource::file_format::json::JsonFormatFactory;
 use crate::datasource::{provider_as_source, MemTable, TableProvider};
 use crate::error::Result;
-use crate::execution::{
-    context::{SessionState, TaskContext},
-    FunctionRegistry,
-};
+use crate::execution::context::{SessionState, TaskContext};
+use crate::execution::FunctionRegistry;
 use crate::logical_expr::utils::find_window_exprs;
 use crate::logical_expr::{
     col, Expr, JoinType, LogicalPlan, LogicalPlanBuilder, Partitioning, TableType,
@@ -40,53 +37,64 @@ use crate::physical_plan::{
     collect, collect_partitioned, execute_stream, execute_stream_partitioned,
     ExecutionPlan, SendableRecordBatchStream,
 };
+use crate::prelude::SessionContext;
+use std::any::Any;
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, Int64Array, StringArray};
 use arrow::compute::{cast, concat};
-use arrow::csv::WriterBuilder;
 use arrow::datatypes::{DataType, Field};
-use datafusion_common::file_options::csv_writer::CsvWriterOptions;
-use datafusion_common::file_options::json_writer::JsonWriterOptions;
-use datafusion_common::parsers::CompressionTypeVariant;
+use arrow_schema::{Schema, SchemaRef};
+use datafusion_common::config::{CsvOptions, JsonOptions};
 use datafusion_common::{
-    Column, DFSchema, DataFusionError, FileType, FileTypeWriterOptions, ParamValues,
+    exec_err, not_impl_err, plan_err, Column, DFSchema, DataFusionError, ParamValues,
     SchemaError, UnnestOptions,
 };
-use datafusion_expr::dml::CopyOptions;
+use datafusion_expr::dml::InsertOp;
+use datafusion_expr::{case, is_null, lit, SortExpr};
 use datafusion_expr::{
-    avg, count, is_null, max, median, min, stddev, utils::COUNT_STAR_EXPANSION,
-    TableProviderFilterPushDown, UNNAMED_TABLE,
+    utils::COUNT_STAR_EXPANSION, TableProviderFilterPushDown, UNNAMED_TABLE,
+};
+use datafusion_functions_aggregate::expr_fn::{
+    avg, count, max, median, min, stddev, sum,
 };
 
-use crate::prelude::SessionContext;
 use async_trait::async_trait;
+use datafusion_catalog::Session;
 
 /// Contains options that control how data is
 /// written out from a DataFrame
 pub struct DataFrameWriteOptions {
-    /// Controls if existing data should be overwritten
-    overwrite: bool,
+    /// Controls how new data should be written to the table, determining whether
+    /// to append, overwrite, or replace existing data.
+    insert_op: InsertOp,
     /// Controls if all partitions should be coalesced into a single output file
     /// Generally will have slower performance when set to true.
     single_file_output: bool,
-    /// Sets compression by DataFusion applied after file serialization.
-    /// Allows compression of CSV and JSON.
-    /// Not supported for parquet.
-    compression: CompressionTypeVariant,
+    /// Sets which columns should be used for hive-style partitioned writes by name.
+    /// Can be set to empty vec![] for non-partitioned writes.
+    partition_by: Vec<String>,
+    /// Sets which columns should be used for sorting the output by name.
+    /// Can be set to empty vec![] for non-sorted writes.
+    sort_by: Vec<SortExpr>,
 }
 
 impl DataFrameWriteOptions {
     /// Create a new DataFrameWriteOptions with default values
     pub fn new() -> Self {
         DataFrameWriteOptions {
-            overwrite: false,
+            insert_op: InsertOp::Append,
             single_file_output: false,
-            compression: CompressionTypeVariant::UNCOMPRESSED,
+            partition_by: vec![],
+            sort_by: vec![],
         }
     }
-    /// Set the overwrite option to true or false
-    pub fn with_overwrite(mut self, overwrite: bool) -> Self {
-        self.overwrite = overwrite;
+
+    /// Set the insert operation
+    pub fn with_insert_operation(mut self, insert_op: InsertOp) -> Self {
+        self.insert_op = insert_op;
         self
     }
 
@@ -96,9 +104,15 @@ impl DataFrameWriteOptions {
         self
     }
 
-    /// Sets the compression type applied to the output file(s)
-    pub fn with_compression(mut self, compression: CompressionTypeVariant) -> Self {
-        self.compression = compression;
+    /// Sets the partition_by columns for output partitioning
+    pub fn with_partition_by(mut self, partition_by: Vec<String>) -> Self {
+        self.partition_by = partition_by;
+        self
+    }
+
+    /// Sets the sort_by columns for output sorting
+    pub fn with_sort_by(mut self, sort_by: Vec<SortExpr>) -> Self {
+        self.sort_by = sort_by;
         self
     }
 }
@@ -109,47 +123,107 @@ impl Default for DataFrameWriteOptions {
     }
 }
 
-/// DataFrame represents a logical set of rows with the same named columns.
-/// Similar to a [Pandas DataFrame](https://pandas.pydata.org/pandas-docs/stable/reference/api/pandas.DataFrame.html) or
-/// [Spark DataFrame](https://spark.apache.org/docs/latest/sql-programming-guide.html)
+/// Represents a logical set of rows with the same named columns.
 ///
-/// DataFrames are typically created by the `read_csv` and `read_parquet` methods on the
-/// [SessionContext](../execution/context/struct.SessionContext.html) and can then be modified
-/// by calling the transformation methods, such as `filter`, `select`, `aggregate`, and `limit`
-/// to build up a query definition.
+/// Similar to a [Pandas DataFrame] or [Spark DataFrame], a DataFusion DataFrame
+/// represents a 2 dimensional table of rows and columns.
 ///
-/// The query can be executed by calling the `collect` method.
+/// The typical workflow using DataFrames looks like
 ///
+/// 1. Create a DataFrame via methods on [SessionContext], such as [`read_csv`]
+///    and [`read_parquet`].
+///
+/// 2. Build a desired calculation by calling methods such as [`filter`],
+///    [`select`], [`aggregate`], and [`limit`]
+///
+/// 3. Execute into [`RecordBatch`]es by calling [`collect`]
+///
+/// A `DataFrame` is a wrapper around a [`LogicalPlan`] and the [`SessionState`]
+///    required for execution.
+///
+/// DataFrames are "lazy" in the sense that most methods do not actually compute
+/// anything, they just build up a plan. Calling [`collect`] executes the plan
+/// using the same DataFusion planning and execution process used to execute SQL
+/// and other queries.
+///
+/// [Pandas DataFrame]: https://pandas.pydata.org/pandas-docs/stable/reference/api/pandas.DataFrame.html
+/// [Spark DataFrame]: https://spark.apache.org/docs/latest/sql-programming-guide.html
+/// [`read_csv`]: SessionContext::read_csv
+/// [`read_parquet`]: SessionContext::read_parquet
+/// [`filter`]: DataFrame::filter
+/// [`select`]: DataFrame::select
+/// [`aggregate`]: DataFrame::aggregate
+/// [`limit`]: DataFrame::limit
+/// [`collect`]: DataFrame::collect
+///
+/// # Example
 /// ```
 /// # use datafusion::prelude::*;
 /// # use datafusion::error::Result;
+/// # use datafusion::functions_aggregate::expr_fn::min;
 /// # #[tokio::main]
 /// # async fn main() -> Result<()> {
 /// let ctx = SessionContext::new();
+/// // Read the data from a csv file
 /// let df = ctx.read_csv("tests/data/example.csv", CsvReadOptions::new()).await?;
+/// // create a new dataframe that computes the equivalent of
+/// // `SELECT a, MIN(b) FROM df WHERE a <= b GROUP BY a LIMIT 100;`
 /// let df = df.filter(col("a").lt_eq(col("b")))?
 ///            .aggregate(vec![col("a")], vec![min(col("b"))])?
 ///            .limit(0, Some(100))?;
+/// // Perform the actual computation
 /// let results = df.collect();
 /// # Ok(())
 /// # }
 /// ```
 #[derive(Debug, Clone)]
 pub struct DataFrame {
-    session_state: SessionState,
+    // Box the (large) SessionState to reduce the size of DataFrame on the stack
+    session_state: Box<SessionState>,
     plan: LogicalPlan,
 }
 
 impl DataFrame {
-    /// Create a new Table based on an existing logical plan
+    /// Create a new `DataFrame ` based on an existing `LogicalPlan`
+    ///
+    /// This is a low-level method and is not typically used by end users. See
+    /// [`SessionContext::read_csv`] and other methods for creating a
+    /// `DataFrame` from an existing datasource.
     pub fn new(session_state: SessionState, plan: LogicalPlan) -> Self {
         Self {
-            session_state,
+            session_state: Box::new(session_state),
             plan,
         }
     }
 
-    /// Create a physical plan
+    /// Creates logical expression from a SQL query text.
+    /// The expression is created and processed against the current schema.
+    ///
+    /// # Example: Parsing SQL queries
+    /// ```
+    /// # use arrow::datatypes::{DataType, Field, Schema};
+    /// # use datafusion::prelude::*;
+    /// # use datafusion_common::{DFSchema, Result};
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<()> {
+    /// // datafusion will parse number as i64 first.
+    /// let sql = "a > 1 and b in (1, 10)";
+    /// let expected = col("a").gt(lit(1 as i64))
+    ///   .and(col("b").in_list(vec![lit(1 as i64), lit(10 as i64)], false));
+    /// let ctx = SessionContext::new();
+    /// let df = ctx.read_csv("tests/data/example.csv", CsvReadOptions::new()).await?;
+    /// let expr = df.parse_sql_expr(sql)?;
+    /// assert_eq!(expected, expr);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn parse_sql_expr(&self, sql: &str) -> Result<Expr> {
+        let df_schema = self.schema();
+
+        self.session_state.create_logical_expr(sql, df_schema)
+    }
+
+    /// Consume the DataFrame and produce a physical plan
     pub async fn create_physical_plan(self) -> Result<Arc<dyn ExecutionPlan>> {
         self.session_state.create_physical_plan(&self.plan).await
     }
@@ -160,28 +234,44 @@ impl DataFrame {
     /// ```
     /// # use datafusion::prelude::*;
     /// # use datafusion::error::Result;
+    /// # use datafusion_common::assert_batches_sorted_eq;
     /// # #[tokio::main]
     /// # async fn main() -> Result<()> {
     /// let ctx = SessionContext::new();
     /// let df = ctx.read_csv("tests/data/example.csv", CsvReadOptions::new()).await?;
     /// let df = df.select_columns(&["a", "b"])?;
+    /// let expected = vec![
+    ///     "+---+---+",
+    ///     "| a | b |",
+    ///     "+---+---+",
+    ///     "| 1 | 2 |",
+    ///     "+---+---+"
+    /// ];
+    /// # assert_batches_sorted_eq!(expected, &df.collect().await?);
     /// # Ok(())
     /// # }
     /// ```
     pub fn select_columns(self, columns: &[&str]) -> Result<DataFrame> {
         let fields = columns
             .iter()
-            .map(|name| self.plan.schema().field_with_unqualified_name(name))
+            .map(|name| {
+                self.plan
+                    .schema()
+                    .qualified_field_with_unqualified_name(name)
+            })
             .collect::<Result<Vec<_>>>()?;
         let expr: Vec<Expr> = fields
-            .iter()
-            .map(|f| Expr::Column(f.qualified_column()))
+            .into_iter()
+            .map(|(qualifier, field)| Expr::Column(Column::from((qualifier, field))))
             .collect();
         self.select(expr)
     }
-
-    /// Create a projection based on arbitrary expressions.
+    /// Project arbitrary list of expression strings into a new `DataFrame`.
+    /// Method will parse string expressions into logical plan expressions.
     ///
+    /// The output `DataFrame` has one column for each element in `exprs`.
+    ///
+    /// # Example
     /// ```
     /// # use datafusion::prelude::*;
     /// # use datafusion::error::Result;
@@ -189,7 +279,42 @@ impl DataFrame {
     /// # async fn main() -> Result<()> {
     /// let ctx = SessionContext::new();
     /// let df = ctx.read_csv("tests/data/example.csv", CsvReadOptions::new()).await?;
-    /// let df = df.select(vec![col("a") * col("b"), col("c")])?;
+    /// let df : DataFrame = df.select_exprs(&["a * b", "c"])?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn select_exprs(self, exprs: &[&str]) -> Result<DataFrame> {
+        let expr_list = exprs
+            .iter()
+            .map(|e| self.parse_sql_expr(e))
+            .collect::<Result<Vec<_>>>()?;
+
+        self.select(expr_list)
+    }
+
+    /// Project arbitrary expressions (like SQL SELECT expressions) into a new
+    /// `DataFrame`.
+    ///
+    /// The output `DataFrame` has one column for each element in `expr_list`.
+    ///
+    /// # Example
+    /// ```
+    /// # use datafusion::prelude::*;
+    /// # use datafusion::error::Result;
+    /// # use datafusion_common::assert_batches_sorted_eq;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<()> {
+    /// let ctx = SessionContext::new();
+    /// let df = ctx.read_csv("tests/data/example.csv", CsvReadOptions::new()).await?;
+    /// let df = df.select(vec![col("a"), col("b") * col("c")])?;
+    /// let expected = vec![
+    ///     "+---+-----------------------+",
+    ///     "| a | ?table?.b * ?table?.c |",
+    ///     "+---+-----------------------+",
+    ///     "| 1 | 6                     |",
+    ///     "+---+-----------------------+"
+    /// ];
+    /// # assert_batches_sorted_eq!(expected, &df.collect().await?);
     /// # Ok(())
     /// # }
     /// ```
@@ -202,57 +327,144 @@ impl DataFrame {
         };
         let project_plan = LogicalPlanBuilder::from(plan).project(expr_list)?.build()?;
 
-        Ok(DataFrame::new(self.session_state, project_plan))
+        Ok(DataFrame {
+            session_state: self.session_state,
+            plan: project_plan,
+        })
     }
 
-    /// Expand each list element of a column to multiple rows.
-    ///
-    /// Seee also:
-    ///
-    /// 1. [`UnnestOptions`] documentation for the behavior of `unnest`
-    /// 2. [`Self::unnest_column_with_options`]
+    /// Returns a new DataFrame containing all columns except the specified columns.
     ///
     /// ```
     /// # use datafusion::prelude::*;
     /// # use datafusion::error::Result;
+    /// # use datafusion_common::assert_batches_sorted_eq;
     /// # #[tokio::main]
     /// # async fn main() -> Result<()> {
     /// let ctx = SessionContext::new();
     /// let df = ctx.read_csv("tests/data/example.csv", CsvReadOptions::new()).await?;
-    /// let df = df.unnest_column("a")?;
+    /// // +----+----+----+
+    /// // | a  | b  | c  |
+    /// // +----+----+----+
+    /// // | 1  | 2  | 3  |
+    /// // +----+----+----+
+    /// let df = df.drop_columns(&["a"])?;
+    /// let expected = vec![
+    ///     "+---+---+",
+    ///     "| b | c |",
+    ///     "+---+---+",
+    ///     "| 2 | 3 |",
+    ///     "+---+---+"
+    /// ];
+    /// # assert_batches_sorted_eq!(expected, &df.collect().await?);
     /// # Ok(())
     /// # }
     /// ```
-    pub fn unnest_column(self, column: &str) -> Result<DataFrame> {
-        self.unnest_column_with_options(column, UnnestOptions::new())
+    pub fn drop_columns(self, columns: &[&str]) -> Result<DataFrame> {
+        let fields_to_drop = columns
+            .iter()
+            .map(|name| {
+                self.plan
+                    .schema()
+                    .qualified_field_with_unqualified_name(name)
+            })
+            .filter(|r| r.is_ok())
+            .collect::<Result<Vec<_>>>()?;
+        let expr: Vec<Expr> = self
+            .plan
+            .schema()
+            .fields()
+            .into_iter()
+            .enumerate()
+            .map(|(idx, _)| self.plan.schema().qualified_field(idx))
+            .filter(|(qualifier, f)| !fields_to_drop.contains(&(*qualifier, f)))
+            .map(|(qualifier, field)| Expr::Column(Column::from((qualifier, field))))
+            .collect();
+        self.select(expr)
     }
 
-    /// Expand each list element of a column to multiple rows, with
+    /// Expand multiple list/struct columns into a set of rows and new columns.
+    ///
+    /// See also: [`UnnestOptions`] documentation for the behavior of `unnest`
+    ///
+    /// # Example
+    /// ```
+    /// # use datafusion::prelude::*;
+    /// # use datafusion::error::Result;
+    /// # use datafusion_common::assert_batches_sorted_eq;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<()> {
+    /// let ctx = SessionContext::new();
+    /// let df = ctx.read_json("tests/data/unnest.json", NdJsonReadOptions::default()).await?;
+    /// // expand into multiple columns if it's json array, flatten field name if it's nested structure
+    /// let df = df.unnest_columns(&["b","c","d"])?;
+    /// let expected = vec![
+    ///     "+---+------+-------+-----+-----+",
+    ///     "| a | b    | c     | d.e | d.f |",
+    ///     "+---+------+-------+-----+-----+",
+    ///     "| 1 | 2.0  | false | 1   | 2   |",
+    ///     "| 1 | 1.3  | true  | 1   | 2   |",
+    ///     "| 1 | -6.1 |       | 1   | 2   |",
+    ///     "| 2 | 3.0  | false |     |     |",
+    ///     "| 2 | 2.3  | true  |     |     |",
+    ///     "| 2 | -7.1 |       |     |     |",
+    ///     "+---+------+-------+-----+-----+"
+    /// ];
+    /// # assert_batches_sorted_eq!(expected, &df.collect().await?);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn unnest_columns(self, columns: &[&str]) -> Result<DataFrame> {
+        self.unnest_columns_with_options(columns, UnnestOptions::new())
+    }
+
+    /// Expand multiple list columns into a set of rows, with
     /// behavior controlled by [`UnnestOptions`].
     ///
     /// Please see the documentation on [`UnnestOptions`] for more
     /// details about the meaning of unnest.
-    pub fn unnest_column_with_options(
+    pub fn unnest_columns_with_options(
         self,
-        column: &str,
+        columns: &[&str],
         options: UnnestOptions,
     ) -> Result<DataFrame> {
+        let columns = columns.iter().map(|c| Column::from(*c)).collect();
         let plan = LogicalPlanBuilder::from(self.plan)
-            .unnest_column_with_options(column, options)?
+            .unnest_columns_with_options(columns, options)?
             .build()?;
-        Ok(DataFrame::new(self.session_state, plan))
+        Ok(DataFrame {
+            session_state: self.session_state,
+            plan,
+        })
     }
 
-    /// Filter a DataFrame to only include rows that match the specified filter expression.
+    /// Return a DataFrame with only rows for which `predicate` evaluates to
+    /// `true`.
     ///
+    /// Rows for which `predicate` evaluates to `false` or `null`
+    /// are filtered out.
+    ///
+    /// # Example
     /// ```
     /// # use datafusion::prelude::*;
     /// # use datafusion::error::Result;
+    /// # use datafusion_common::assert_batches_sorted_eq;
     /// # #[tokio::main]
     /// # async fn main() -> Result<()> {
     /// let ctx = SessionContext::new();
-    /// let df = ctx.read_csv("tests/data/example.csv", CsvReadOptions::new()).await?;
+    /// let df = ctx.read_csv("tests/data/example_long.csv", CsvReadOptions::new()).await?;
     /// let df = df.filter(col("a").lt_eq(col("b")))?;
+    /// // all rows where a <= b are returned
+    /// let expected = vec![
+    ///     "+---+---+---+",
+    ///     "| a | b | c |",
+    ///     "+---+---+---+",
+    ///     "| 1 | 2 | 3 |",
+    ///     "| 4 | 5 | 6 |",
+    ///     "| 7 | 8 | 9 |",
+    ///     "+---+---+---+"
+    /// ];
+    /// # assert_batches_sorted_eq!(expected, &df.collect().await?);
     /// # Ok(())
     /// # }
     /// ```
@@ -260,24 +472,48 @@ impl DataFrame {
         let plan = LogicalPlanBuilder::from(self.plan)
             .filter(predicate)?
             .build()?;
-        Ok(DataFrame::new(self.session_state, plan))
+        Ok(DataFrame {
+            session_state: self.session_state,
+            plan,
+        })
     }
 
-    /// Perform an aggregate query with optional grouping expressions.
+    /// Return a new `DataFrame` that aggregates the rows of the current
+    /// `DataFrame`, first optionally grouping by the given expressions.
     ///
+    /// # Example
     /// ```
     /// # use datafusion::prelude::*;
     /// # use datafusion::error::Result;
+    /// # use datafusion::functions_aggregate::expr_fn::min;
+    /// # use datafusion_common::assert_batches_sorted_eq;
     /// # #[tokio::main]
     /// # async fn main() -> Result<()> {
     /// let ctx = SessionContext::new();
-    /// let df = ctx.read_csv("tests/data/example.csv", CsvReadOptions::new()).await?;
+    /// let df = ctx.read_csv("tests/data/example_long.csv", CsvReadOptions::new()).await?;
     ///
     /// // The following use is the equivalent of "SELECT MIN(b) GROUP BY a"
-    /// let _ = df.clone().aggregate(vec![col("a")], vec![min(col("b"))])?;
-    ///
+    /// let df1 = df.clone().aggregate(vec![col("a")], vec![min(col("b"))])?;
+    /// let expected1 = vec![
+    ///     "+---+----------------+",
+    ///     "| a | min(?table?.b) |",
+    ///     "+---+----------------+",
+    ///     "| 1 | 2              |",
+    ///     "| 4 | 5              |",
+    ///     "| 7 | 8              |",
+    ///     "+---+----------------+"
+    /// ];
+    /// assert_batches_sorted_eq!(expected1, &df1.collect().await?);
     /// // The following use is the equivalent of "SELECT MIN(b)"
-    /// let _ = df.aggregate(vec![], vec![min(col("b"))])?;
+    /// let df2 = df.aggregate(vec![], vec![min(col("b"))])?;
+    /// let expected2 = vec![
+    ///     "+----------------+",
+    ///     "| min(?table?.b) |",
+    ///     "+----------------+",
+    ///     "| 2              |",
+    ///     "+----------------+"
+    /// ];
+    /// # assert_batches_sorted_eq!(expected2, &df2.collect().await?);
     /// # Ok(())
     /// # }
     /// ```
@@ -286,33 +522,69 @@ impl DataFrame {
         group_expr: Vec<Expr>,
         aggr_expr: Vec<Expr>,
     ) -> Result<DataFrame> {
+        let is_grouping_set = matches!(group_expr.as_slice(), [Expr::GroupingSet(_)]);
+        let aggr_expr_len = aggr_expr.len();
         let plan = LogicalPlanBuilder::from(self.plan)
             .aggregate(group_expr, aggr_expr)?
             .build()?;
-        Ok(DataFrame::new(self.session_state, plan))
+        let plan = if is_grouping_set {
+            let grouping_id_pos = plan.schema().fields().len() - 1 - aggr_expr_len;
+            // For grouping sets we do a project to not expose the internal grouping id
+            let exprs = plan
+                .schema()
+                .columns()
+                .into_iter()
+                .enumerate()
+                .filter(|(idx, _)| *idx != grouping_id_pos)
+                .map(|(_, column)| Expr::Column(column))
+                .collect::<Vec<_>>();
+            LogicalPlanBuilder::from(plan).project(exprs)?.build()?
+        } else {
+            plan
+        };
+        Ok(DataFrame {
+            session_state: self.session_state,
+            plan,
+        })
     }
 
-    /// Apply one or more window functions ([`Expr::WindowFunction`]) to extend the schema
+    /// Return a new DataFrame that adds the result of evaluating one or more
+    /// window functions ([`Expr::WindowFunction`]) to the existing columns
     pub fn window(self, window_exprs: Vec<Expr>) -> Result<DataFrame> {
         let plan = LogicalPlanBuilder::from(self.plan)
             .window(window_exprs)?
             .build()?;
-        Ok(DataFrame::new(self.session_state, plan))
+        Ok(DataFrame {
+            session_state: self.session_state,
+            plan,
+        })
     }
 
-    /// Limit the number of rows returned from this DataFrame.
+    /// Returns a new `DataFrame` with a limited number of rows.
     ///
+    /// # Arguments
     /// `skip` - Number of rows to skip before fetch any row
+    /// `fetch` - Maximum number of rows to return, after skipping `skip` rows.
     ///
-    /// `fetch` - Maximum number of rows to fetch, after skipping `skip` rows.
+    /// # Example
     /// ```
     /// # use datafusion::prelude::*;
     /// # use datafusion::error::Result;
+    /// # use datafusion_common::assert_batches_sorted_eq;
     /// # #[tokio::main]
     /// # async fn main() -> Result<()> {
     /// let ctx = SessionContext::new();
-    /// let df = ctx.read_csv("tests/data/example.csv", CsvReadOptions::new()).await?;
-    /// let df = df.limit(0, Some(100))?;
+    /// let df = ctx.read_csv("tests/data/example_long.csv", CsvReadOptions::new()).await?;
+    /// let df = df.limit(1, Some(2))?;
+    /// let expected = vec![
+    ///     "+---+---+---+",
+    ///     "| a | b | c |",
+    ///     "+---+---+---+",
+    ///     "| 4 | 5 | 6 |",
+    ///     "| 7 | 8 | 9 |",
+    ///     "+---+---+---+"
+    /// ];
+    /// # assert_batches_sorted_eq!(expected, &df.collect().await?);
     /// # Ok(())
     /// # }
     /// ```
@@ -320,21 +592,36 @@ impl DataFrame {
         let plan = LogicalPlanBuilder::from(self.plan)
             .limit(skip, fetch)?
             .build()?;
-        Ok(DataFrame::new(self.session_state, plan))
+        Ok(DataFrame {
+            session_state: self.session_state,
+            plan,
+        })
     }
 
-    /// Calculate the union of two [`DataFrame`]s, preserving duplicate rows.The
-    /// two [`DataFrame`]s must have exactly the same schema
+    /// Calculate the union of two [`DataFrame`]s, preserving duplicate rows.
     ///
+    /// The two [`DataFrame`]s must have exactly the same schema
+    ///
+    /// # Example
     /// ```
     /// # use datafusion::prelude::*;
     /// # use datafusion::error::Result;
+    /// # use datafusion_common::assert_batches_sorted_eq;
     /// # #[tokio::main]
     /// # async fn main() -> Result<()> {
     /// let ctx = SessionContext::new();
-    /// let df = ctx.read_csv("tests/data/example.csv", CsvReadOptions::new()).await?;
+    /// let df = ctx.read_csv("tests/data/example.csv", CsvReadOptions::new()).await?   ;
     /// let d2 = df.clone();
     /// let df = df.union(d2)?;
+    /// let expected = vec![
+    ///     "+---+---+---+",
+    ///     "| a | b | c |",
+    ///     "+---+---+---+",
+    ///     "| 1 | 2 | 3 |",
+    ///     "| 1 | 2 | 3 |",
+    ///     "+---+---+---+"
+    /// ];
+    /// # assert_batches_sorted_eq!(expected, &df.collect().await?);
     /// # Ok(())
     /// # }
     /// ```
@@ -342,66 +629,152 @@ impl DataFrame {
         let plan = LogicalPlanBuilder::from(self.plan)
             .union(dataframe.plan)?
             .build()?;
-        Ok(DataFrame::new(self.session_state, plan))
+        Ok(DataFrame {
+            session_state: self.session_state,
+            plan,
+        })
     }
 
-    /// Calculate the distinct union of two [`DataFrame`]s.  The
-    /// two [`DataFrame`]s must have exactly the same schema
+    /// Calculate the distinct union of two [`DataFrame`]s.
     ///
+    /// The two [`DataFrame`]s must have exactly the same schema. Any duplicate
+    /// rows are discarded.
+    ///
+    /// # Example
     /// ```
     /// # use datafusion::prelude::*;
     /// # use datafusion::error::Result;
+    /// # use datafusion_common::assert_batches_sorted_eq;
     /// # #[tokio::main]
     /// # async fn main() -> Result<()> {
     /// let ctx = SessionContext::new();
     /// let df = ctx.read_csv("tests/data/example.csv", CsvReadOptions::new()).await?;
     /// let d2 = df.clone();
     /// let df = df.union_distinct(d2)?;
+    /// // df2 are duplicate of df
+    /// let expected = vec![
+    ///     "+---+---+---+",
+    ///     "| a | b | c |",
+    ///     "+---+---+---+",
+    ///     "| 1 | 2 | 3 |",
+    ///     "+---+---+---+"
+    /// ];
+    /// # assert_batches_sorted_eq!(expected, &df.collect().await?);
     /// # Ok(())
     /// # }
     /// ```
     pub fn union_distinct(self, dataframe: DataFrame) -> Result<DataFrame> {
-        Ok(DataFrame::new(
-            self.session_state,
-            LogicalPlanBuilder::from(self.plan)
-                .union_distinct(dataframe.plan)?
-                .build()?,
-        ))
+        let plan = LogicalPlanBuilder::from(self.plan)
+            .union_distinct(dataframe.plan)?
+            .build()?;
+        Ok(DataFrame {
+            session_state: self.session_state,
+            plan,
+        })
     }
 
-    /// Filter out duplicate rows
+    /// Return a new `DataFrame` with all duplicated rows removed.
     ///
+    /// # Example
     /// ```
     /// # use datafusion::prelude::*;
     /// # use datafusion::error::Result;
+    /// # use datafusion_common::assert_batches_sorted_eq;
     /// # #[tokio::main]
     /// # async fn main() -> Result<()> {
     /// let ctx = SessionContext::new();
     /// let df = ctx.read_csv("tests/data/example.csv", CsvReadOptions::new()).await?;
     /// let df = df.distinct()?;
+    /// let expected = vec![
+    ///     "+---+---+---+",
+    ///     "| a | b | c |",
+    ///     "+---+---+---+",
+    ///     "| 1 | 2 | 3 |",
+    ///     "+---+---+---+"
+    /// ];
+    /// # assert_batches_sorted_eq!(expected, &df.collect().await?);
     /// # Ok(())
     /// # }
     /// ```
     pub fn distinct(self) -> Result<DataFrame> {
-        Ok(DataFrame::new(
-            self.session_state,
-            LogicalPlanBuilder::from(self.plan).distinct()?.build()?,
-        ))
+        let plan = LogicalPlanBuilder::from(self.plan).distinct()?.build()?;
+        Ok(DataFrame {
+            session_state: self.session_state,
+            plan,
+        })
     }
 
-    /// Summary statistics for a DataFrame. Only summarizes numeric datatypes at the moment and
-    /// returns nulls for non numeric datatypes. Try in keep output similar to pandas
+    /// Return a new `DataFrame` with duplicated rows removed as per the specified expression list
+    /// according to the provided sorting expressions grouped by the `DISTINCT ON` clause
+    /// expressions.
     ///
+    /// # Example
+    /// ```
+    /// # use datafusion::prelude::*;
+    /// # use datafusion::error::Result;
+    /// # use datafusion_common::assert_batches_sorted_eq;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<()> {
+    /// let ctx = SessionContext::new();
+    /// let df = ctx.read_csv("tests/data/example.csv", CsvReadOptions::new()).await?
+    ///   // Return a single row (a, b) for each distinct value of a
+    ///   .distinct_on(vec![col("a")], vec![col("a"), col("b")], None)?;
+    /// let expected = vec![
+    ///     "+---+---+",
+    ///     "| a | b |",
+    ///     "+---+---+",
+    ///     "| 1 | 2 |",
+    ///     "+---+---+"
+    /// ];
+    /// # assert_batches_sorted_eq!(expected, &df.collect().await?);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn distinct_on(
+        self,
+        on_expr: Vec<Expr>,
+        select_expr: Vec<Expr>,
+        sort_expr: Option<Vec<SortExpr>>,
+    ) -> Result<DataFrame> {
+        let plan = LogicalPlanBuilder::from(self.plan)
+            .distinct_on(on_expr, select_expr, sort_expr)?
+            .build()?;
+        Ok(DataFrame {
+            session_state: self.session_state,
+            plan,
+        })
+    }
+
+    /// Return a new `DataFrame` that has statistics for a DataFrame.
+    ///
+    /// Only summarizes numeric datatypes at the moment and returns nulls for
+    /// non numeric datatypes. The output format is modeled after pandas
+    ///
+    /// # Example
     /// ```
     /// # use datafusion::prelude::*;
     /// # use datafusion::error::Result;
     /// # use arrow::util::pretty;
+    /// # use datafusion_common::assert_batches_sorted_eq;
     /// # #[tokio::main]
     /// # async fn main() -> Result<()> {
     /// let ctx = SessionContext::new();
     /// let df = ctx.read_csv("tests/tpch-csv/customer.csv", CsvReadOptions::new()).await?;
-    /// df.describe().await.unwrap();
-    ///
+    /// let stat = df.describe().await?;
+    /// # // some output column are ignored
+    /// let expected = vec![
+    ///     "+------------+--------------------+--------------------+------------------------------------+--------------------+-----------------+--------------------+--------------+----------------------------------------------------------------------------------------------------------+",
+    ///     "| describe   | c_custkey          | c_name             | c_address                          | c_nationkey        | c_phone         | c_acctbal          | c_mktsegment | c_comment                                                                                                |",
+    ///     "+------------+--------------------+--------------------+------------------------------------+--------------------+-----------------+--------------------+--------------+----------------------------------------------------------------------------------------------------------+",
+    ///     "| count      | 9.0                | 9                  | 9                                  | 9.0                | 9               | 9.0                | 9            | 9                                                                                                        |",
+    ///     "| max        | 10.0               | Customer#000000010 | xKiAFTjUsCuxfeleNqefumTrjS         | 20.0               | 30-114-968-4951 | 9561.95            | MACHINERY    | tions. even deposits boost according to the slyly bold packages. final accounts cajole requests. furious |",
+    ///     "| mean       | 6.0                | null               | null                               | 9.88888888888889   | null            | 5153.2155555555555 | null         | null                                                                                                     |",
+    ///     "| median     | 6.0                | null               | null                               | 8.0                | null            | 6819.74            | null         | null                                                                                                     |",
+    ///     "| min        | 2.0                | Customer#000000002 | 6LrEaV6KR6PLVcgl2ArL Q3rqzLzcT1 v2 | 1.0                | 11-719-748-3364 | 121.65             | AUTOMOBILE   |  deposits eat slyly ironic, even instructions. express foxes detect slyly. blithely even accounts abov   |",
+    ///     "| null_count | 0.0                | 0                  | 0                                  | 0.0                | 0               | 0.0                | 0            | 0                                                                                                        |",
+    ///     "| std        | 2.7386127875258306 | null               | null                               | 7.2188026092359046 | null            | 3522.169804254585  | null         | null                                                                                                     |",
+    ///     "+------------+--------------------+--------------------+------------------------------------+--------------------+-----------------+--------------------+--------------+----------------------------------------------------------------------------------------------------------+"];
+    /// assert_batches_sorted_eq!(expected, &stat.collect().await?);
     /// # Ok(())
     /// # }
     /// ```
@@ -437,7 +810,13 @@ impl DataFrame {
                 vec![],
                 original_schema_fields
                     .clone()
-                    .map(|f| count(is_null(col(f.name()))).alias(f.name()))
+                    .map(|f| {
+                        sum(case(is_null(col(f.name())))
+                            .when(lit(true), lit(1))
+                            .otherwise(lit(0))
+                            .unwrap())
+                        .alias(f.name())
+                    })
                     .collect::<Vec<_>>(),
             ),
             // mean aggregation
@@ -500,17 +879,20 @@ impl DataFrame {
             for result in describe_record_batch.iter() {
                 let array_ref = match result {
                     Ok(df) => {
-                        let batchs = df.clone().collect().await;
-                        match batchs {
-                            Ok(batchs)
-                                if batchs.len() == 1
-                                    && batchs[0]
+                        let batches = df.clone().collect().await;
+                        match batches {
+                            Ok(batches)
+                                if batches.len() == 1
+                                    && batches[0]
                                         .column_by_name(field.name())
                                         .is_some() =>
                             {
                                 let column =
-                                    batchs[0].column_by_name(field.name()).unwrap();
-                                if field.data_type().is_numeric() {
+                                    batches[0].column_by_name(field.name()).unwrap();
+
+                                if column.data_type().is_null() {
+                                    Arc::new(StringArray::from(vec!["null"]))
+                                } else if field.data_type().is_numeric() {
                                     cast(column, &DataType::Float64)?
                                 } else {
                                     cast(column, &DataType::Utf8)?
@@ -529,9 +911,7 @@ impl DataFrame {
                     {
                         Arc::new(StringArray::from(vec!["null"]))
                     }
-                    Err(other_err) => {
-                        panic!("{other_err}")
-                    }
+                    Err(e) => return exec_err!("{}", e),
                 };
                 array_datas.push(array_ref);
             }
@@ -551,34 +931,67 @@ impl DataFrame {
             describe_record_batch.schema(),
             vec![vec![describe_record_batch]],
         )?;
-        Ok(DataFrame::new(
-            self.session_state,
-            LogicalPlanBuilder::scan(
-                UNNAMED_TABLE,
-                provider_as_source(Arc::new(provider)),
-                None,
-            )?
-            .build()?,
-        ))
+
+        let plan = LogicalPlanBuilder::scan(
+            UNNAMED_TABLE,
+            provider_as_source(Arc::new(provider)),
+            None,
+        )?
+        .build()?;
+
+        Ok(DataFrame {
+            session_state: self.session_state,
+            plan,
+        })
     }
 
-    /// Sort the DataFrame by the specified sorting expressions. Any expression can be turned into
-    /// a sort expression by calling its [sort](../logical_plan/enum.Expr.html#method.sort) method.
+    /// Apply a sort by provided expressions with default direction
+    pub fn sort_by(self, expr: Vec<Expr>) -> Result<DataFrame> {
+        self.sort(
+            expr.into_iter()
+                .map(|e| e.sort(true, false))
+                .collect::<Vec<SortExpr>>(),
+        )
+    }
+
+    /// Sort the DataFrame by the specified sorting expressions.
+    ///
+    /// Note that any expression can be turned into
+    /// a sort expression by calling its [sort](Expr::sort) method.
+    ///
+    /// # Example
     ///
     /// ```
     /// # use datafusion::prelude::*;
     /// # use datafusion::error::Result;
+    /// # use datafusion_common::assert_batches_sorted_eq;
     /// # #[tokio::main]
     /// # async fn main() -> Result<()> {
     /// let ctx = SessionContext::new();
-    /// let df = ctx.read_csv("tests/data/example.csv", CsvReadOptions::new()).await?;
-    /// let df = df.sort(vec![col("a").sort(true, true), col("b").sort(false, false)])?;
+    /// let df = ctx.read_csv("tests/data/example_long.csv", CsvReadOptions::new()).await?;
+    /// let df = df.sort(vec![
+    ///   col("a").sort(false, true),   // a DESC, nulls first
+    ///   col("b").sort(true, false), // b ASC, nulls last
+    ///  ])?;
+    /// let expected = vec![
+    ///     "+---+---+---+",
+    ///     "| a | b | c |",
+    ///     "+---+---+---+",
+    ///     "| 1 | 2 | 3 |",
+    ///     "| 4 | 5 | 6 |",
+    ///     "| 7 | 8 | 9 |",
+    ///     "+---+---+---+",
+    /// ];
+    /// # assert_batches_sorted_eq!(expected, &df.collect().await?);
     /// # Ok(())
     /// # }
     /// ```
-    pub fn sort(self, expr: Vec<Expr>) -> Result<DataFrame> {
+    pub fn sort(self, expr: Vec<SortExpr>) -> Result<DataFrame> {
         let plan = LogicalPlanBuilder::from(self.plan).sort(expr)?.build()?;
-        Ok(DataFrame::new(self.session_state, plan))
+        Ok(DataFrame {
+            session_state: self.session_state,
+            plan,
+        })
     }
 
     /// Join this `DataFrame` with another `DataFrame` using explicitly specified
@@ -599,6 +1012,7 @@ impl DataFrame {
     /// ```
     /// # use datafusion::prelude::*;
     /// # use datafusion::error::Result;
+    /// # use datafusion_common::assert_batches_sorted_eq;
     /// # #[tokio::main]
     /// # async fn main() -> Result<()> {
     /// let ctx = SessionContext::new();
@@ -611,7 +1025,14 @@ impl DataFrame {
     /// // Perform the equivalent of `left INNER JOIN right ON (a = a2 AND b = b2)`
     /// // finding all pairs of rows from `left` and `right` where `a = a2` and `b = b2`.
     /// let join = left.join(right, JoinType::Inner, &["a", "b"], &["a2", "b2"], None)?;
-    /// let batches = join.collect().await?;
+    /// let expected = vec![
+    ///     "+---+---+---+----+----+----+",
+    ///     "| a | b | c | a2 | b2 | c2 |",
+    ///     "+---+---+---+----+----+----+",
+    ///     "| 1 | 2 | 3 | 1  | 2  | 3  |",
+    ///     "+---+---+---+----+----+----+"
+    /// ];
+    /// assert_batches_sorted_eq!(expected, &join.collect().await?);
     /// # Ok(())
     /// # }
     /// ```
@@ -632,7 +1053,10 @@ impl DataFrame {
                 filter,
             )?
             .build()?;
-        Ok(DataFrame::new(self.session_state, plan))
+        Ok(DataFrame {
+            session_state: self.session_state,
+            plan,
+        })
     }
 
     /// Join this `DataFrame` with another `DataFrame` using the specified
@@ -642,10 +1066,10 @@ impl DataFrame {
     /// identifying and optimizing equality predicates.
     ///
     /// # Example
-    ///
     /// ```
     /// # use datafusion::prelude::*;
     /// # use datafusion::error::Result;
+    /// # use datafusion_common::assert_batches_sorted_eq;
     /// # #[tokio::main]
     /// # async fn main() -> Result<()> {
     /// let ctx = SessionContext::new();
@@ -669,7 +1093,13 @@ impl DataFrame {
     ///     JoinType::Inner,
     ///     [col("a").not_eq(col("a2")), col("b").not_eq(col("b2"))],
     /// )?;
-    /// let batches = join_on.collect().await?;
+    /// let expected = vec![
+    ///     "+---+---+---+----+----+----+",
+    ///     "| a | b | c | a2 | b2 | c2 |",
+    ///     "+---+---+---+----+----+----+",
+    ///     "+---+---+---+----+----+----+"
+    /// ];
+    /// # assert_batches_sorted_eq!(expected, &join_on.collect().await?);
     /// # Ok(())
     /// # }
     /// ```
@@ -679,23 +1109,37 @@ impl DataFrame {
         join_type: JoinType,
         on_exprs: impl IntoIterator<Item = Expr>,
     ) -> Result<DataFrame> {
-        let expr = on_exprs.into_iter().reduce(Expr::and);
         let plan = LogicalPlanBuilder::from(self.plan)
-            .join_on(right.plan, join_type, expr)?
+            .join_on(right.plan, join_type, on_exprs)?
             .build()?;
-        Ok(DataFrame::new(self.session_state, plan))
+        Ok(DataFrame {
+            session_state: self.session_state,
+            plan,
+        })
     }
 
     /// Repartition a DataFrame based on a logical partitioning scheme.
     ///
+    /// # Example
     /// ```
     /// # use datafusion::prelude::*;
     /// # use datafusion::error::Result;
+    /// # use datafusion_common::assert_batches_sorted_eq;
     /// # #[tokio::main]
     /// # async fn main() -> Result<()> {
     /// let ctx = SessionContext::new();
-    /// let df = ctx.read_csv("tests/data/example.csv", CsvReadOptions::new()).await?;
+    /// let df = ctx.read_csv("tests/data/example_long.csv", CsvReadOptions::new()).await?;
     /// let df1 = df.repartition(Partitioning::RoundRobinBatch(4))?;
+    /// let expected = vec![
+    ///     "+---+---+---+",
+    ///     "| a | b | c |",
+    ///     "+---+---+---+",
+    ///     "| 1 | 2 | 3 |",
+    ///     "| 4 | 5 | 6 |",
+    ///     "| 7 | 8 | 9 |",
+    ///     "+---+---+---+"
+    /// ];
+    /// # assert_batches_sorted_eq!(expected, &df1.collect().await?);
     /// # Ok(())
     /// # }
     /// ```
@@ -703,12 +1147,18 @@ impl DataFrame {
         let plan = LogicalPlanBuilder::from(self.plan)
             .repartition(partitioning_scheme)?
             .build()?;
-        Ok(DataFrame::new(self.session_state, plan))
+        Ok(DataFrame {
+            session_state: self.session_state,
+            plan,
+        })
     }
 
-    /// Run a count aggregate on the DataFrame and execute the DataFrame to collect this
-    /// count and return it as a usize, to find the total number of rows after executing
-    /// the DataFrame.
+    /// Return the total number of rows in this `DataFrame`.
+    ///
+    /// Note that this method will actually run a plan to calculate the count,
+    /// which may be slow for large or complicated DataFrames.
+    ///
+    /// # Example
     /// ```
     /// # use datafusion::prelude::*;
     /// # use datafusion::error::Result;
@@ -716,16 +1166,14 @@ impl DataFrame {
     /// # async fn main() -> Result<()> {
     /// let ctx = SessionContext::new();
     /// let df = ctx.read_csv("tests/data/example.csv", CsvReadOptions::new()).await?;
-    /// let count = df.count().await?;
+    /// let count = df.count().await?; // 1
+    /// # assert_eq!(count, 1);
     /// # Ok(())
     /// # }
     /// ```
     pub async fn count(self) -> Result<usize> {
         let rows = self
-            .aggregate(
-                vec![],
-                vec![datafusion_expr::count(Expr::Literal(COUNT_STAR_EXPANSION))],
-            )?
+            .aggregate(vec![], vec![count(Expr::Literal(COUNT_STAR_EXPANSION))])?
             .collect()
             .await?;
         let len = *rows
@@ -739,9 +1187,14 @@ impl DataFrame {
         Ok(len)
     }
 
-    /// Convert the logical plan represented by this DataFrame into a physical plan and
-    /// execute it, collecting all resulting batches into memory
-    /// Executes this DataFrame and collects all results into a vector of RecordBatch.
+    /// Execute this `DataFrame` and buffer all resulting `RecordBatch`es  into memory.
+    ///
+    /// Prior to calling `collect`, modifying a DataFrame simply updates a plan
+    /// (no actual computation is performed). `collect` triggers the computation.
+    ///
+    /// See [`Self::execute_stream`] to execute a DataFrame without buffering.
+    ///
+    /// # Example
     /// ```
     /// # use datafusion::prelude::*;
     /// # use datafusion::error::Result;
@@ -759,8 +1212,9 @@ impl DataFrame {
         collect(plan, task_ctx).await
     }
 
-    /// Print results.
+    /// Execute the `DataFrame` and print the results to the console.
     ///
+    /// # Example
     /// ```
     /// # use datafusion::prelude::*;
     /// # use datafusion::error::Result;
@@ -777,8 +1231,10 @@ impl DataFrame {
         Ok(pretty::print_batches(&results)?)
     }
 
-    /// Print results and limit rows.
+    /// Execute the `DataFrame` and print only the first `num` rows of the
+    /// result to the console.
     ///
+    /// # Example
     /// ```
     /// # use datafusion::prelude::*;
     /// # use datafusion::error::Result;
@@ -795,12 +1251,14 @@ impl DataFrame {
         Ok(pretty::print_batches(&results)?)
     }
 
-    /// Get a new TaskContext to run in this session
+    /// Return a new [`TaskContext`] which would be used to execute this DataFrame
     pub fn task_ctx(&self) -> TaskContext {
-        TaskContext::from(&self.session_state)
+        TaskContext::from(self.session_state.as_ref())
     }
 
     /// Executes this DataFrame and returns a stream over a single partition
+    ///
+    /// See [Self::collect] to buffer the `RecordBatch`es in memory.
     ///
     /// # Example
     /// ```
@@ -828,6 +1286,7 @@ impl DataFrame {
     /// Executes this DataFrame and collects all results into a vector of vector of RecordBatch
     /// maintaining the input partitioning.
     ///
+    /// # Example
     /// ```
     /// # use datafusion::prelude::*;
     /// # use datafusion::error::Result;
@@ -871,9 +1330,12 @@ impl DataFrame {
         execute_stream_partitioned(plan, task_ctx)
     }
 
-    /// Returns the schema describing the output of this DataFrame in terms of columns returned,
-    /// where each column has a name, data type, and nullability attribute.
-
+    /// Returns the `DFSchema` describing the output of this DataFrame.
+    ///
+    /// The output `DFSchema` contains information on the name, data type, and
+    /// nullability for each column.
+    ///
+    /// # Example
     /// ```
     /// # use datafusion::prelude::*;
     /// # use datafusion::error::Result;
@@ -889,30 +1351,37 @@ impl DataFrame {
         self.plan.schema()
     }
 
-    /// Return the unoptimized logical plan
+    /// Return a reference to the unoptimized [`LogicalPlan`] that comprises
+    /// this DataFrame.
+    ///
+    /// See [`Self::into_unoptimized_plan`] for more details.
     pub fn logical_plan(&self) -> &LogicalPlan {
         &self.plan
     }
 
     /// Returns both the [`LogicalPlan`] and [`SessionState`] that comprise this [`DataFrame`]
     pub fn into_parts(self) -> (SessionState, LogicalPlan) {
-        (self.session_state, self.plan)
+        (*self.session_state, self.plan)
     }
 
-    /// Return the logical plan represented by this DataFrame without running the optimizers
+    /// Return the [`LogicalPlan`] represented by this DataFrame without running
+    /// any optimizers
     ///
-    /// Note: This method should not be used outside testing, as it loses the snapshot
-    /// of the [`SessionState`] attached to this [`DataFrame`] and consequently subsequent
-    /// operations may take place against a different state
+    /// Note: This method should not be used outside testing, as it loses the
+    /// snapshot of the [`SessionState`] attached to this [`DataFrame`] and
+    /// consequently subsequent operations may take place against a different
+    /// state (e.g. a different value of `now()`)
+    ///
+    /// See [`Self::into_parts`] to retrieve the owned [`LogicalPlan`] and
+    /// corresponding [`SessionState`].
     pub fn into_unoptimized_plan(self) -> LogicalPlan {
         self.plan
     }
 
-    /// Return the optimized logical plan represented by this DataFrame.
+    /// Return the optimized [`LogicalPlan`] represented by this DataFrame.
     ///
-    /// Note: This method should not be used outside testing, as it loses the snapshot
-    /// of the [`SessionState`] attached to this [`DataFrame`] and consequently subsequent
-    /// operations may take place against a different state
+    /// Note: This method should not be used outside testing -- see
+    /// [`Self::into_unoptimized_plan`] for more details.
     pub fn into_optimized_plan(self) -> Result<LogicalPlan> {
         // Optimize the plan first for better UX
         self.session_state.optimize(&self.plan)
@@ -925,16 +1394,6 @@ impl DataFrame {
     /// [`DataFrame`] in favour of the one passed to [`TableProvider::scan`]
     pub fn into_view(self) -> Arc<dyn TableProvider> {
         Arc::new(DataFrameTableProvider { plan: self.plan })
-    }
-
-    /// Return the optimized logical plan represented by this DataFrame.
-    ///
-    /// Note: This method should not be used outside testing, as it loses the snapshot
-    /// of the [`SessionState`] attached to this [`DataFrame`] and consequently subsequent
-    /// operations may take place against a different state
-    #[deprecated(since = "23.0.0", note = "Use DataFrame::into_optimized_plan")]
-    pub fn to_logical_plan(self) -> Result<LogicalPlan> {
-        self.into_optimized_plan()
     }
 
     /// Return a DataFrame with the explanation of its plan so far.
@@ -953,14 +1412,21 @@ impl DataFrame {
     /// # }
     /// ```
     pub fn explain(self, verbose: bool, analyze: bool) -> Result<DataFrame> {
+        if matches!(self.plan, LogicalPlan::Explain(_)) {
+            return plan_err!("Nested EXPLAINs are not supported");
+        }
         let plan = LogicalPlanBuilder::from(self.plan)
             .explain(verbose, analyze)?
             .build()?;
-        Ok(DataFrame::new(self.session_state, plan))
+        Ok(DataFrame {
+            session_state: self.session_state,
+            plan,
+        })
     }
 
     /// Return a `FunctionRegistry` used to plan udf's calls
     ///
+    /// # Example
     /// ```
     /// # use datafusion::prelude::*;
     /// # use datafusion::error::Result;
@@ -974,7 +1440,7 @@ impl DataFrame {
     /// # }
     /// ```
     pub fn registry(&self) -> &dyn FunctionRegistry {
-        &self.session_state
+        self.session_state.as_ref()
     }
 
     /// Calculate the intersection of two [`DataFrame`]s.  The two [`DataFrame`]s must have exactly the same schema
@@ -982,22 +1448,32 @@ impl DataFrame {
     /// ```
     /// # use datafusion::prelude::*;
     /// # use datafusion::error::Result;
+    /// # use datafusion_common::assert_batches_sorted_eq;
     /// # #[tokio::main]
     /// # async fn main() -> Result<()> {
     /// let ctx = SessionContext::new();
     /// let df = ctx.read_csv("tests/data/example.csv", CsvReadOptions::new()).await?;
-    /// let d2 = df.clone();
+    /// let d2 = ctx.read_csv("tests/data/example_long.csv", CsvReadOptions::new()).await?;
     /// let df = df.intersect(d2)?;
+    /// let expected = vec![
+    ///     "+---+---+---+",
+    ///     "| a | b | c |",
+    ///     "+---+---+---+",
+    ///     "| 1 | 2 | 3 |",
+    ///     "+---+---+---+"
+    /// ];
+    /// # assert_batches_sorted_eq!(expected, &df.collect().await?);
     /// # Ok(())
     /// # }
     /// ```
     pub fn intersect(self, dataframe: DataFrame) -> Result<DataFrame> {
         let left_plan = self.plan;
         let right_plan = dataframe.plan;
-        Ok(DataFrame::new(
-            self.session_state,
-            LogicalPlanBuilder::intersect(left_plan, right_plan, true)?,
-        ))
+        let plan = LogicalPlanBuilder::intersect(left_plan, right_plan, true)?;
+        Ok(DataFrame {
+            session_state: self.session_state,
+            plan,
+        })
     }
 
     /// Calculate the exception of two [`DataFrame`]s.  The two [`DataFrame`]s must have exactly the same schema
@@ -1005,108 +1481,217 @@ impl DataFrame {
     /// ```
     /// # use datafusion::prelude::*;
     /// # use datafusion::error::Result;
+    /// # use datafusion_common::assert_batches_sorted_eq;
     /// # #[tokio::main]
     /// # async fn main() -> Result<()> {
     /// let ctx = SessionContext::new();
-    /// let df = ctx.read_csv("tests/data/example.csv", CsvReadOptions::new()).await?;
-    /// let d2 = df.clone();
-    /// let df = df.except(d2)?;
+    /// let df = ctx.read_csv("tests/data/example_long.csv", CsvReadOptions::new()).await?;
+    /// let d2 = ctx.read_csv("tests/data/example.csv", CsvReadOptions::new()).await?;
+    /// let result = df.except(d2)?;
+    /// // those columns are not in example.csv, but in example_long.csv
+    /// let expected = vec![
+    ///     "+---+---+---+",
+    ///     "| a | b | c |",
+    ///     "+---+---+---+",
+    ///     "| 4 | 5 | 6 |",
+    ///     "| 7 | 8 | 9 |",
+    ///     "+---+---+---+"
+    /// ];
+    /// # assert_batches_sorted_eq!(expected, &result.collect().await?);
     /// # Ok(())
     /// # }
     /// ```
     pub fn except(self, dataframe: DataFrame) -> Result<DataFrame> {
         let left_plan = self.plan;
         let right_plan = dataframe.plan;
-
-        Ok(DataFrame::new(
-            self.session_state,
-            LogicalPlanBuilder::except(left_plan, right_plan, true)?,
-        ))
+        let plan = LogicalPlanBuilder::except(left_plan, right_plan, true)?;
+        Ok(DataFrame {
+            session_state: self.session_state,
+            plan,
+        })
     }
 
-    /// Write this DataFrame to the referenced table by name.
-    /// This method uses on the same underlying implementation
-    /// as the SQL Insert Into statement. Unlike most other DataFrame methods,
-    /// this method executes eagerly. Data is written to the table using an
-    /// execution plan returned by the [TableProvider]'s insert_into method.
-    /// Refer to the documentation of the specific [TableProvider] to determine
-    /// the expected data returned by the insert_into plan via this method.
-    /// For the built in ListingTable provider, a single [RecordBatch] containing
-    /// a single column and row representing the count of total rows written
-    /// is returned.
+    /// Execute this `DataFrame` and write the results to `table_name`.
+    ///
+    /// Returns a single [RecordBatch] containing a single column and
+    /// row representing the count of total rows written.
+    ///
+    /// Unlike most other `DataFrame` methods, this method executes eagerly.
+    /// Data is written to the table using the [`TableProvider::insert_into`]
+    /// method. This is the same underlying implementation used by SQL `INSERT
+    /// INTO` statements.
     pub async fn write_table(
         self,
         table_name: &str,
         write_options: DataFrameWriteOptions,
     ) -> Result<Vec<RecordBatch>, DataFusionError> {
         let arrow_schema = Schema::from(self.schema());
+
+        let plan = if write_options.sort_by.is_empty() {
+            self.plan
+        } else {
+            LogicalPlanBuilder::from(self.plan)
+                .sort(write_options.sort_by)?
+                .build()?
+        };
+
         let plan = LogicalPlanBuilder::insert_into(
-            self.plan,
+            plan,
             table_name.to_owned(),
             &arrow_schema,
-            write_options.overwrite,
+            write_options.insert_op,
         )?
         .build()?;
-        DataFrame::new(self.session_state, plan).collect().await
+
+        DataFrame {
+            session_state: self.session_state,
+            plan,
+        }
+        .collect()
+        .await
     }
 
-    /// Write a `DataFrame` to a CSV file.
+    /// Execute the `DataFrame` and write the results to CSV file(s).
+    ///
+    /// # Example
+    /// ```
+    /// # use datafusion::prelude::*;
+    /// # use datafusion::error::Result;
+    /// # use std::fs;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<()> {
+    /// use datafusion::dataframe::DataFrameWriteOptions;
+    /// let ctx = SessionContext::new();
+    /// // Sort the data by column "b" and write it to a new location
+    /// ctx.read_csv("tests/data/example.csv", CsvReadOptions::new()).await?
+    ///   .sort(vec![col("b").sort(true, true)])? // sort by b asc, nulls first
+    ///   .write_csv(
+    ///     "output.csv",
+    ///     DataFrameWriteOptions::new(),
+    ///     None, // can also specify CSV writing options here
+    /// ).await?;
+    /// # fs::remove_file("output.csv")?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn write_csv(
         self,
         path: &str,
         options: DataFrameWriteOptions,
-        writer_properties: Option<WriterBuilder>,
+        writer_options: Option<CsvOptions>,
     ) -> Result<Vec<RecordBatch>, DataFusionError> {
-        if options.overwrite {
-            return Err(DataFusionError::NotImplemented(
-                "Overwrites are not implemented for DataFrame::write_csv.".to_owned(),
-            ));
+        if options.insert_op != InsertOp::Append {
+            return not_impl_err!(
+                "{} is not implemented for DataFrame::write_csv.",
+                options.insert_op
+            );
         }
-        let props = match writer_properties {
-            Some(props) => props,
-            None => WriterBuilder::new(),
+
+        let format = if let Some(csv_opts) = writer_options {
+            Arc::new(CsvFormatFactory::new_with_options(csv_opts))
+        } else {
+            Arc::new(CsvFormatFactory::new())
         };
 
-        let file_type_writer_options =
-            FileTypeWriterOptions::CSV(CsvWriterOptions::new(props, options.compression));
-        let copy_options = CopyOptions::WriterOptions(Box::new(file_type_writer_options));
+        let file_type = format_as_file_type(format);
+
+        let plan = if options.sort_by.is_empty() {
+            self.plan
+        } else {
+            LogicalPlanBuilder::from(self.plan)
+                .sort(options.sort_by)?
+                .build()?
+        };
 
         let plan = LogicalPlanBuilder::copy_to(
-            self.plan,
+            plan,
             path.into(),
-            FileType::CSV,
-            copy_options,
+            file_type,
+            HashMap::new(),
+            options.partition_by,
         )?
         .build()?;
-        DataFrame::new(self.session_state, plan).collect().await
+
+        DataFrame {
+            session_state: self.session_state,
+            plan,
+        }
+        .collect()
+        .await
     }
 
-    /// Executes a query and writes the results to a partitioned JSON file.
+    /// Execute the `DataFrame` and write the results to JSON file(s).
+    ///
+    /// # Example
+    /// ```
+    /// # use datafusion::prelude::*;
+    /// # use datafusion::error::Result;
+    /// # use std::fs;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<()> {
+    /// use datafusion::dataframe::DataFrameWriteOptions;
+    /// let ctx = SessionContext::new();
+    /// // Sort the data by column "b" and write it to a new location
+    /// ctx.read_csv("tests/data/example.csv", CsvReadOptions::new()).await?
+    ///   .sort(vec![col("b").sort(true, true)])? // sort by b asc, nulls first
+    ///   .write_json(
+    ///     "output.json",
+    ///     DataFrameWriteOptions::new(),
+    ///     None
+    /// ).await?;
+    /// # fs::remove_file("output.json")?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn write_json(
         self,
         path: &str,
         options: DataFrameWriteOptions,
+        writer_options: Option<JsonOptions>,
     ) -> Result<Vec<RecordBatch>, DataFusionError> {
-        if options.overwrite {
-            return Err(DataFusionError::NotImplemented(
-                "Overwrites are not implemented for DataFrame::write_json.".to_owned(),
-            ));
+        if options.insert_op != InsertOp::Append {
+            return not_impl_err!(
+                "{} is not implemented for DataFrame::write_json.",
+                options.insert_op
+            );
         }
-        let file_type_writer_options =
-            FileTypeWriterOptions::JSON(JsonWriterOptions::new(options.compression));
-        let copy_options = CopyOptions::WriterOptions(Box::new(file_type_writer_options));
+
+        let format = if let Some(json_opts) = writer_options {
+            Arc::new(JsonFormatFactory::new_with_options(json_opts))
+        } else {
+            Arc::new(JsonFormatFactory::new())
+        };
+
+        let file_type = format_as_file_type(format);
+
+        let plan = if options.sort_by.is_empty() {
+            self.plan
+        } else {
+            LogicalPlanBuilder::from(self.plan)
+                .sort(options.sort_by)?
+                .build()?
+        };
+
         let plan = LogicalPlanBuilder::copy_to(
-            self.plan,
+            plan,
             path.into(),
-            FileType::JSON,
-            copy_options,
+            file_type,
+            Default::default(),
+            options.partition_by,
         )?
         .build()?;
-        DataFrame::new(self.session_state, plan).collect().await
+
+        DataFrame {
+            session_state: self.session_state,
+            plan,
+        }
+        .collect()
+        .await
     }
 
     /// Add an additional column to the DataFrame.
     ///
+    /// # Example
     /// ```
     /// # use datafusion::prelude::*;
     /// # use datafusion::error::Result;
@@ -1119,25 +1704,33 @@ impl DataFrame {
     /// # }
     /// ```
     pub fn with_column(self, name: &str, expr: Expr) -> Result<DataFrame> {
-        let window_func_exprs = find_window_exprs(&[expr.clone()]);
-        let plan = if window_func_exprs.is_empty() {
-            self.plan
+        let window_func_exprs = find_window_exprs(std::slice::from_ref(&expr));
+
+        let (window_fn_str, plan) = if window_func_exprs.is_empty() {
+            (None, self.plan)
         } else {
-            LogicalPlanBuilder::window_plan(self.plan, window_func_exprs)?
+            (
+                Some(window_func_exprs[0].to_string()),
+                LogicalPlanBuilder::window_plan(self.plan, window_func_exprs)?,
+            )
         };
 
-        let new_column = expr.alias(name);
         let mut col_exists = false;
+        let new_column = expr.alias(name);
         let mut fields: Vec<Expr> = plan
             .schema()
-            .fields()
             .iter()
-            .map(|f| {
-                if f.name() == name {
+            .filter_map(|(qualifier, field)| {
+                if field.name() == name {
                     col_exists = true;
-                    new_column.clone()
+                    Some(new_column.clone())
                 } else {
-                    col(f.qualified_column())
+                    let e = col(Column::from((qualifier, field)));
+                    window_fn_str
+                        .as_ref()
+                        .filter(|s| *s == &e.to_string())
+                        .is_none()
+                        .then_some(e)
                 }
             })
             .collect();
@@ -1148,7 +1741,10 @@ impl DataFrame {
 
         let project_plan = LogicalPlanBuilder::from(plan).project(fields)?.build()?;
 
-        Ok(DataFrame::new(self.session_state, project_plan))
+        Ok(DataFrame {
+            session_state: self.session_state,
+            plan: project_plan,
+        })
     }
 
     /// Rename one column by applying a new projection. This is a no-op if the column to be
@@ -1156,9 +1752,10 @@ impl DataFrame {
     ///
     /// The method supports case sensitive rename with wrapping column name into one of following symbols (  "  or  '  or  `  )
     ///
-    /// Alternatively setting Datafusion param `datafusion.sql_parser.enable_ident_normalization` to `false` will enable  
+    /// Alternatively setting DataFusion param `datafusion.sql_parser.enable_ident_normalization` to `false` will enable
     /// case sensitive rename without need to wrap column name into special symbols
     ///
+    /// # Example
     /// ```
     /// # use datafusion::prelude::*;
     /// # use datafusion::error::Result;
@@ -1187,31 +1784,35 @@ impl DataFrame {
             Column::from_qualified_name_ignore_case(old_name)
         };
 
-        let field_to_rename = match self.plan.schema().field_from_column(&old_column) {
-            Ok(field) => field,
-            // no-op if field not found
-            Err(DataFusionError::SchemaError(SchemaError::FieldNotFound { .. }, _)) => {
-                return Ok(self)
-            }
-            Err(err) => return Err(err),
-        };
+        let (qualifier_rename, field_rename) =
+            match self.plan.schema().qualified_field_from_column(&old_column) {
+                Ok(qualifier_and_field) => qualifier_and_field,
+                // no-op if field not found
+                Err(DataFusionError::SchemaError(
+                    SchemaError::FieldNotFound { .. },
+                    _,
+                )) => return Ok(self),
+                Err(err) => return Err(err),
+            };
         let projection = self
             .plan
             .schema()
-            .fields()
             .iter()
-            .map(|f| {
-                if f == field_to_rename {
-                    col(f.qualified_column()).alias(new_name)
+            .map(|(qualifier, field)| {
+                if qualifier.eq(&qualifier_rename) && field.as_ref() == field_rename {
+                    col(Column::from((qualifier, field))).alias(new_name)
                 } else {
-                    col(f.qualified_column())
+                    col(Column::from((qualifier, field)))
                 }
             })
             .collect::<Vec<_>>();
         let project_plan = LogicalPlanBuilder::from(self.plan)
             .project(projection)?
             .build()?;
-        Ok(DataFrame::new(self.session_state, project_plan))
+        Ok(DataFrame {
+            session_state: self.session_state,
+            plan: project_plan,
+        })
     }
 
     /// Replace all parameters in logical plan with the specified
@@ -1225,7 +1826,7 @@ impl DataFrame {
     /// # #[tokio::main]
     /// # async fn main() -> Result<()> {
     /// # use datafusion_common::ScalarValue;
-    /// let mut ctx = SessionContext::new();
+    /// let ctx = SessionContext::new();
     /// # ctx.register_csv("example", "tests/data/example.csv", CsvReadOptions::new()).await?;
     /// let results = ctx
     ///   .sql("SELECT a FROM example WHERE b = $1")
@@ -1273,7 +1874,10 @@ impl DataFrame {
     /// ```
     pub fn with_param_values(self, query_values: impl Into<ParamValues>) -> Result<Self> {
         let plan = self.plan.with_param_values(query_values)?;
-        Ok(Self::new(self.session_state, plan))
+        Ok(DataFrame {
+            session_state: self.session_state,
+            plan,
+        })
     }
 
     /// Cache DataFrame as a memory table.
@@ -1290,7 +1894,7 @@ impl DataFrame {
     /// # }
     /// ```
     pub async fn cache(self) -> Result<DataFrame> {
-        let context = SessionContext::new_with_state(self.session_state.clone());
+        let context = SessionContext::new_with_state((*self.session_state).clone());
         // The schema is consistent with the output
         let plan = self.clone().create_physical_plan().await?;
         let schema = plan.schema();
@@ -1299,8 +1903,20 @@ impl DataFrame {
         let mem_table = MemTable::try_new(schema, partitions)?;
         context.read_table(Arc::new(mem_table))
     }
+
+    /// Apply an alias to the DataFrame.
+    ///
+    /// This method replaces the qualifiers of output columns with the given alias.
+    pub fn alias(self, alias: &str) -> Result<DataFrame> {
+        let plan = LogicalPlanBuilder::from(self.plan).alias(alias)?.build()?;
+        Ok(DataFrame {
+            session_state: self.session_state,
+            plan,
+        })
+    }
 }
 
+#[derive(Debug)]
 struct DataFrameTableProvider {
     plan: LogicalPlan,
 }
@@ -1311,16 +1927,16 @@ impl TableProvider for DataFrameTableProvider {
         self
     }
 
-    fn get_logical_plan(&self) -> Option<&LogicalPlan> {
-        Some(&self.plan)
+    fn get_logical_plan(&self) -> Option<Cow<LogicalPlan>> {
+        Some(Cow::Borrowed(&self.plan))
     }
 
-    fn supports_filter_pushdown(
+    fn supports_filters_pushdown(
         &self,
-        _filter: &Expr,
-    ) -> Result<TableProviderFilterPushDown> {
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>> {
         // A filter is added on the DataFrame when given
-        Ok(TableProviderFilterPushDown::Exact)
+        Ok(vec![TableProviderFilterPushDown::Exact; filters.len()])
     }
 
     fn schema(&self) -> SchemaRef {
@@ -1334,7 +1950,7 @@ impl TableProvider for DataFrameTableProvider {
 
     async fn scan(
         &self,
-        state: &SessionState,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
@@ -1364,21 +1980,27 @@ mod tests {
     use std::vec;
 
     use super::*;
+    use crate::assert_batches_sorted_eq;
     use crate::execution::context::SessionConfig;
     use crate::physical_plan::{ColumnarValue, Partitioning, PhysicalExpr};
     use crate::test_util::{register_aggregate_csv, test_table, test_table_with_name};
-    use crate::{assert_batches_sorted_eq, execution::context::SessionContext};
 
-    use arrow::array::{self, Int32Array};
-    use arrow::datatypes::DataType;
-    use datafusion_common::{Constraint, Constraints};
+    use crate::prelude::{CsvReadOptions, NdJsonReadOptions, ParquetReadOptions};
+    use arrow::array::Int32Array;
+    use datafusion_common::{assert_batches_eq, Constraint, Constraints, ScalarValue};
+    use datafusion_common_runtime::SpawnedTask;
+    use datafusion_expr::expr::WindowFunction;
     use datafusion_expr::{
-        avg, cast, count, count_distinct, create_udf, expr, lit, max, min, sum,
-        BuiltInWindowFunction, ScalarFunctionImplementation, Volatility, WindowFrame,
-        WindowFunctionDefinition,
+        cast, create_udf, lit, ExprFunctionExt, ScalarFunctionImplementation, Volatility,
+        WindowFrame, WindowFrameBound, WindowFrameUnits, WindowFunctionDefinition,
     };
+    use datafusion_functions_aggregate::expr_fn::{array_agg, count_distinct};
+    use datafusion_functions_window::expr_fn::row_number;
+    use datafusion_functions_window::nth_value::first_value_udwf;
     use datafusion_physical_expr::expressions::Column;
-    use datafusion_physical_plan::get_plan_string;
+    use datafusion_physical_plan::{get_plan_string, ExecutionPlanProperties};
+    use sqlparser::ast::NullTreatment;
+    use tempfile::TempDir;
 
     // Get string representation of the plan
     async fn assert_physical_plan(df: &DataFrame, expected: Vec<&str>) {
@@ -1403,8 +2025,8 @@ mod tests {
         let batch = RecordBatch::try_new(
             dual_schema.clone(),
             vec![
-                Arc::new(array::Int32Array::from(vec![1])),
-                Arc::new(array::StringArray::from(vec!["a"])),
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["a"])),
             ],
         )
         .unwrap();
@@ -1446,6 +2068,43 @@ mod tests {
         array_agg("double_field" ORDER BY "string_field") as "double_field",
         array_agg("string_field" ORDER BY "string_field") as "string_field"
     FROM test_table"#;
+
+        let result = ctx.sql(query).await?;
+        assert_logical_expr_schema_eq_physical_expr_schema(result).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_coalesce_schema() -> Result<()> {
+        let ctx = SessionContext::new();
+
+        let query = r#"SELECT COALESCE(null, 5)"#;
+
+        let result = ctx.sql(query).await?;
+        assert_logical_expr_schema_eq_physical_expr_schema(result).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_coalesce_from_values_schema() -> Result<()> {
+        let ctx = SessionContext::new();
+
+        let query = r#"SELECT COALESCE(column1, column2) FROM VALUES (null, 1.2)"#;
+
+        let result = ctx.sql(query).await?;
+        assert_logical_expr_schema_eq_physical_expr_schema(result).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_coalesce_from_values_schema_multiple_rows() -> Result<()> {
+        let ctx = SessionContext::new();
+
+        let query = r#"SELECT COALESCE(column1, column2)
+        FROM VALUES
+        (null, 1.2),
+        (1.1, null),
+        (2, 5);"#;
 
         let result = ctx.sql(query).await?;
         assert_logical_expr_schema_eq_physical_expr_schema(result).await?;
@@ -1536,18 +2195,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn select_exprs() -> Result<()> {
+        // build plan using `select_expr``
+        let t = test_table().await?;
+        let plan = t
+            .clone()
+            .select_exprs(&["c1", "c2", "c11", "c2 * c11"])?
+            .plan;
+
+        // build plan using select
+        let expected_plan = t
+            .select(vec![
+                col("c1"),
+                col("c2"),
+                col("c11"),
+                col("c2") * col("c11"),
+            ])?
+            .plan;
+
+        assert_same_plan(&expected_plan, &plan);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn select_with_window_exprs() -> Result<()> {
         // build plan using Table API
         let t = test_table().await?;
-        let first_row = Expr::WindowFunction(expr::WindowFunction::new(
-            WindowFunctionDefinition::BuiltInWindowFunction(
-                BuiltInWindowFunction::FirstValue,
-            ),
+        let first_row = Expr::WindowFunction(WindowFunction::new(
+            WindowFunctionDefinition::WindowUDF(first_value_udwf()),
             vec![col("aggregate_test_100.c1")],
-            vec![col("aggregate_test_100.c2")],
-            vec![],
-            WindowFrame::new(None),
-        ));
+        ))
+        .partition_by(vec![col("aggregate_test_100.c2")])
+        .build()
+        .unwrap();
         let t2 = t.select(vec![col("c1"), first_row])?;
         let plan = t2.plan.clone();
 
@@ -1582,6 +2263,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn drop_columns() -> Result<()> {
+        // build plan using Table API
+        let t = test_table().await?;
+        let t2 = t.drop_columns(&["c2", "c11"])?;
+        let plan = t2.plan.clone();
+
+        // build query using SQL
+        let sql_plan = create_plan(
+            "SELECT c1,c3,c4,c5,c6,c7,c8,c9,c10,c12,c13 FROM aggregate_test_100",
+        )
+        .await?;
+
+        // the two plans should be identical
+        assert_same_plan(&plan, &sql_plan);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn drop_columns_with_duplicates() -> Result<()> {
+        // build plan using Table API
+        let t = test_table().await?;
+        let t2 = t.drop_columns(&["c2", "c11", "c2", "c2"])?;
+        let plan = t2.plan.clone();
+
+        // build query using SQL
+        let sql_plan = create_plan(
+            "SELECT c1,c3,c4,c5,c6,c7,c8,c9,c10,c12,c13 FROM aggregate_test_100",
+        )
+        .await?;
+
+        // the two plans should be identical
+        assert_same_plan(&plan, &sql_plan);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn drop_columns_with_nonexistent_columns() -> Result<()> {
+        // build plan using Table API
+        let t = test_table().await?;
+        let t2 = t.drop_columns(&["canada", "c2", "rocks"])?;
+        let plan = t2.plan.clone();
+
+        // build query using SQL
+        let sql_plan = create_plan(
+            "SELECT c1,c3,c4,c5,c6,c7,c8,c9,c10,c11,c12,c13 FROM aggregate_test_100",
+        )
+        .await?;
+
+        // the two plans should be identical
+        assert_same_plan(&plan, &sql_plan);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn drop_columns_with_empty_array() -> Result<()> {
+        // build plan using Table API
+        let t = test_table().await?;
+        let t2 = t.drop_columns(&[])?;
+        let plan = t2.plan.clone();
+
+        // build query using SQL
+        let sql_plan = create_plan(
+            "SELECT c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11,c12,c13 FROM aggregate_test_100",
+        )
+        .await?;
+
+        // the two plans should be identical
+        assert_same_plan(&plan, &sql_plan);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn drop_with_quotes() -> Result<()> {
+        // define data with a column name that has a "." in it:
+        let array1: Int32Array = [1, 10].into_iter().collect();
+        let array2: Int32Array = [2, 11].into_iter().collect();
+        let batch = RecordBatch::try_from_iter(vec![
+            ("f\"c1", Arc::new(array1) as _),
+            ("f\"c2", Arc::new(array2) as _),
+        ])?;
+
+        let ctx = SessionContext::new();
+        ctx.register_batch("t", batch)?;
+
+        let df = ctx.table("t").await?.drop_columns(&["f\"c1"])?;
+
+        let df_results = df.collect().await?;
+
+        assert_batches_sorted_eq!(
+            [
+                "+------+",
+                "| f\"c2 |",
+                "+------+",
+                "| 2    |",
+                "| 11   |",
+                "+------+"
+            ],
+            &df_results
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn drop_with_periods() -> Result<()> {
+        // define data with a column name that has a "." in it:
+        let array1: Int32Array = [1, 10].into_iter().collect();
+        let array2: Int32Array = [2, 11].into_iter().collect();
+        let batch = RecordBatch::try_from_iter(vec![
+            ("f.c1", Arc::new(array1) as _),
+            ("f.c2", Arc::new(array2) as _),
+        ])?;
+
+        let ctx = SessionContext::new();
+        ctx.register_batch("t", batch)?;
+
+        let df = ctx.table("t").await?.drop_columns(&["f.c1"])?;
+
+        let df_results = df.collect().await?;
+
+        assert_batches_sorted_eq!(
+            ["+------+", "| f.c2 |", "+------+", "| 2    |", "| 11   |", "+------+"],
+            &df_results
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn aggregate() -> Result<()> {
         // build plan using DataFrame API
         let df = test_table().await?;
@@ -1599,7 +2413,7 @@ mod tests {
 
         assert_batches_sorted_eq!(
             ["+----+-----------------------------+-----------------------------+-----------------------------+-----------------------------+-------------------------------+----------------------------------------+",
-                "| c1 | MIN(aggregate_test_100.c12) | MAX(aggregate_test_100.c12) | AVG(aggregate_test_100.c12) | SUM(aggregate_test_100.c12) | COUNT(aggregate_test_100.c12) | COUNT(DISTINCT aggregate_test_100.c12) |",
+                "| c1 | min(aggregate_test_100.c12) | max(aggregate_test_100.c12) | avg(aggregate_test_100.c12) | sum(aggregate_test_100.c12) | count(aggregate_test_100.c12) | count(DISTINCT aggregate_test_100.c12) |",
                 "+----+-----------------------------+-----------------------------+-----------------------------+-----------------------------+-------------------------------+----------------------------------------+",
                 "| a  | 0.02182578039211991         | 0.9800193410444061          | 0.48754517466109415         | 10.238448667882977          | 21                            | 21                                     |",
                 "| b  | 0.04893135681998029         | 0.9185813970744787          | 0.41040709263815384         | 7.797734760124923           | 19                            | 19                                     |",
@@ -1609,6 +2423,30 @@ mod tests {
                 "+----+-----------------------------+-----------------------------+-----------------------------+-----------------------------+-------------------------------+----------------------------------------+"],
             &df
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aggregate_assert_no_empty_batches() -> Result<()> {
+        // build plan using DataFrame API
+        let df = test_table().await?;
+        let group_expr = vec![col("c1")];
+        let aggr_expr = vec![
+            min(col("c12")),
+            max(col("c12")),
+            avg(col("c12")),
+            sum(col("c12")),
+            count(col("c12")),
+            count_distinct(col("c12")),
+            median(col("c12")),
+        ];
+
+        let df: Vec<RecordBatch> = df.aggregate(group_expr, aggr_expr)?.collect().await?;
+        // Empty batches should not be produced
+        for batch in df {
+            assert!(batch.num_rows() > 0);
+        }
 
         Ok(())
     }
@@ -1831,6 +2669,219 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_aggregate_with_union() -> Result<()> {
+        let df = test_table().await?;
+
+        let df1 = df
+            .clone()
+            // GROUP BY `c1`
+            .aggregate(vec![col("c1")], vec![min(col("c2"))])?
+            // SELECT `c1` , min(c2) as `result`
+            .select(vec![col("c1"), min(col("c2")).alias("result")])?;
+        let df2 = df
+            .clone()
+            // GROUP BY `c1`
+            .aggregate(vec![col("c1")], vec![max(col("c3"))])?
+            // SELECT `c1` , max(c3) as `result`
+            .select(vec![col("c1"), max(col("c3")).alias("result")])?;
+
+        let df_union = df1.union(df2)?;
+        let df = df_union
+            // GROUP BY `c1`
+            .aggregate(
+                vec![col("c1")],
+                vec![sum(col("result")).alias("sum_result")],
+            )?
+            // SELECT `c1`, sum(result) as `sum_result`
+            .select(vec![(col("c1")), col("sum_result")])?;
+
+        let df_results = df.collect().await?;
+
+        #[rustfmt::skip]
+        assert_batches_sorted_eq!(
+            [
+                "+----+------------+",
+                "| c1 | sum_result |",
+                "+----+------------+",
+                "| a  | 84         |",
+                "| b  | 69         |",
+                "| c  | 124        |",
+                "| d  | 126        |",
+                "| e  | 121        |",
+                "+----+------------+"
+            ],
+            &df_results
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_aggregate_subexpr() -> Result<()> {
+        let df = test_table().await?;
+
+        let group_expr = col("c2") + lit(1);
+        let aggr_expr = sum(col("c3") + lit(2));
+
+        let df = df
+            // GROUP BY `c2 + 1`
+            .aggregate(vec![group_expr.clone()], vec![aggr_expr.clone()])?
+            // SELECT `c2 + 1` as c2 + 10, sum(c3 + 2) + 20
+            // SELECT expressions contain aggr_expr and group_expr as subexpressions
+            .select(vec![
+                group_expr.alias("c2") + lit(10),
+                (aggr_expr + lit(20)).alias("sum"),
+            ])?;
+
+        let df_results = df.collect().await?;
+
+        #[rustfmt::skip]
+        assert_batches_sorted_eq!([
+                "+----------------+------+",
+                "| c2 + Int32(10) | sum  |",
+                "+----------------+------+",
+                "| 12             | 431  |",
+                "| 13             | 248  |",
+                "| 14             | 453  |",
+                "| 15             | 95   |",
+                "| 16             | -146 |",
+                "+----------------+------+",
+            ],
+            &df_results
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_aggregate_name_collision() -> Result<()> {
+        let df = test_table().await?;
+
+        let collided_alias = "aggregate_test_100.c2 + aggregate_test_100.c3";
+        let group_expr = lit(1).alias(collided_alias);
+
+        let df = df
+            // GROUP BY 1
+            .aggregate(vec![group_expr], vec![])?
+            // SELECT `aggregate_test_100.c2 + aggregate_test_100.c3`
+            .select(vec![
+                (col("aggregate_test_100.c2") + col("aggregate_test_100.c3")),
+            ])
+            // The select expr has the same display_name as the group_expr,
+            // but since they are different expressions, it should fail.
+            .expect_err("Expected error");
+        let expected = "Schema error: No field named aggregate_test_100.c2. \
+            Valid fields are \"aggregate_test_100.c2 + aggregate_test_100.c3\".";
+        assert_eq!(df.strip_backtrace(), expected);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn window_using_aggregates() -> Result<()> {
+        // build plan using DataFrame API
+        let df = test_table().await?.filter(col("c1").eq(lit("a")))?;
+        let mut aggr_expr = vec![
+            (
+                datafusion_functions_aggregate::first_last::first_value_udaf(),
+                "first_value",
+            ),
+            (
+                datafusion_functions_aggregate::first_last::last_value_udaf(),
+                "last_val",
+            ),
+            (
+                datafusion_functions_aggregate::approx_distinct::approx_distinct_udaf(),
+                "approx_distinct",
+            ),
+            (
+                datafusion_functions_aggregate::approx_median::approx_median_udaf(),
+                "approx_median",
+            ),
+            (
+                datafusion_functions_aggregate::median::median_udaf(),
+                "median",
+            ),
+            (datafusion_functions_aggregate::min_max::max_udaf(), "max"),
+            (datafusion_functions_aggregate::min_max::min_udaf(), "min"),
+        ]
+        .into_iter()
+        .map(|(func, name)| {
+            let w = WindowFunction::new(
+                WindowFunctionDefinition::AggregateUDF(func),
+                vec![col("c3")],
+            );
+
+            Expr::WindowFunction(w)
+                .null_treatment(NullTreatment::IgnoreNulls)
+                .order_by(vec![col("c2").sort(true, true), col("c3").sort(true, true)])
+                .window_frame(WindowFrame::new_bounds(
+                    WindowFrameUnits::Rows,
+                    WindowFrameBound::Preceding(ScalarValue::UInt64(None)),
+                    WindowFrameBound::Preceding(ScalarValue::UInt64(Some(1))),
+                ))
+                .build()
+                .unwrap()
+                .alias(name)
+        })
+        .collect::<Vec<_>>();
+        aggr_expr.extend_from_slice(&[col("c2"), col("c3")]);
+
+        let df: Vec<RecordBatch> = df.select(aggr_expr)?.collect().await?;
+
+        assert_batches_sorted_eq!(
+            [
+                "+-------------+----------+-----------------+---------------+--------+-----+------+----+------+",
+                "| first_value | last_val | approx_distinct | approx_median | median | max | min  | c2 | c3   |",
+                "+-------------+----------+-----------------+---------------+--------+-----+------+----+------+",
+                "|             |          |                 |               |        |     |      | 1  | -85  |",
+                "| -85         | -101     | 14              | -12           | -101   | 83  | -101 | 4  | -54  |",
+                "| -85         | -101     | 17              | -25           | -101   | 83  | -101 | 5  | -31  |",
+                "| -85         | -12      | 10              | -32           | -12    | 83  | -85  | 3  | 13   |",
+                "| -85         | -25      | 3               | -56           | -25    | -25 | -85  | 1  | -5   |",
+                "| -85         | -31      | 18              | -29           | -31    | 83  | -101 | 5  | 36   |",
+                "| -85         | -38      | 16              | -25           | -38    | 83  | -101 | 4  | 65   |",
+                "| -85         | -43      | 7               | -43           | -43    | 83  | -85  | 2  | 45   |",
+                "| -85         | -48      | 6               | -35           | -48    | 83  | -85  | 2  | -43  |",
+                "| -85         | -5       | 4               | -37           | -5     | -5  | -85  | 1  | 83   |",
+                "| -85         | -54      | 15              | -17           | -54    | 83  | -101 | 4  | -38  |",
+                "| -85         | -56      | 2               | -70           | -56    | -56 | -85  | 1  | -25  |",
+                "| -85         | -72      | 9               | -43           | -72    | 83  | -85  | 3  | -12  |",
+                "| -85         | -85      | 1               | -85           | -85    | -85 | -85  | 1  | -56  |",
+                "| -85         | 13       | 11              | -17           | 13     | 83  | -85  | 3  | 14   |",
+                "| -85         | 13       | 11              | -25           | 13     | 83  | -85  | 3  | 13   |",
+                "| -85         | 14       | 12              | -12           | 14     | 83  | -85  | 3  | 17   |",
+                "| -85         | 17       | 13              | -11           | 17     | 83  | -85  | 4  | -101 |",
+                "| -85         | 45       | 8               | -34           | 45     | 83  | -85  | 3  | -72  |",
+                "| -85         | 65       | 17              | -17           | 65     | 83  | -101 | 5  | -101 |",
+                "| -85         | 83       | 5               | -25           | 83     | 83  | -85  | 2  | -48  |",
+                "+-------------+----------+-----------------+---------------+--------+-----+------+----+------+",
+            ],
+            &df
+        );
+
+        Ok(())
+    }
+
+    // Test issue: https://github.com/apache/datafusion/issues/10346
+    #[tokio::test]
+    async fn test_select_over_aggregate_schema() -> Result<()> {
+        let df = test_table()
+            .await?
+            .with_column("c", col("c1"))?
+            .aggregate(vec![], vec![array_agg(col("c")).alias("c")])?
+            .select(vec![col("c")])?;
+
+        assert_eq!(df.schema().fields().len(), 1);
+        let field = df.schema().field(0);
+        // There are two columns named 'c', one from the input of the aggregate and the other from the output.
+        // Select should return the column from the output of the aggregate, which is a list.
+        assert!(matches!(field.data_type(), DataType::List(_)));
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_distinct() -> Result<()> {
         let t = test_table().await?;
         let plan = t
@@ -1894,6 +2945,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_distinct_on() -> Result<()> {
+        let t = test_table().await?;
+        let plan = t
+            .distinct_on(vec![col("c1")], vec![col("aggregate_test_100.c1")], None)
+            .unwrap();
+
+        let sql_plan =
+            create_plan("select distinct on (c1) c1 from aggregate_test_100").await?;
+
+        assert_same_plan(&plan.plan.clone(), &sql_plan);
+
+        let df_results = plan.clone().collect().await?;
+
+        #[rustfmt::skip]
+        assert_batches_sorted_eq!(
+            ["+----+",
+                "| c1 |",
+                "+----+",
+                "| a  |",
+                "| b  |",
+                "| c  |",
+                "| d  |",
+                "| e  |",
+                "+----+"],
+            &df_results
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_distinct_on_sort_by() -> Result<()> {
+        let t = test_table().await?;
+        let plan = t
+            .select(vec![col("c1")])
+            .unwrap()
+            .distinct_on(
+                vec![col("c1")],
+                vec![col("c1")],
+                Some(vec![col("c1").sort(true, true)]),
+            )
+            .unwrap()
+            .sort(vec![col("c1").sort(true, true)])
+            .unwrap();
+
+        let df_results = plan.clone().collect().await?;
+
+        #[rustfmt::skip]
+        assert_batches_sorted_eq!(
+            ["+----+",
+                "| c1 |",
+                "+----+",
+                "| a  |",
+                "| b  |",
+                "| c  |",
+                "| d  |",
+                "| e  |",
+                "+----+"],
+            &df_results
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_distinct_on_sort_by_unprojected() -> Result<()> {
+        let t = test_table().await?;
+        let err = t
+            .select(vec![col("c1")])
+            .unwrap()
+            .distinct_on(
+                vec![col("c1")],
+                vec![col("c1")],
+                Some(vec![col("c1").sort(true, true)]),
+            )
+            .unwrap()
+            // try to sort on some value not present in input to distinct
+            .sort(vec![col("c2").sort(true, true)])
+            .unwrap_err();
+        assert_eq!(err.strip_backtrace(), "Error during planning: For SELECT DISTINCT, ORDER BY expressions c2 must appear in select list");
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn join() -> Result<()> {
         let left = test_table().await?.select_columns(&["c1", "c2"])?;
         let right = test_table_with_name("c2")
@@ -1928,8 +3064,32 @@ mod tests {
         \n    TableScan: a\
         \n  Projection: b.c1, b.c2\
         \n    TableScan: b";
-        assert_eq!(expected_plan, format!("{:?}", join.logical_plan()));
+        assert_eq!(expected_plan, format!("{}", join.logical_plan()));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn join_on_filter_datatype() -> Result<()> {
+        let left = test_table_with_name("a").await?.select_columns(&["c1"])?;
+        let right = test_table_with_name("b").await?.select_columns(&["c1"])?;
+
+        // JOIN ON untyped NULL
+        let join = left.clone().join_on(
+            right.clone(),
+            JoinType::Inner,
+            Some(Expr::Literal(ScalarValue::Null)),
+        )?;
+        let expected_plan = "EmptyRelation";
+        assert_eq!(expected_plan, format!("{}", join.into_optimized_plan()?));
+
+        // JOIN ON expression must be boolean type
+        let join = left.join_on(right, JoinType::Inner, Some(lit("TRUE")))?;
+        let expected = join.into_optimized_plan().unwrap_err();
+        assert_eq!(
+            expected.strip_backtrace(),
+            "type_coercion\ncaused by\nError during planning: Join condition must be boolean type, but got Utf8"
+        );
         Ok(())
     }
 
@@ -1998,8 +3158,8 @@ mod tests {
 
     #[tokio::test]
     async fn registry() -> Result<()> {
-        let mut ctx = SessionContext::new();
-        register_aggregate_csv(&mut ctx, "aggregate_test_100").await?;
+        let ctx = SessionContext::new();
+        register_aggregate_csv(&ctx, "aggregate_test_100").await?;
 
         // declare the udf
         let my_fn: ScalarFunctionImplementation =
@@ -2009,7 +3169,7 @@ mod tests {
         ctx.register_udf(create_udf(
             "my_fn",
             vec![DataType::Float64],
-            Arc::new(DataType::Float64),
+            DataType::Float64,
             Volatility::Immutable,
             my_fn,
         ));
@@ -2033,11 +3193,11 @@ mod tests {
     async fn sendable() {
         let df = test_table().await.unwrap();
         // dataframes should be sendable between threads/tasks
-        let task = tokio::task::spawn(async move {
+        let task = SpawnedTask::spawn(async move {
             df.select_columns(&["c1"])
                 .expect("should be usable in a task")
         });
-        task.await.expect("task completed successfully");
+        task.join().await.expect("task completed successfully");
     }
 
     #[tokio::test]
@@ -2095,7 +3255,7 @@ mod tests {
         assert_batches_sorted_eq!(
             [
                 "+----+-----------------------------+",
-                "| c1 | SUM(aggregate_test_100.c12) |",
+                "| c1 | sum(aggregate_test_100.c12) |",
                 "+----+-----------------------------+",
                 "| a  | 10.238448667882977          |",
                 "| b  | 7.797734760124923           |",
@@ -2111,7 +3271,7 @@ mod tests {
         assert_batches_sorted_eq!(
             [
                 "+----+---------------------+",
-                "| c1 | SUM(test_table.c12) |",
+                "| c1 | sum(test_table.c12) |",
                 "+----+---------------------+",
                 "| a  | 10.238448667882977  |",
                 "| b  | 7.797734760124923   |",
@@ -2132,8 +3292,8 @@ mod tests {
 
     /// Create a logical plan from a SQL query
     async fn create_plan(sql: &str) -> Result<LogicalPlan> {
-        let mut ctx = SessionContext::new();
-        register_aggregate_csv(&mut ctx, "aggregate_test_100").await?;
+        let ctx = SessionContext::new();
+        register_aggregate_csv(&ctx, "aggregate_test_100").await?;
         Ok(ctx.sql(sql).await?.into_unoptimized_plan())
     }
 
@@ -2166,7 +3326,7 @@ mod tests {
             &df_results
         );
 
-        // check that col with the same name ovwewritten
+        // check that col with the same name overwritten
         let df_results_overwrite = df
             .clone()
             .with_column("c1", col("c2") + col("c3"))?
@@ -2189,7 +3349,7 @@ mod tests {
             &df_results_overwrite
         );
 
-        // check that col with the same name ovwewritten using same name as reference
+        // check that col with the same name overwritten using same name as reference
         let df_results_overwrite_self = df
             .clone()
             .with_column("c2", col("c2") + lit(1))?
@@ -2215,7 +3375,42 @@ mod tests {
         Ok(())
     }
 
-    // Test issue: https://github.com/apache/arrow-datafusion/issues/7790
+    // Test issues: https://github.com/apache/datafusion/issues/11982
+    // and https://github.com/apache/datafusion/issues/12425
+    // Window function was creating unwanted projection when using with_column() method.
+    #[tokio::test]
+    async fn test_window_function_with_column() -> Result<()> {
+        let df = test_table().await?.select_columns(&["c1", "c2", "c3"])?;
+        let ctx = SessionContext::new();
+        let df_impl = DataFrame::new(ctx.state(), df.plan.clone());
+        let func = row_number().alias("row_num");
+
+        // This first `with_column` results in a column without a `qualifier`
+        let df_impl = df_impl.with_column("s", col("c2") + col("c3"))?;
+
+        // This second `with_column` should only alias `func` as `"r"`
+        let df = df_impl.with_column("r", func)?.limit(0, Some(2))?;
+
+        df.clone().show().await?;
+        assert_eq!(5, df.schema().fields().len());
+
+        let df_results = df.clone().collect().await?;
+        assert_batches_sorted_eq!(
+            [
+                "+----+----+-----+-----+---+",
+                "| c1 | c2 | c3  | s   | r |",
+                "+----+----+-----+-----+---+",
+                "| c  | 2  | 1   | 3   | 1 |",
+                "| d  | 5  | -40 | -35 | 2 |",
+                "+----+----+-----+-----+---+",
+            ],
+            &df_results
+        );
+
+        Ok(())
+    }
+
+    // Test issue: https://github.com/apache/datafusion/issues/7790
     // The join operation outputs two identical column names, but they belong to different relations.
     #[tokio::test]
     async fn with_column_join_same_columns() -> Result<()> {
@@ -2263,20 +3458,19 @@ mod tests {
         \n      Inner Join: t1.c1 = t2.c1\
         \n        TableScan: t1\
         \n        TableScan: t2",
-            format!("{:?}", df_with_column.logical_plan())
+            format!("{}", df_with_column.logical_plan())
         );
 
         assert_eq!(
             "\
         Projection: t1.c1, t2.c1, Boolean(true) AS new_column\
-        \n  Limit: skip=0, fetch=1\
-        \n    Sort: t1.c1 ASC NULLS FIRST, fetch=1\
-        \n      Inner Join: t1.c1 = t2.c1\
-        \n        SubqueryAlias: t1\
-        \n          TableScan: aggregate_test_100 projection=[c1]\
-        \n        SubqueryAlias: t2\
-        \n          TableScan: aggregate_test_100 projection=[c1]",
-            format!("{:?}", df_with_column.clone().into_optimized_plan()?)
+        \n  Sort: t1.c1 ASC NULLS FIRST, fetch=1\
+        \n    Inner Join: t1.c1 = t2.c1\
+        \n      SubqueryAlias: t1\
+        \n        TableScan: aggregate_test_100 projection=[c1]\
+        \n      SubqueryAlias: t2\
+        \n        TableScan: aggregate_test_100 projection=[c1]",
+            format!("{}", df_with_column.clone().into_optimized_plan()?)
         );
 
         let df_results = df_with_column.collect().await?;
@@ -2294,65 +3488,19 @@ mod tests {
         Ok(())
     }
 
-    // Table 't1' self join
-    // Supplementary test of issue: https://github.com/apache/arrow-datafusion/issues/7790
-    #[tokio::test]
-    async fn with_column_self_join() -> Result<()> {
-        let df = test_table().await?.select_columns(&["c1"])?;
-        let ctx = SessionContext::new();
-
-        ctx.register_table("t1", df.into_view())?;
-
-        let df = ctx
-            .table("t1")
-            .await?
-            .join(
-                ctx.table("t1").await?,
-                JoinType::Inner,
-                &["c1"],
-                &["c1"],
-                None,
-            )?
-            .sort(vec![
-                // make the test deterministic
-                col("t1.c1").sort(true, true),
-            ])?
-            .limit(0, Some(1))?;
-
-        let df_results = df.clone().collect().await?;
-        assert_batches_sorted_eq!(
-            [
-                "+----+----+",
-                "| c1 | c1 |",
-                "+----+----+",
-                "| a  | a  |",
-                "+----+----+",
-            ],
-            &df_results
-        );
-
-        let actual_err = df.clone().with_column("new_column", lit(true)).unwrap_err();
-        let expected_err = "Error during planning: Projections require unique expression names \
-            but the expression \"t1.c1\" at position 0 and \"t1.c1\" at position 1 have the same name. \
-            Consider aliasing (\"AS\") one of them.";
-        assert_eq!(actual_err.strip_backtrace(), expected_err);
-
-        Ok(())
-    }
-
     #[tokio::test]
     async fn with_column_renamed() -> Result<()> {
         let df = test_table()
             .await?
             .select_columns(&["c1", "c2", "c3"])?
             .filter(col("c2").eq(lit(3)).and(col("c1").eq(lit("a"))))?
-            .limit(0, Some(1))?
             .sort(vec![
                 // make the test deterministic
                 col("c1").sort(true, true),
                 col("c2").sort(true, true),
                 col("c3").sort(true, true),
             ])?
+            .limit(0, Some(1))?
             .with_column("sum", col("c2") + col("c3"))?;
 
         let df_sum_renamed = df
@@ -2368,11 +3516,11 @@ mod tests {
 
         assert_batches_sorted_eq!(
             [
-                "+-----+-----+----+-------+",
-                "| one | two | c3 | total |",
-                "+-----+-----+----+-------+",
-                "| a   | 3   | 13 | 16    |",
-                "+-----+-----+----+-------+"
+                "+-----+-----+-----+-------+",
+                "| one | two | c3  | total |",
+                "+-----+-----+-----+-------+",
+                "| a   | 3   | -72 | -69   |",
+                "+-----+-----+-----+-------+",
             ],
             &df_sum_renamed
         );
@@ -2458,19 +3606,18 @@ mod tests {
         \n      Inner Join: t1.c1 = t2.c1\
         \n        TableScan: t1\
         \n        TableScan: t2",
-                   format!("{:?}", df_renamed.logical_plan())
+                   format!("{}", df_renamed.logical_plan())
         );
 
         assert_eq!("\
         Projection: t1.c1 AS AAA, t1.c2, t1.c3, t2.c1, t2.c2, t2.c3\
-        \n  Limit: skip=0, fetch=1\
-        \n    Sort: t1.c1 ASC NULLS FIRST, t1.c2 ASC NULLS FIRST, t1.c3 ASC NULLS FIRST, t2.c1 ASC NULLS FIRST, t2.c2 ASC NULLS FIRST, t2.c3 ASC NULLS FIRST, fetch=1\
-        \n      Inner Join: t1.c1 = t2.c1\
-        \n        SubqueryAlias: t1\
-        \n          TableScan: aggregate_test_100 projection=[c1, c2, c3]\
-        \n        SubqueryAlias: t2\
-        \n          TableScan: aggregate_test_100 projection=[c1, c2, c3]",
-                   format!("{:?}", df_renamed.clone().into_optimized_plan()?)
+        \n  Sort: t1.c1 ASC NULLS FIRST, t1.c2 ASC NULLS FIRST, t1.c3 ASC NULLS FIRST, t2.c1 ASC NULLS FIRST, t2.c2 ASC NULLS FIRST, t2.c3 ASC NULLS FIRST, fetch=1\
+        \n    Inner Join: t1.c1 = t2.c1\
+        \n      SubqueryAlias: t1\
+        \n        TableScan: aggregate_test_100 projection=[c1, c2, c3]\
+        \n      SubqueryAlias: t2\
+        \n        TableScan: aggregate_test_100 projection=[c1, c2, c3]",
+                   format!("{}", df_renamed.clone().into_optimized_plan()?)
         );
 
         let df_results = df_renamed.collect().await?;
@@ -2491,14 +3638,13 @@ mod tests {
 
     #[tokio::test]
     async fn with_column_renamed_case_sensitive() -> Result<()> {
-        let config =
-            SessionConfig::from_string_hash_map(std::collections::HashMap::from([(
-                "datafusion.sql_parser.enable_ident_normalization".to_owned(),
-                "false".to_owned(),
-            )]))?;
-        let mut ctx = SessionContext::new_with_config(config);
+        let config = SessionConfig::from_string_hash_map(&HashMap::from([(
+            "datafusion.sql_parser.enable_ident_normalization".to_owned(),
+            "false".to_owned(),
+        )]))?;
+        let ctx = SessionContext::new_with_config(config);
         let name = "aggregate_test_100";
-        register_aggregate_csv(&mut ctx, name).await?;
+        register_aggregate_csv(&ctx, name).await?;
         let df = ctx.table(name);
 
         let df = df
@@ -2567,7 +3713,7 @@ mod tests {
 
     #[tokio::test]
     async fn row_writer_resize_test() -> Result<()> {
-        let schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+        let schema = Arc::new(Schema::new(vec![Field::new(
             "column_1",
             DataType::Utf8,
             false,
@@ -2576,7 +3722,7 @@ mod tests {
         let data = RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(arrow::array::StringArray::from(vec![
+                Arc::new(StringArray::from(vec![
                     Some("2a0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"),
                     Some("3a0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000800"),
                 ]))
@@ -2588,7 +3734,7 @@ mod tests {
 
         let sql = r#"
         SELECT
-            COUNT(1)
+            count(1)
         FROM
             test
         GROUP BY
@@ -2655,7 +3801,7 @@ mod tests {
 
         assert_eq!(
             "TableScan: ?table? projection=[c2, c3, sum]",
-            format!("{:?}", cached_df.clone().into_optimized_plan()?)
+            format!("{}", cached_df.clone().into_optimized_plan()?)
         );
 
         let df_results = df.collect().await?;
@@ -2764,7 +3910,7 @@ mod tests {
         // For non-partition aware union, the output partitioning count should be the combination of all output partitions count
         assert!(matches!(
             physical_plan.output_partitioning(),
-            Partitioning::UnknownPartitioning(partition_count) if partition_count == default_partition_count * 2));
+            Partitioning::UnknownPartitioning(partition_count) if *partition_count == default_partition_count * 2));
         Ok(())
     }
 
@@ -2786,6 +3932,7 @@ mod tests {
             JoinType::RightSemi,
             JoinType::LeftAnti,
             JoinType::RightAnti,
+            JoinType::LeftMark,
         ];
 
         let default_partition_count = SessionConfig::new().target_partitions();
@@ -2803,37 +3950,391 @@ mod tests {
             let join_schema = physical_plan.schema();
 
             match join_type {
-                JoinType::Inner
-                | JoinType::Left
+                JoinType::Left
                 | JoinType::LeftSemi
-                | JoinType::LeftAnti => {
+                | JoinType::LeftAnti
+                | JoinType::LeftMark => {
                     let left_exprs: Vec<Arc<dyn PhysicalExpr>> = vec![
                         Arc::new(Column::new_with_schema("c1", &join_schema)?),
                         Arc::new(Column::new_with_schema("c2", &join_schema)?),
                     ];
                     assert_eq!(
                         out_partitioning,
-                        Partitioning::Hash(left_exprs, default_partition_count)
+                        &Partitioning::Hash(left_exprs, default_partition_count)
                     );
                 }
-                JoinType::Right | JoinType::RightSemi | JoinType::RightAnti => {
+                JoinType::Inner
+                | JoinType::Right
+                | JoinType::RightSemi
+                | JoinType::RightAnti => {
                     let right_exprs: Vec<Arc<dyn PhysicalExpr>> = vec![
                         Arc::new(Column::new_with_schema("c2_c1", &join_schema)?),
                         Arc::new(Column::new_with_schema("c2_c2", &join_schema)?),
                     ];
                     assert_eq!(
                         out_partitioning,
-                        Partitioning::Hash(right_exprs, default_partition_count)
+                        &Partitioning::Hash(right_exprs, default_partition_count)
                     );
                 }
                 JoinType::Full => {
                     assert!(matches!(
                         out_partitioning,
-                    Partitioning::UnknownPartitioning(partition_count) if partition_count == default_partition_count));
+                    &Partitioning::UnknownPartitioning(partition_count) if partition_count == default_partition_count));
                 }
             }
         }
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_except_nested_struct() -> Result<()> {
+        use arrow::array::StructArray;
+
+        let nested_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("lat", DataType::Int32, true),
+            Field::new("long", DataType::Int32, true),
+        ]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int32, true),
+            Field::new(
+                "nested",
+                DataType::Struct(nested_schema.fields.clone()),
+                true,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), Some(2), Some(3)])),
+                Arc::new(StructArray::from(vec![
+                    (
+                        Arc::new(Field::new("id", DataType::Int32, true)),
+                        Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+                    ),
+                    (
+                        Arc::new(Field::new("lat", DataType::Int32, true)),
+                        Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+                    ),
+                    (
+                        Arc::new(Field::new("long", DataType::Int32, true)),
+                        Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+                    ),
+                ])),
+            ],
+        )
+        .unwrap();
+
+        let updated_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), Some(12), Some(3)])),
+                Arc::new(StructArray::from(vec![
+                    (
+                        Arc::new(Field::new("id", DataType::Int32, true)),
+                        Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+                    ),
+                    (
+                        Arc::new(Field::new("lat", DataType::Int32, true)),
+                        Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+                    ),
+                    (
+                        Arc::new(Field::new("long", DataType::Int32, true)),
+                        Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+                    ),
+                ])),
+            ],
+        )
+        .unwrap();
+
+        let ctx = SessionContext::new();
+        let before = ctx.read_batch(batch).expect("Failed to make DataFrame");
+        let after = ctx
+            .read_batch(updated_batch)
+            .expect("Failed to make DataFrame");
+
+        let diff = before
+            .except(after)
+            .expect("Failed to except")
+            .collect()
+            .await?;
+        assert_eq!(diff.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nested_explain_should_fail() -> Result<()> {
+        let ctx = SessionContext::new();
+        // must be error
+        let mut result = ctx.sql("explain select 1").await?.explain(false, false);
+        assert!(result.is_err());
+        // must be error
+        result = ctx.sql("explain explain select 1").await;
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    // Test issue: https://github.com/apache/datafusion/issues/12065
+    #[tokio::test]
+    async fn filtered_aggr_with_param_values() -> Result<()> {
+        let cfg = SessionConfig::new().set(
+            "datafusion.sql_parser.dialect",
+            &ScalarValue::from("PostgreSQL"),
+        );
+        let ctx = SessionContext::new_with_config(cfg);
+        register_aggregate_csv(&ctx, "table1").await?;
+
+        let df = ctx
+            .sql("select count (c2) filter (where c3 > $1) from table1")
+            .await?
+            .with_param_values(ParamValues::List(vec![ScalarValue::from(10u64)]));
+
+        let df_results = df?.collect().await?;
+        assert_batches_eq!(
+            &[
+                "+------------------------------------------------+",
+                "| count(table1.c2) FILTER (WHERE table1.c3 > $1) |",
+                "+------------------------------------------------+",
+                "| 54                                             |",
+                "+------------------------------------------------+",
+            ],
+            &df_results
+        );
+
+        Ok(())
+    }
+
+    // Test issue: https://github.com/apache/datafusion/issues/13873
+    #[tokio::test]
+    async fn write_parquet_with_order() -> Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int32, true),
+        ]));
+
+        let ctx = SessionContext::new();
+        let write_df = ctx.read_batch(RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 5, 7, 3, 2])),
+                Arc::new(Int32Array::from(vec![2, 3, 4, 5, 6])),
+            ],
+        )?)?;
+
+        let test_path = tmp_dir.path().join("test.parquet");
+
+        write_df
+            .clone()
+            .write_parquet(
+                test_path.to_str().unwrap(),
+                DataFrameWriteOptions::new()
+                    .with_sort_by(vec![col("a").sort(true, true)]),
+                None,
+            )
+            .await?;
+
+        let ctx = SessionContext::new();
+        ctx.register_parquet(
+            "data",
+            test_path.to_str().unwrap(),
+            ParquetReadOptions::default(),
+        )
+        .await?;
+
+        let df = ctx.sql("SELECT * FROM data").await?;
+        let results = df.collect().await?;
+
+        let df_explain = ctx.sql("explain SELECT a FROM data").await?;
+        let explain_result = df_explain.collect().await?;
+
+        println!("explain_result {:?}", explain_result);
+
+        assert_batches_eq!(
+            &[
+                "+---+---+",
+                "| a | b |",
+                "+---+---+",
+                "| 1 | 2 |",
+                "| 2 | 6 |",
+                "| 3 | 5 |",
+                "| 5 | 3 |",
+                "| 7 | 4 |",
+                "+---+---+",
+            ],
+            &results
+        );
+        Ok(())
+    }
+
+    // Test issue: https://github.com/apache/datafusion/issues/13873
+    #[tokio::test]
+    async fn write_csv_with_order() -> Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int32, true),
+        ]));
+
+        let ctx = SessionContext::new();
+        let write_df = ctx.read_batch(RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 5, 7, 3, 2])),
+                Arc::new(Int32Array::from(vec![2, 3, 4, 5, 6])),
+            ],
+        )?)?;
+
+        let test_path = tmp_dir.path().join("test.csv");
+
+        write_df
+            .clone()
+            .write_csv(
+                test_path.to_str().unwrap(),
+                DataFrameWriteOptions::new()
+                    .with_sort_by(vec![col("a").sort(true, true)]),
+                None,
+            )
+            .await?;
+
+        let ctx = SessionContext::new();
+        ctx.register_csv(
+            "data",
+            test_path.to_str().unwrap(),
+            CsvReadOptions::new().schema(&schema),
+        )
+        .await?;
+
+        let df = ctx.sql("SELECT * FROM data").await?;
+        let results = df.collect().await?;
+
+        assert_batches_eq!(
+            &[
+                "+---+---+",
+                "| a | b |",
+                "+---+---+",
+                "| 1 | 2 |",
+                "| 2 | 6 |",
+                "| 3 | 5 |",
+                "| 5 | 3 |",
+                "| 7 | 4 |",
+                "+---+---+",
+            ],
+            &results
+        );
+        Ok(())
+    }
+
+    // Test issue: https://github.com/apache/datafusion/issues/13873
+    #[tokio::test]
+    async fn write_json_with_order() -> Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int32, true),
+        ]));
+
+        let ctx = SessionContext::new();
+        let write_df = ctx.read_batch(RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 5, 7, 3, 2])),
+                Arc::new(Int32Array::from(vec![2, 3, 4, 5, 6])),
+            ],
+        )?)?;
+
+        let test_path = tmp_dir.path().join("test.json");
+
+        write_df
+            .clone()
+            .write_json(
+                test_path.to_str().unwrap(),
+                DataFrameWriteOptions::new()
+                    .with_sort_by(vec![col("a").sort(true, true)]),
+                None,
+            )
+            .await?;
+
+        let ctx = SessionContext::new();
+        ctx.register_json(
+            "data",
+            test_path.to_str().unwrap(),
+            NdJsonReadOptions::default().schema(&schema),
+        )
+        .await?;
+
+        let df = ctx.sql("SELECT * FROM data").await?;
+        let results = df.collect().await?;
+
+        assert_batches_eq!(
+            &[
+                "+---+---+",
+                "| a | b |",
+                "+---+---+",
+                "| 1 | 2 |",
+                "| 2 | 6 |",
+                "| 3 | 5 |",
+                "| 5 | 3 |",
+                "| 7 | 4 |",
+                "+---+---+",
+            ],
+            &results
+        );
+        Ok(())
+    }
+
+    // Test issue: https://github.com/apache/datafusion/issues/13873
+    #[tokio::test]
+    async fn write_table_with_order() -> Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let ctx = SessionContext::new();
+        let location = tmp_dir.path().join("test_table/");
+
+        let mut write_df = ctx
+            .sql("values ('z'), ('x'), ('a'), ('b'), ('c')")
+            .await
+            .unwrap();
+
+        // Ensure the column names and types match the target table
+        write_df = write_df
+            .with_column_renamed("column1", "tablecol1")
+            .unwrap();
+        let sql_str =
+            "create external table data(tablecol1 varchar) stored as parquet location '"
+                .to_owned()
+                + location.to_str().unwrap()
+                + "'";
+
+        ctx.sql(sql_str.as_str()).await?.collect().await?;
+
+        // This is equivalent to INSERT INTO test.
+        write_df
+            .clone()
+            .write_table(
+                "data",
+                DataFrameWriteOptions::new()
+                    .with_sort_by(vec![col("tablecol1").sort(true, true)]),
+            )
+            .await?;
+
+        let df = ctx.sql("SELECT * FROM data").await?;
+        let results = df.collect().await?;
+
+        assert_batches_eq!(
+            &[
+                "+-----------+",
+                "| tablecol1 |",
+                "+-----------+",
+                "| a         |",
+                "| b         |",
+                "| c         |",
+                "| x         |",
+                "| z         |",
+                "+-----------+",
+            ],
+            &results
+        );
         Ok(())
     }
 }

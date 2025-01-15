@@ -17,13 +17,11 @@
 
 //! Utility functions for expression simplification
 
-use crate::simplify_expressions::SimplifyInfo;
-use datafusion_common::{internal_err, DataFusionError, Result, ScalarValue};
-use datafusion_expr::expr::ScalarFunction;
+use datafusion_common::{internal_err, Result, ScalarValue};
 use datafusion_expr::{
     expr::{Between, BinaryExpr, InList},
-    expr_fn::{and, bitwise_and, bitwise_or, concat_ws, or},
-    lit, BuiltinScalarFunction, Expr, Like, Operator, ScalarFunctionDefinition,
+    expr_fn::{and, bitwise_and, bitwise_or, or},
+    Expr, Like, Operator,
 };
 
 pub static POWS_OF_TEN: [i128; 38] = [
@@ -69,14 +67,19 @@ pub static POWS_OF_TEN: [i128; 38] = [
 
 /// returns true if `needle` is found in a chain of search_op
 /// expressions. Such as: (A AND B) AND C
-pub fn expr_contains(expr: &Expr, needle: &Expr, search_op: Operator) -> bool {
+fn expr_contains_inner(expr: &Expr, needle: &Expr, search_op: Operator) -> bool {
     match expr {
         Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == search_op => {
-            expr_contains(left, needle, search_op)
-                || expr_contains(right, needle, search_op)
+            expr_contains_inner(left, needle, search_op)
+                || expr_contains_inner(right, needle, search_op)
         }
         _ => expr == needle,
     }
+}
+
+/// check volatile calls and return if expr contains needle
+pub fn expr_contains(expr: &Expr, needle: &Expr, search_op: Operator) -> bool {
+    expr_contains_inner(expr, needle, search_op) && !needle.is_volatile()
 }
 
 /// Deletes all 'needles' or remains one 'needle' that are found in a chain of xor
@@ -208,7 +211,7 @@ pub fn is_false(expr: &Expr) -> bool {
 
 /// returns true if `haystack` looks like (needle OP X) or (X OP needle)
 pub fn is_op_with(target_op: Operator, haystack: &Expr, needle: &Expr) -> bool {
-    matches!(haystack, Expr::BinaryExpr(BinaryExpr { left, op, right }) if op == &target_op && (needle == left.as_ref() || needle == right.as_ref()))
+    matches!(haystack, Expr::BinaryExpr(BinaryExpr { left, op, right }) if op == &target_op && (needle == left.as_ref() || needle == right.as_ref()) && !needle.is_volatile())
 }
 
 /// returns true if `not_expr` is !`expr` (not)
@@ -223,9 +226,9 @@ pub fn is_negative_of(not_expr: &Expr, expr: &Expr) -> bool {
 
 /// returns the contained boolean value in `expr` as
 /// `Expr::Literal(ScalarValue::Boolean(v))`.
-pub fn as_bool_lit(expr: Expr) -> Result<Option<bool>> {
+pub fn as_bool_lit(expr: &Expr) -> Result<Option<bool>> {
     match expr {
-        Expr::Literal(ScalarValue::Boolean(v)) => Ok(v),
+        Expr::Literal(ScalarValue::Boolean(v)) => Ok(*v),
         _ => internal_err!("Expected boolean literal, got {expr:?}"),
     }
 }
@@ -341,211 +344,5 @@ pub fn distribute_negation(expr: Expr) -> Expr {
         Expr::Negative(expr) => *expr,
         // use negative clause
         _ => Expr::Negative(Box::new(expr)),
-    }
-}
-
-/// Simplify the `log` function by the relevant rules:
-/// 1. Log(a, 1) ===> 0
-/// 2. Log(a, a) ===> 1
-/// 3. Log(a, Power(a, b)) ===> b
-pub fn simpl_log(current_args: Vec<Expr>, info: &dyn SimplifyInfo) -> Result<Expr> {
-    let mut number = &current_args[0];
-    let mut base = &Expr::Literal(ScalarValue::new_ten(&info.get_data_type(number)?)?);
-    if current_args.len() == 2 {
-        base = &current_args[0];
-        number = &current_args[1];
-    }
-
-    match number {
-        Expr::Literal(value)
-            if value == &ScalarValue::new_one(&info.get_data_type(number)?)? =>
-        {
-            Ok(Expr::Literal(ScalarValue::new_zero(
-                &info.get_data_type(base)?,
-            )?))
-        }
-        Expr::ScalarFunction(ScalarFunction {
-            func_def: ScalarFunctionDefinition::BuiltIn(BuiltinScalarFunction::Power),
-            args,
-        }) if base == &args[0] => Ok(args[1].clone()),
-        _ => {
-            if number == base {
-                Ok(Expr::Literal(ScalarValue::new_one(
-                    &info.get_data_type(number)?,
-                )?))
-            } else {
-                Ok(Expr::ScalarFunction(ScalarFunction::new(
-                    BuiltinScalarFunction::Log,
-                    vec![base.clone(), number.clone()],
-                )))
-            }
-        }
-    }
-}
-
-/// Simplify the `power` function by the relevant rules:
-/// 1. Power(a, 0) ===> 0
-/// 2. Power(a, 1) ===> a
-/// 3. Power(a, Log(a, b)) ===> b
-pub fn simpl_power(current_args: Vec<Expr>, info: &dyn SimplifyInfo) -> Result<Expr> {
-    let base = &current_args[0];
-    let exponent = &current_args[1];
-
-    match exponent {
-        Expr::Literal(value)
-            if value == &ScalarValue::new_zero(&info.get_data_type(exponent)?)? =>
-        {
-            Ok(Expr::Literal(ScalarValue::new_one(
-                &info.get_data_type(base)?,
-            )?))
-        }
-        Expr::Literal(value)
-            if value == &ScalarValue::new_one(&info.get_data_type(exponent)?)? =>
-        {
-            Ok(base.clone())
-        }
-        Expr::ScalarFunction(ScalarFunction {
-            func_def: ScalarFunctionDefinition::BuiltIn(BuiltinScalarFunction::Log),
-            args,
-        }) if base == &args[0] => Ok(args[1].clone()),
-        _ => Ok(Expr::ScalarFunction(ScalarFunction::new(
-            BuiltinScalarFunction::Power,
-            current_args,
-        ))),
-    }
-}
-
-/// Simplify the `concat` function by
-/// 1. filtering out all `null` literals
-/// 2. concatenating contiguous literal arguments
-///
-/// For example:
-/// `concat(col(a), 'hello ', 'world', col(b), null)`
-/// will be optimized to
-/// `concat(col(a), 'hello world', col(b))`
-pub fn simpl_concat(args: Vec<Expr>) -> Result<Expr> {
-    let mut new_args = Vec::with_capacity(args.len());
-    let mut contiguous_scalar = "".to_string();
-    for arg in args {
-        match arg {
-            // filter out `null` args
-            Expr::Literal(ScalarValue::Utf8(None) | ScalarValue::LargeUtf8(None)) => {}
-            // All literals have been converted to Utf8 or LargeUtf8 in type_coercion.
-            // Concatenate it with the `contiguous_scalar`.
-            Expr::Literal(
-                ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)),
-            ) => contiguous_scalar += &v,
-            Expr::Literal(x) => {
-                return internal_err!(
-                "The scalar {x} should be casted to string type during the type coercion."
-            )
-            }
-            // If the arg is not a literal, we should first push the current `contiguous_scalar`
-            // to the `new_args` (if it is not empty) and reset it to empty string.
-            // Then pushing this arg to the `new_args`.
-            arg => {
-                if !contiguous_scalar.is_empty() {
-                    new_args.push(lit(contiguous_scalar));
-                    contiguous_scalar = "".to_string();
-                }
-                new_args.push(arg);
-            }
-        }
-    }
-    if !contiguous_scalar.is_empty() {
-        new_args.push(lit(contiguous_scalar));
-    }
-
-    Ok(Expr::ScalarFunction(ScalarFunction::new(
-        BuiltinScalarFunction::Concat,
-        new_args,
-    )))
-}
-
-/// Simply the `concat_ws` function by
-/// 1. folding to `null` if the delimiter is null
-/// 2. filtering out `null` arguments
-/// 3. using `concat` to replace `concat_ws` if the delimiter is an empty string
-/// 4. concatenating contiguous literals if the delimiter is a literal.
-pub fn simpl_concat_ws(delimiter: &Expr, args: &[Expr]) -> Result<Expr> {
-    match delimiter {
-        Expr::Literal(
-            ScalarValue::Utf8(delimiter) | ScalarValue::LargeUtf8(delimiter),
-        ) => {
-            match delimiter {
-                // when the delimiter is an empty string,
-                // we can use `concat` to replace `concat_ws`
-                Some(delimiter) if delimiter.is_empty() => simpl_concat(args.to_vec()),
-                Some(delimiter) => {
-                    let mut new_args = Vec::with_capacity(args.len());
-                    new_args.push(lit(delimiter));
-                    let mut contiguous_scalar = None;
-                    for arg in args {
-                        match arg {
-                            // filter out null args
-                            Expr::Literal(ScalarValue::Utf8(None) | ScalarValue::LargeUtf8(None)) => {}
-                            Expr::Literal(ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v))) => {
-                                match contiguous_scalar {
-                                    None => contiguous_scalar = Some(v.to_string()),
-                                    Some(mut pre) => {
-                                        pre += delimiter;
-                                        pre += v;
-                                        contiguous_scalar = Some(pre)
-                                    }
-                                }
-                            }
-                            Expr::Literal(s) => return internal_err!("The scalar {s} should be casted to string type during the type coercion."),
-                            // If the arg is not a literal, we should first push the current `contiguous_scalar`
-                            // to the `new_args` and reset it to None.
-                            // Then pushing this arg to the `new_args`.
-                            arg => {
-                                if let Some(val) = contiguous_scalar {
-                                    new_args.push(lit(val));
-                                }
-                                new_args.push(arg.clone());
-                                contiguous_scalar = None;
-                            }
-                        }
-                    }
-                    if let Some(val) = contiguous_scalar {
-                        new_args.push(lit(val));
-                    }
-                    Ok(Expr::ScalarFunction(ScalarFunction::new(
-                        BuiltinScalarFunction::ConcatWithSeparator,
-                        new_args,
-                    )))
-                }
-                // if the delimiter is null, then the value of the whole expression is null.
-                None => Ok(Expr::Literal(ScalarValue::Utf8(None))),
-            }
-        }
-        Expr::Literal(d) => internal_err!(
-            "The scalar {d} should be casted to string type during the type coercion."
-        ),
-        d => Ok(concat_ws(
-            d.clone(),
-            args.iter()
-                .filter(|&x| !is_null(x))
-                .cloned()
-                .collect::<Vec<Expr>>(),
-        )),
-    }
-}
-
-#[cfg(test)]
-pub mod for_test {
-    use arrow::datatypes::DataType;
-    use datafusion_expr::{call_fn, lit, Cast, Expr};
-
-    pub fn now_expr() -> Expr {
-        call_fn("now", vec![]).unwrap()
-    }
-
-    pub fn cast_to_int64_expr(expr: Expr) -> Expr {
-        Expr::Cast(Cast::new(expr.into(), DataType::Int64))
-    }
-
-    pub fn to_timestamp_expr(arg: impl Into<String>) -> Expr {
-        call_fn("to_timestamp", vec![lit(arg.into())]).unwrap()
     }
 }

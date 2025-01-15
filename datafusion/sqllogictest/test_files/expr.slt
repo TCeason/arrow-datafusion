@@ -22,7 +22,7 @@ SELECT true, false, false = false, true = false
 true false true false
 
 # test_mathematical_expressions_with_null
-query RRRRRRRRRRRRRRRRRR?RRRRRRRIRRRRRRBB
+query RRRRRRRRRRRRRRRRRRRRRRRRIIIRRRRRRBB
 SELECT
     sqrt(NULL),
     cbrt(NULL),
@@ -63,7 +63,7 @@ SELECT
 NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL
 
 # test_array_cast_invalid_timezone_will_panic
-statement error Parser error: Invalid timezone "Foo": 'Foo' is not a valid timezone
+statement error Parser error: Invalid timezone "Foo": failed to parse timezone
 SELECT arrow_cast('2021-01-02T03:04:00', 'Timestamp(Nanosecond, Some("Foo"))')
 
 # test_array_index
@@ -107,7 +107,7 @@ SELECT
     STRUCT(true, false),
     STRUCT('str1', 'str2')
 ----
-{c0: 1, c1: 2, c2: 3, c3: 4, c4: 5} {c0: } {c0: 2} {c0: 1, c1: } {c0: true, c1: false} {c0: str1, c1: str2}
+{c0: 1, c1: 2, c2: 3, c3: 4, c4: 5} {c0: NULL} {c0: 2} {c0: 1, c1: NULL} {c0: true, c1: false} {c0: str1, c1: str2}
 
 # test binary_bitwise_shift
 query IIII
@@ -122,203 +122,197 @@ SELECT
 query ?
 SELECT interval '1'
 ----
-0 years 0 mons 0 days 0 hours 0 mins 1.000000000 secs
+1.000000000 secs
 
 query ?
 SELECT interval '1 second'
 ----
-0 years 0 mons 0 days 0 hours 0 mins 1.000000000 secs
+1.000000000 secs
 
 query ?
 SELECT interval '500 milliseconds'
 ----
-0 years 0 mons 0 days 0 hours 0 mins 0.500000000 secs
+0.500000000 secs
 
 query ?
 SELECT interval '5 second'
 ----
-0 years 0 mons 0 days 0 hours 0 mins 5.000000000 secs
+5.000000000 secs
 
 query ?
 SELECT interval '0.5 minute'
 ----
-0 years 0 mons 0 days 0 hours 0 mins 30.000000000 secs
+30.000000000 secs
 
 query ?
 SELECT interval '.5 minute'
 ----
-0 years 0 mons 0 days 0 hours 0 mins 30.000000000 secs
+30.000000000 secs
 
 query ?
 SELECT interval '5 minute'
 ----
-0 years 0 mons 0 days 0 hours 5 mins 0.000000000 secs
+5 mins
 
 query ?
 SELECT interval '5 minute 1 second'
 ----
-0 years 0 mons 0 days 0 hours 5 mins 1.000000000 secs
+5 mins 1.000000000 secs
 
 query ?
 SELECT interval '1 hour'
 ----
-0 years 0 mons 0 days 1 hours 0 mins 0.000000000 secs
+1 hours
 
 query ?
 SELECT interval '5 hour'
 ----
-0 years 0 mons 0 days 5 hours 0 mins 0.000000000 secs
+5 hours
 
 query ?
 SELECT interval '1 day'
 ----
-0 years 0 mons 1 days 0 hours 0 mins 0.000000000 secs
+1 days
 
 query ?
 SELECT interval '1 week'
 ----
-0 years 0 mons 7 days 0 hours 0 mins 0.000000000 secs
+7 days
 
 query ?
 SELECT interval '2 weeks'
 ----
-0 years 0 mons 14 days 0 hours 0 mins 0.000000000 secs
+14 days
 
 query ?
 SELECT interval '1 day 1'
 ----
-0 years 0 mons 1 days 0 hours 0 mins 1.000000000 secs
+1 days 1.000000000 secs
 
 query ?
 SELECT interval '0.5'
 ----
-0 years 0 mons 0 days 0 hours 0 mins 0.500000000 secs
+0.500000000 secs
 
 query ?
 SELECT interval '0.5 day 1'
 ----
-0 years 0 mons 0 days 12 hours 0 mins 1.000000000 secs
+12 hours 1.000000000 secs
 
 query ?
 SELECT interval '0.49 day'
 ----
-0 years 0 mons 0 days 11 hours 45 mins 36.000000000 secs
+11 hours 45 mins 36.000000000 secs
 
 query ?
 SELECT interval '0.499 day'
 ----
-0 years 0 mons 0 days 11 hours 58 mins 33.600000000 secs
+11 hours 58 mins 33.600000000 secs
 
 query ?
 SELECT interval '0.4999 day'
 ----
-0 years 0 mons 0 days 11 hours 59 mins 51.360000000 secs
+11 hours 59 mins 51.360000000 secs
 
 query ?
 SELECT interval '0.49999 day'
 ----
-0 years 0 mons 0 days 11 hours 59 mins 59.136000000 secs
+11 hours 59 mins 59.136000000 secs
 
 query ?
 SELECT interval '0.49999999999 day'
 ----
-0 years 0 mons 0 days 11 hours 59 mins 59.999999136 secs
+11 hours 59 mins 59.999999136 secs
 
 query ?
 SELECT interval '5 day'
 ----
-0 years 0 mons 5 days 0 hours 0 mins 0.000000000 secs
-
-# Hour is ignored, this matches PostgreSQL
-query ?
-SELECT interval '5 day' hour
-----
-0 years 0 mons 5 days 0 hours 0 mins 0.000000000 secs
+5 days
 
 query ?
 SELECT interval '5 day 4 hours 3 minutes 2 seconds 100 milliseconds'
 ----
-0 years 0 mons 5 days 4 hours 3 mins 2.100000000 secs
+5 days 4 hours 3 mins 2.100000000 secs
 
 query ?
 SELECT interval '0.5 month'
 ----
-0 years 0 mons 15 days 0 hours 0 mins 0.000000000 secs
+15 days
 
 query ?
 SELECT interval '0.5' month
 ----
-0 years 0 mons 15 days 0 hours 0 mins 0.000000000 secs
+15 days
 
 query ?
 SELECT interval '1 month'
 ----
-0 years 1 mons 0 days 0 hours 0 mins 0.000000000 secs
+1 mons
 
 query ?
 SELECT interval '1' MONTH
 ----
-0 years 1 mons 0 days 0 hours 0 mins 0.000000000 secs
+1 mons
 
 query ?
 SELECT interval '5 month'
 ----
-0 years 5 mons 0 days 0 hours 0 mins 0.000000000 secs
+5 mons
 
 query ?
 SELECT interval '13 month'
 ----
-0 years 13 mons 0 days 0 hours 0 mins 0.000000000 secs
+13 mons
 
 query ?
 SELECT interval '0.5 year'
 ----
-0 years 6 mons 0 days 0 hours 0 mins 0.000000000 secs
+6 mons
 
 query ?
 SELECT interval '1 year'
 ----
-0 years 12 mons 0 days 0 hours 0 mins 0.000000000 secs
+12 mons
 
 query ?
 SELECT interval '1 decade'
 ----
-0 years 120 mons 0 days 0 hours 0 mins 0.000000000 secs
+120 mons
 
 query ?
 SELECT interval '2 decades'
 ----
-0 years 240 mons 0 days 0 hours 0 mins 0.000000000 secs
+240 mons
 
 query ?
 SELECT interval '1 century'
 ----
-0 years 1200 mons 0 days 0 hours 0 mins 0.000000000 secs
+1200 mons
 
 query ?
 SELECT interval '2 year'
 ----
-0 years 24 mons 0 days 0 hours 0 mins 0.000000000 secs
+24 mons
 
 query ?
 SELECT interval '1 year 1 day'
 ----
-0 years 12 mons 1 days 0 hours 0 mins 0.000000000 secs
+12 mons 1 days
 
 query ?
 SELECT interval '1 year 1 day 1 hour'
 ----
-0 years 12 mons 1 days 1 hours 0 mins 0.000000000 secs
+12 mons 1 days 1 hours
 
 query ?
 SELECT interval '1 year 1 day 1 hour 1 minute'
 ----
-0 years 12 mons 1 days 1 hours 1 mins 0.000000000 secs
+12 mons 1 days 1 hours 1 mins
 
 query ?
 SELECT interval '1 year 1 day 1 hour 1 minute 1 second'
 ----
-0 years 12 mons 1 days 1 hours 1 mins 1.000000000 secs
+12 mons 1 days 1 hours 1 mins 1.000000000 secs
 
 query I
 SELECT ascii('')
@@ -336,6 +330,21 @@ SELECT ascii(NULL)
 NULL
 
 query I
+SELECT ascii('ésoj')
+----
+233
+
+query I
+SELECT ascii('💯')
+----
+128175
+
+query I
+SELECT ascii('💯a')
+----
+128175
+
+query I
 SELECT bit_length('')
 ----
 0
@@ -350,10 +359,15 @@ SELECT bit_length('josé')
 ----
 40
 
-query ?
+query I
 SELECT bit_length(NULL)
 ----
 NULL
+
+query I
+SELECT bit_length(arrow_cast('jonathan', 'Utf8View'));
+----
+64
 
 query T
 SELECT btrim(' xyxtrimyyx ', NULL)
@@ -380,7 +394,7 @@ SELECT btrim('\nxyxtrimyyx\n', 'xyz\n')
 ----
 trim
 
-query ?
+query T
 SELECT btrim(NULL, 'xyz')
 ----
 NULL
@@ -399,6 +413,12 @@ query T
 SELECT chr(CAST(NULL AS int))
 ----
 NULL
+
+statement error DataFusion error: Execution error: null character not permitted.
+SELECT chr(CAST(0 AS int))
+
+statement error DataFusion error: Execution error: requested character too large for encoding.
+SELECT chr(CAST(9223372036854775807 AS bigint))
 
 query T
 SELECT concat('a','b','c')
@@ -455,7 +475,7 @@ SELECT initcap('hi THOMAS')
 ----
 Hi Thomas
 
-query ?
+query T
 SELECT initcap(NULL)
 ----
 NULL
@@ -470,7 +490,7 @@ SELECT lower('TOM')
 ----
 tom
 
-query ?
+query T
 SELECT lower(NULL)
 ----
 NULL
@@ -490,7 +510,7 @@ SELECT ltrim('zzzytest', 'xyz')
 ----
 test
 
-query ?
+query T
 SELECT ltrim(NULL, 'xyz')
 ----
 NULL
@@ -510,7 +530,7 @@ SELECT octet_length('josé')
 ----
 5
 
-query ?
+query I
 SELECT octet_length(NULL)
 ----
 NULL
@@ -521,14 +541,27 @@ SELECT repeat('Pg', 4)
 PgPgPgPg
 
 query T
+SELECT repeat('Pg', -1)
+----
+(empty)
+
+query T
 SELECT repeat('Pg', CAST(NULL AS INT))
 ----
 NULL
 
-query ?
+query T
 SELECT repeat(NULL, 4)
 ----
 NULL
+
+query T
+select repeat('-1.2', arrow_cast(3, 'Int32'));
+----
+-1.2-1.2-1.2
+
+query error DataFusion error: Error during planning: Internal error: Expect TypeSignatureClass::Native\(LogicalType\(Native\(Int64\), Int64\)\) but received Float64
+select repeat('-1.2', 3.2);
 
 query T
 SELECT replace('abcdefabcdef', 'cd', 'XX')
@@ -550,7 +583,7 @@ SELECT replace('abcdefabcdef', NULL, 'XX')
 ----
 NULL
 
-query ?
+query T
 SELECT replace(NULL, 'cd', 'XX')
 ----
 NULL
@@ -570,7 +603,7 @@ SELECT rtrim('testxxzx', 'xyz')
 ----
 test
 
-query ?
+query T
 SELECT rtrim(NULL, 'xyz')
 ----
 NULL
@@ -585,7 +618,7 @@ SELECT split_part('abc~@~def~@~ghi', '~@~', 20)
 ----
 (empty)
 
-query ?
+query T
 SELECT split_part(NULL, '~@~', 20)
 ----
 NULL
@@ -599,6 +632,19 @@ query T
 SELECT split_part('abc~@~def~@~ghi', '~@~', CAST(NULL AS INT))
 ----
 NULL
+
+query T
+SELECT split_part('abc~@~def~@~ghi', '~@~', -1)
+----
+ghi
+
+query T
+SELECT split_part('abc~@~def~@~ghi', '~@~', -100)
+----
+(empty)
+
+statement error DataFusion error: Execution error: field position must not be zero
+SELECT split_part('abc~@~def~@~ghi', '~@~', 0)
 
 query B
 SELECT starts_with('alphabet', 'alph')
@@ -664,6 +710,14 @@ query T
 SELECT trim(TRAILING ' ' FROM ' tom ')
 ----
  tom
+
+query T
+SELECT trim('test.com', '.com')
+----
+test
+
+statement error
+SELECT trim(BOTH 'tom' FROM 'tommy', 'my')
 
 query T
 SELECT trim(BOTH ' ' FROM ' tom ')
@@ -741,12 +795,12 @@ SELECT upper('tom')
 ----
 TOM
 
-query ?
+query T
 SELECT upper(NULL)
 ----
 NULL
 
-# TODO issue: https://github.com/apache/arrow-datafusion/issues/6596
+# TODO issue: https://github.com/apache/datafusion/issues/6596
 # query ??
 #SELECT
 #    CAST([1,2,3,4] AS INT[]) as a,
@@ -777,278 +831,6 @@ SELECT
     TRY_CAST('x' AS INT) as d
 ----
 0 NULL 0 NULL
-
-# test_extract_date_part
-
-query R
-SELECT date_part('YEAR', CAST('2000-01-01' AS DATE))
-----
-2000
-
-query R
-SELECT EXTRACT(year FROM  timestamp '2020-09-08T12:00:00+00:00')
-----
-2020
-
-query R
-SELECT date_part('QUARTER', CAST('2000-01-01' AS DATE))
-----
-1
-
-query R
-SELECT EXTRACT(quarter FROM to_timestamp('2020-09-08T12:00:00+00:00'))
-----
-3
-
-query R
-SELECT date_part('MONTH', CAST('2000-01-01' AS DATE))
-----
-1
-
-query R
-SELECT EXTRACT(month FROM to_timestamp('2020-09-08T12:00:00+00:00'))
-----
-9
-
-query R
-SELECT date_part('WEEK', CAST('2003-01-01' AS DATE))
-----
-1
-
-query R
-SELECT EXTRACT(WEEK FROM to_timestamp('2020-09-08T12:00:00+00:00'))
-----
-37
-
-query R
-SELECT date_part('DAY', CAST('2000-01-01' AS DATE))
-----
-1
-
-query R
-SELECT EXTRACT(day FROM to_timestamp('2020-09-08T12:00:00+00:00'))
-----
-8
-
-query R
-SELECT date_part('DOY', CAST('2000-01-01' AS DATE))
-----
-1
-
-query R
-SELECT EXTRACT(doy FROM to_timestamp('2020-09-08T12:00:00+00:00'))
-----
-252
-
-query R
-SELECT date_part('DOW', CAST('2000-01-01' AS DATE))
-----
-6
-
-query R
-SELECT EXTRACT(dow FROM to_timestamp('2020-09-08T12:00:00+00:00'))
-----
-2
-
-query R
-SELECT date_part('HOUR', CAST('2000-01-01' AS DATE))
-----
-0
-
-query R
-SELECT EXTRACT(hour FROM to_timestamp('2020-09-08T12:03:03+00:00'))
-----
-12
-
-query R
-SELECT EXTRACT(minute FROM to_timestamp('2020-09-08T12:12:00+00:00'))
-----
-12
-
-query R
-SELECT date_part('minute', to_timestamp('2020-09-08T12:12:00+00:00'))
-----
-12
-
-query R
-SELECT EXTRACT(second FROM timestamp '2020-09-08T12:00:12.12345678+00:00')
-----
-12.12345678
-
-query R
-SELECT EXTRACT(millisecond FROM timestamp '2020-09-08T12:00:12.12345678+00:00')
-----
-12123.45678
-
-query R
-SELECT EXTRACT(microsecond FROM timestamp '2020-09-08T12:00:12.12345678+00:00')
-----
-12123456.78
-
-query R
-SELECT EXTRACT(nanosecond FROM timestamp '2020-09-08T12:00:12.12345678+00:00')
-----
-12123456780
-
-# Keep precision when coercing Utf8 to Timestamp
-query R
-SELECT date_part('second', timestamp '2020-09-08T12:00:12.12345678+00:00')
-----
-12.12345678
-
-query R
-SELECT date_part('millisecond', timestamp '2020-09-08T12:00:12.12345678+00:00')
-----
-12123.45678
-
-query R
-SELECT date_part('microsecond', timestamp '2020-09-08T12:00:12.12345678+00:00')
-----
-12123456.78
-
-query R
-SELECT date_part('nanosecond', timestamp '2020-09-08T12:00:12.12345678+00:00')
-----
-12123456780
-
-query R
-SELECT date_part('second', '2020-09-08T12:00:12.12345678+00:00')
-----
-12.12345678
-
-query R
-SELECT date_part('millisecond', '2020-09-08T12:00:12.12345678+00:00')
-----
-12123.45678
-
-query R
-SELECT date_part('microsecond', '2020-09-08T12:00:12.12345678+00:00')
-----
-12123456.78
-
-query R
-SELECT date_part('nanosecond', '2020-09-08T12:00:12.12345678+00:00')
-----
-12123456780
-
-# test_extract_epoch
-
-query R
-SELECT extract(epoch from '1870-01-01T07:29:10.256'::timestamp)
-----
--3155646649.744
-
-query R
-SELECT extract(epoch from '2000-01-01T00:00:00.000'::timestamp)
-----
-946684800
-
-query R
-SELECT extract(epoch from to_timestamp('2000-01-01T00:00:00+00:00'))
-----
-946684800
-
-query R
-SELECT extract(epoch from NULL::timestamp)
-----
-NULL
-
-query R
-SELECT extract(epoch from arrow_cast('1970-01-01', 'Date32'))
-----
-0
-
-query R
-SELECT extract(epoch from arrow_cast('1970-01-02', 'Date32'))
-----
-86400
-
-query R
-SELECT extract(epoch from arrow_cast('1970-01-11', 'Date32'))
-----
-864000
-
-query R
-SELECT extract(epoch from arrow_cast('1969-12-31', 'Date32'))
-----
--86400
-
-query R
-SELECT extract(epoch from arrow_cast('1970-01-01', 'Date64'))
-----
-0
-
-query R
-SELECT extract(epoch from arrow_cast('1970-01-02', 'Date64'))
-----
-86400
-
-query R
-SELECT extract(epoch from arrow_cast('1970-01-11', 'Date64'))
-----
-864000
-
-query R
-SELECT extract(epoch from arrow_cast('1969-12-31', 'Date64'))
-----
--86400
-
-# test_extract_date_part_func
-
-query B
-SELECT (date_part('year', now()) = EXTRACT(year FROM now()))
-----
-true
-
-query B
-SELECT (date_part('quarter', now()) = EXTRACT(quarter FROM now()))
-----
-true
-
-query B
-SELECT (date_part('month', now()) = EXTRACT(month FROM now()))
-----
-true
-
-query B
-SELECT (date_part('week', now()) = EXTRACT(week FROM now()))
-----
-true
-
-query B
-SELECT (date_part('day', now()) = EXTRACT(day FROM now()))
-----
-true
-
-query B
-SELECT (date_part('hour', now()) = EXTRACT(hour FROM now()))
-----
-true
-
-query B
-SELECT (date_part('minute', now()) = EXTRACT(minute FROM now()))
-----
-true
-
-query B
-SELECT (date_part('second', now()) = EXTRACT(second FROM now()))
-----
-true
-
-query B
-SELECT (date_part('millisecond', now()) = EXTRACT(millisecond FROM now()))
-----
-true
-
-query B
-SELECT (date_part('microsecond', now()) = EXTRACT(microsecond FROM now()))
-----
-true
-
-query B
-SELECT (date_part('nanosecond', now()) = EXTRACT(nanosecond FROM now()))
-----
-true
 
 query B
 SELECT 'a' IN ('a','b')
@@ -1330,7 +1112,7 @@ SELECT arrow_cast(decode(arrow_cast('746f6d', 'LargeBinary'),'hex'), 'Utf8');
 ----
 tom
 
-query ?
+query T
 SELECT encode(NULL,'base64');
 ----
 NULL
@@ -1340,7 +1122,7 @@ SELECT decode(NULL,'base64');
 ----
 NULL
 
-query ?
+query T
 SELECT encode(NULL,'hex');
 ----
 NULL
@@ -1385,7 +1167,7 @@ SELECT md5('');
 ----
 d41d8cd98f00b204e9800998ecf8427e
 
-query ?
+query T
 SELECT md5(NULL);
 ----
 NULL
@@ -1555,6 +1337,22 @@ SELECT digest('','blake3');
 ----
 af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262
 
+# vverify utf8view
+query ?
+SELECT sha224(arrow_cast('tom', 'Utf8View'));
+----
+0bf6cb62649c42a9ae3876ab6f6d92ad36cb5414e495f8873292be4d
+
+query T
+SELECT substring('alphabet', 1)
+----
+alphabet
+
+query T
+SELECT substring('alphabet', 3, 2)
+----
+ph
+
 query T
 SELECT substring('alphabet' from 2 for 1);
 ----
@@ -1570,95 +1368,22 @@ SELECT substring('alphabet' for 1);
 ----
 a
 
-query T
-SELECT regexp_replace('ABCabcABC', '(abc)', 'X', 'gi');
-----
-XXX
+# The 'from' and 'for' parameters don't support string types, because they should be treated as
+# regular expressions, which we have not implemented yet.
+query error
+SELECT substring('alphabet' FROM '3')
 
-query T
-SELECT regexp_replace('ABCabcABC', '(abc)', 'X', 'i');
-----
-XabcABC
+query error
+SELECT substring('alphabet' FROM '3' FOR '2')
 
-query T
-SELECT regexp_replace('foobarbaz', 'b..', 'X', 'g');
-----
-fooXX
+query error
+SELECT substring('alphabet' FROM '3' FOR 2)
 
-query T
-SELECT regexp_replace('foobarbaz', 'b..', 'X');
-----
-fooXbaz
+query error
+SELECT substring('alphabet' FROM 3 FOR '2')
 
-query T
-SELECT regexp_replace('foobarbaz', 'b(..)', 'X\\1Y', 'g');
-----
-fooXarYXazY
-
-query T
-SELECT regexp_replace('foobarbaz', 'b(..)', 'X\\1Y', NULL);
-----
-NULL
-
-query T
-SELECT regexp_replace('foobarbaz', 'b(..)', NULL, 'g');
-----
-NULL
-
-query T
-SELECT regexp_replace('foobarbaz', NULL, 'X\\1Y', 'g');
-----
-NULL
-
-query T
-SELECT regexp_replace('Thomas', '.[mN]a.', 'M');
-----
-ThM
-
-query ?
-SELECT regexp_replace(NULL, 'b(..)', 'X\\1Y', 'g');
-----
-NULL
-
-query ?
-SELECT regexp_match('foobarbequebaz', '');
-----
-[]
-
-query ?
-SELECT regexp_match('foobarbequebaz', '(bar)(beque)');
-----
-[bar, beque]
-
-query ?
-SELECT regexp_match('foobarbequebaz', '(ba3r)(bequ34e)');
-----
-NULL
-
-query ?
-SELECT regexp_match('aaa-0', '.*-(\d)');
-----
-[0]
-
-query ?
-SELECT regexp_match('bb-1', '.*-(\d)');
-----
-[1]
-
-query ?
-SELECT regexp_match('aa', '.*-(\d)');
-----
-NULL
-
-query ?
-SELECT regexp_match(NULL, '.*-(\d)');
-----
-NULL
-
-query ?
-SELECT regexp_match('aaa-0', NULL);
-----
-NULL
+query error
+SELECT substring('alphabet' FOR '2')
 
 ##### csv_query_nullif_divide_by_0
 
@@ -1680,8 +1405,8 @@ CREATE EXTERNAL TABLE aggregate_test_100_by_sql (
   c13 VARCHAR NOT NULL
 )
 STORED AS CSV
-WITH HEADER ROW
 LOCATION '../../testing/data/csv/aggregate_test_100.csv'
+OPTIONS ('format.has_header' 'true');
 
 
 
@@ -1974,7 +1699,7 @@ CREATE TABLE t_source(
     column1 String,
     column2 String,
     column3 String,
-    column4 String,
+    column4 String
 ) AS VALUES
 ('one', 'one', 'one', 'one'),
 ('two', 'two', '', 'two'),
@@ -2000,3 +1725,258 @@ false true false true
 NULL NULL NULL NULL
 false false true true
 false false true false
+
+
+#############
+## Common Subexpr Eliminate Tests
+#############
+
+statement ok
+CREATE TABLE doubles (
+    f64 DOUBLE
+) as VALUES
+  (10.1)
+;
+
+# common subexpr with alias
+query RRR rowsort
+select f64, round(1.0 / f64) as i64_1, acos(round(1.0 / f64)) from doubles;
+----
+10.1 0 1.570796326795
+
+# common subexpr with coalesce (short-circuited)
+query RRR
+select f64, coalesce(1.0 / f64, 0.0), acos(coalesce(1.0 / f64, 0.0)) from doubles;
+----
+10.1 0.09900990099 1.471623942989
+
+# common subexpr with coalesce (short-circuited) and alias
+query RRR
+select f64, coalesce(1.0 / f64, 0.0) as f64_1, acos(coalesce(1.0 / f64, 0.0)) from doubles;
+----
+10.1 0.09900990099 1.471623942989
+
+# common subexpr with case (short-circuited)
+query RRR rowsort
+select f64, case when f64 > 0 then 1.0 / f64 else null end, acos(case when f64 > 0 then 1.0 / f64 else null end) from doubles;
+----
+10.1 0.09900990099 1.471623942989
+
+
+statement ok
+CREATE TABLE t1(
+    time TIMESTAMP,
+    load1 DOUBLE,
+    load2 DOUBLE,
+    host VARCHAR
+) AS VALUES
+  (to_timestamp_nanos(1527018806000000000), 1.1, 101, 'host1'),
+  (to_timestamp_nanos(1527018806000000000), 2.2, 202, 'host2'),
+  (to_timestamp_nanos(1527018806000000000), 3.3, 303, 'host3'),
+  (to_timestamp_nanos(1527018806000000000), 1.1, 101, NULL)
+;
+
+# struct scalar function with columns
+query ?
+select struct(time,load1,load2,host) from t1;
+----
+{c0: 2018-05-22T19:53:26, c1: 1.1, c2: 101.0, c3: host1}
+{c0: 2018-05-22T19:53:26, c1: 2.2, c2: 202.0, c3: host2}
+{c0: 2018-05-22T19:53:26, c1: 3.3, c2: 303.0, c3: host3}
+{c0: 2018-05-22T19:53:26, c1: 1.1, c2: 101.0, c3: NULL}
+
+# can have an aggregate function with an inner coalesce
+query TR
+select t2."struct(t1.time,t1.load1,t1.load2,t1.host)"['c3'] as host, sum(coalesce(t2."struct(t1.time,t1.load1,t1.load2,t1.host)")['c1']) from (select struct(time,load1,load2,host) from t1) t2 where t2."struct(t1.time,t1.load1,t1.load2,t1.host)"['c3'] IS NOT NULL group by t2."struct(t1.time,t1.load1,t1.load2,t1.host)"['c3'] order by host;
+----
+host1 1.1
+host2 2.2
+host3 3.3
+
+# can have an aggregate function with an inner CASE WHEN
+query TR
+select 
+    t2.server_host as host, 
+    sum((
+        case when t2.server_host is not null 
+        then t2.server_load2
+        end
+    )) 
+    from (
+        select 
+            struct(time,load1,load2,host)['c2'] as server_load2,
+            struct(time,load1,load2,host)['c3'] as server_host
+        from t1
+    ) t2 
+    where server_host IS NOT NULL 
+    group by server_host order by host;
+----
+host1 101
+host2 202
+host3 303
+
+# TODO: Issue tracked in https://github.com/apache/datafusion/issues/10364
+query TR
+select 
+    t2.server['c3'] as host, 
+    sum((
+        case when t2.server['c3'] is not null 
+        then t2.server['c2']
+        end
+    )) 
+    from (
+        select 
+            struct(time,load1,load2,host) as server
+        from t1
+    ) t2 
+    where t2.server['c3'] IS NOT NULL 
+    group by t2.server['c3'] order by host;
+----
+host1 101
+host2 202
+host3 303
+
+# can have 2 projections with aggr(short_circuited), with different short-circuited expr
+query TRR
+select 
+    t2.server_host as host, 
+    sum(coalesce(server_load1)),
+    sum((
+        case when t2.server_host is not null 
+        then t2.server_load2
+        end
+    )) 
+    from (
+        select 
+            struct(time,load1,load2,host)['c1'] as server_load1,
+            struct(time,load1,load2,host)['c2'] as server_load2,
+            struct(time,load1,load2,host)['c3'] as server_host
+        from t1
+    ) t2 
+    where server_host IS NOT NULL 
+    group by server_host order by host;
+----
+host1 1.1 101
+host2 2.2 202
+host3 3.3 303
+
+# TODO: Issue tracked in https://github.com/apache/datafusion/issues/10364
+query error
+select 
+    t2.server['c3'] as host, 
+    sum(coalesce(server['c1'])),
+    sum((
+        case when t2.server['c3'] is not null 
+        then t2.server['c2']
+        end
+    )) 
+    from (
+        select 
+            struct(time,load1,load2,host) as server,
+        from t1
+    ) t2 
+    where server_host IS NOT NULL 
+    group by server_host order by host;
+
+query TRR
+select 
+    t2.server_host as host, 
+    sum((
+        case when t2.server_host is not null 
+        then server_load1 
+        end
+    )), 
+    sum((
+        case when server_host is not null 
+        then server_load2 
+        end
+    )) 
+    from (
+        select 
+            struct(time,load1,load2,host)['c1'] as server_load1,
+            struct(time,load1,load2,host)['c2'] as server_load2,
+            struct(time,load1,load2,host)['c3'] as server_host
+        from t1
+    ) t2 
+    where server_host IS NOT NULL 
+    group by server_host order by host;
+----
+host1 1.1 101
+host2 2.2 202
+host3 3.3 303
+
+# TODO: Issue tracked in https://github.com/apache/datafusion/issues/10364
+query TRR
+select 
+    t2.server['c3'] as host, 
+    sum((
+        case when t2.server['c3'] is not null 
+        then t2.server['c1']
+        end
+    )), 
+    sum((
+        case when t2.server['c3'] is not null 
+        then t2.server['c2']
+        end
+    )) 
+    from (
+        select 
+            struct(time,load1,load2,host) as server 
+        from t1
+    ) t2 
+    where t2.server['c3'] IS NOT NULL 
+    group by t2.server['c3'] order by host;
+----
+host1 1.1 101
+host2 2.2 202
+host3 3.3 303
+
+# can have 2 projections with aggr(short_circuited), with the same short-circuited expr (e.g. coalesce)
+query TRR
+select t2."struct(t1.time,t1.load1,t1.load2,t1.host)"['c3'] as host, sum(coalesce(t2."struct(t1.time,t1.load1,t1.load2,t1.host)")['c1']), sum(coalesce(t2."struct(t1.time,t1.load1,t1.load2,t1.host)")['c2']) from (select struct(time,load1,load2,host) from t1) t2 where t2."struct(t1.time,t1.load1,t1.load2,t1.host)"['c3'] IS NOT NULL group by t2."struct(t1.time,t1.load1,t1.load2,t1.host)"['c3'] order by host;
+----
+host1 1.1 101
+host2 2.2 202
+host3 3.3 303
+
+statement ok
+set datafusion.sql_parser.dialect = 'Postgres';
+
+statement ok
+create table t (a float) as values (1), (2), (3);
+
+query TT
+explain select min(a) filter (where a > 1) as x from t;
+----
+logical_plan
+01)Projection: min(t.a) FILTER (WHERE t.a > Int64(1)) AS x
+02)--Aggregate: groupBy=[[]], aggr=[[min(t.a) FILTER (WHERE t.a > Float32(1)) AS min(t.a) FILTER (WHERE t.a > Int64(1))]]
+03)----TableScan: t projection=[a]
+physical_plan
+01)ProjectionExec: expr=[min(t.a) FILTER (WHERE t.a > Int64(1))@0 as x]
+02)--AggregateExec: mode=Single, gby=[], aggr=[min(t.a) FILTER (WHERE t.a > Int64(1))]
+03)----MemoryExec: partitions=1, partition_sizes=[1]
+
+
+statement ok
+drop table t;
+
+statement ok
+set datafusion.sql_parser.dialect = 'Generic';
+
+# test between expression with null
+query I
+select 1 where null between null and null;
+----
+
+query T
+select 'A' where null between null and null;
+----
+
+query I
+select 1 where null between null and 2;
+----
+
+query T
+select 'A' where null between 2 and null;
+---

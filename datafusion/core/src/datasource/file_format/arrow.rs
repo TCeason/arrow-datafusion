@@ -21,42 +21,46 @@
 
 use std::any::Any;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fmt::{self, Debug};
 use std::sync::Arc;
 
+use super::file_compression_type::FileCompressionType;
+use super::write::demux::DemuxedStreamReceiver;
+use super::write::{create_writer, SharedBuffer};
+use super::FileFormatFactory;
+use crate::datasource::file_format::write::get_writer_schema;
 use crate::datasource::file_format::FileFormat;
 use crate::datasource::physical_plan::{
-    ArrowExec, FileGroupDisplay, FileScanConfig, FileSinkConfig,
+    ArrowExec, FileGroupDisplay, FileScanConfig, FileSink, FileSinkConfig,
 };
 use crate::error::Result;
 use crate::execution::context::SessionState;
-use crate::physical_plan::ExecutionPlan;
+use crate::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
 
 use arrow::ipc::convert::fb_to_schema;
 use arrow::ipc::reader::FileReader;
-use arrow::ipc::root_as_message;
-use arrow_ipc::writer::IpcWriteOptions;
-use arrow_ipc::CompressionType;
+use arrow::ipc::writer::IpcWriteOptions;
+use arrow::ipc::{root_as_message, CompressionType};
 use arrow_schema::{ArrowError, Schema, SchemaRef};
-
-use bytes::Bytes;
-use datafusion_common::{not_impl_err, DataFusionError, FileType, Statistics};
+use datafusion_common::parsers::CompressionTypeVariant;
+use datafusion_common::{
+    not_impl_err, DataFusionError, GetExt, Statistics, DEFAULT_ARROW_EXTENSION,
+};
+use datafusion_common_runtime::SpawnedTask;
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
-use datafusion_physical_expr::{PhysicalExpr, PhysicalSortRequirement};
+use datafusion_expr::dml::InsertOp;
+use datafusion_physical_expr::PhysicalExpr;
+use datafusion_physical_plan::insert::{DataSink, DataSinkExec};
 
-use crate::physical_plan::{DisplayAs, DisplayFormatType};
 use async_trait::async_trait;
-use datafusion_physical_plan::insert::{DataSink, FileSinkExec};
-use datafusion_physical_plan::metrics::MetricsSet;
+use bytes::Bytes;
+use datafusion_physical_expr_common::sort_expr::LexRequirement;
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use object_store::{GetResultPayload, ObjectMeta, ObjectStore};
 use tokio::io::AsyncWriteExt;
 use tokio::task::JoinSet;
-
-use super::file_compression_type::FileCompressionType;
-use super::write::demux::start_demuxer_task;
-use super::write::{create_writer, SharedBuffer};
 
 /// Initial writing buffer size. Note this is just a size hint for efficiency. It
 /// will grow beyond the set value if needed.
@@ -64,6 +68,42 @@ const INITIAL_BUFFER_BYTES: usize = 1048576;
 
 /// If the buffered Arrow data exceeds this size, it is flushed to object store
 const BUFFER_FLUSH_BYTES: usize = 1024000;
+
+#[derive(Default, Debug)]
+/// Factory struct used to create [ArrowFormat]
+pub struct ArrowFormatFactory;
+
+impl ArrowFormatFactory {
+    /// Creates an instance of [ArrowFormatFactory]
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+impl FileFormatFactory for ArrowFormatFactory {
+    fn create(
+        &self,
+        _state: &SessionState,
+        _format_options: &HashMap<String, String>,
+    ) -> Result<Arc<dyn FileFormat>> {
+        Ok(Arc::new(ArrowFormat))
+    }
+
+    fn default(&self) -> Arc<dyn FileFormat> {
+        Arc::new(ArrowFormat)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+impl GetExt for ArrowFormatFactory {
+    fn get_ext(&self) -> String {
+        // Removes the dot, i.e. ".parquet" -> "parquet"
+        DEFAULT_ARROW_EXTENSION[1..].to_string()
+    }
+}
 
 /// Arrow `FileFormat` implementation.
 #[derive(Default, Debug)]
@@ -73,6 +113,23 @@ pub struct ArrowFormat;
 impl FileFormat for ArrowFormat {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn get_ext(&self) -> String {
+        ArrowFormatFactory::new().get_ext()
+    }
+
+    fn get_ext_with_compression(
+        &self,
+        file_compression_type: &FileCompressionType,
+    ) -> Result<String> {
+        let ext = self.get_ext();
+        match file_compression_type.get_variant() {
+            CompressionTypeVariant::UNCOMPRESSED => Ok(ext),
+            _ => Err(DataFusionError::Internal(
+                "Arrow FileFormat does not support compression.".into(),
+            )),
+        }
     }
 
     async fn infer_schema(
@@ -124,29 +181,19 @@ impl FileFormat for ArrowFormat {
         input: Arc<dyn ExecutionPlan>,
         _state: &SessionState,
         conf: FileSinkConfig,
-        order_requirements: Option<Vec<PhysicalSortRequirement>>,
+        order_requirements: Option<LexRequirement>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        if conf.overwrite {
+        if conf.insert_op != InsertOp::Append {
             return not_impl_err!("Overwrites are not implemented yet for Arrow format");
         }
 
-        let sink_schema = conf.output_schema().clone();
         let sink = Arc::new(ArrowFileSink::new(conf));
 
-        Ok(Arc::new(FileSinkExec::new(
-            input,
-            sink,
-            sink_schema,
-            order_requirements,
-        )) as _)
-    }
-
-    fn file_type(&self) -> FileType {
-        FileType::ARROW
+        Ok(Arc::new(DataSinkExec::new(input, sink, order_requirements)) as _)
     }
 }
 
-/// Implements [`DataSink`] for writing to arrow_ipc files
+/// Implements [`FileSink`] for writing to arrow_ipc files
 struct ArrowFileSink {
     config: FileSinkConfig,
 }
@@ -155,89 +202,21 @@ impl ArrowFileSink {
     fn new(config: FileSinkConfig) -> Self {
         Self { config }
     }
-
-    /// Converts table schema to writer schema, which may differ in the case
-    /// of hive style partitioning where some columns are removed from the
-    /// underlying files.
-    fn get_writer_schema(&self) -> Arc<Schema> {
-        if !self.config.table_partition_cols.is_empty() {
-            let schema = self.config.output_schema();
-            let partition_names: Vec<_> = self
-                .config
-                .table_partition_cols
-                .iter()
-                .map(|(s, _)| s)
-                .collect();
-            Arc::new(Schema::new(
-                schema
-                    .fields()
-                    .iter()
-                    .filter(|f| !partition_names.contains(&f.name()))
-                    .map(|f| (**f).clone())
-                    .collect::<Vec<_>>(),
-            ))
-        } else {
-            self.config.output_schema().clone()
-        }
-    }
-}
-
-impl Debug for ArrowFileSink {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ArrowFileSink").finish()
-    }
-}
-
-impl DisplayAs for ArrowFileSink {
-    fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "ArrowFileSink(file_groups=",)?;
-                FileGroupDisplay(&self.config.file_groups).fmt_as(t, f)?;
-                write!(f, ")")
-            }
-        }
-    }
 }
 
 #[async_trait]
-impl DataSink for ArrowFileSink {
-    fn as_any(&self) -> &dyn Any {
-        self
+impl FileSink for ArrowFileSink {
+    fn config(&self) -> &FileSinkConfig {
+        &self.config
     }
 
-    fn metrics(&self) -> Option<MetricsSet> {
-        None
-    }
-
-    async fn write_all(
+    async fn spawn_writer_tasks_and_join(
         &self,
-        data: SendableRecordBatchStream,
-        context: &Arc<TaskContext>,
+        _context: &Arc<TaskContext>,
+        demux_task: SpawnedTask<Result<()>>,
+        mut file_stream_rx: DemuxedStreamReceiver,
+        object_store: Arc<dyn ObjectStore>,
     ) -> Result<u64> {
-        // No props are supported yet, but can be by updating FileTypeWriterOptions
-        // to populate this struct and use those options to initialize the arrow_ipc::writer::FileWriter
-        // https://github.com/apache/arrow-datafusion/issues/8635
-        let _arrow_props = self.config.file_type_writer_options.try_into_arrow()?;
-
-        let object_store = context
-            .runtime_env()
-            .object_store(&self.config.object_store_url)?;
-
-        let part_col = if !self.config.table_partition_cols.is_empty() {
-            Some(self.config.table_partition_cols.clone())
-        } else {
-            None
-        };
-
-        let (demux_task, mut file_stream_rx) = start_demuxer_task(
-            data,
-            context,
-            part_col,
-            self.config.table_paths[0].clone(),
-            "arrow".into(),
-        );
-
         let mut file_write_tasks: JoinSet<std::result::Result<usize, DataFusionError>> =
             JoinSet::new();
 
@@ -248,13 +227,13 @@ impl DataSink for ArrowFileSink {
             let shared_buffer = SharedBuffer::new(INITIAL_BUFFER_BYTES);
             let mut arrow_writer = arrow_ipc::writer::FileWriter::try_new_with_options(
                 shared_buffer.clone(),
-                &self.get_writer_schema(),
+                &get_writer_schema(&self.config),
                 ipc_options.clone(),
             )?;
             let mut object_store_writer = create_writer(
                 FileCompressionType::UNCOMPRESSED,
                 &path,
-                object_store.clone(),
+                Arc::clone(&object_store),
             )
             .await?;
             file_write_tasks.spawn(async move {
@@ -295,17 +274,48 @@ impl DataSink for ArrowFileSink {
             }
         }
 
-        match demux_task.await {
-            Ok(r) => r?,
-            Err(e) => {
-                if e.is_panic() {
-                    std::panic::resume_unwind(e.into_panic());
-                } else {
-                    unreachable!();
-                }
+        demux_task
+            .join_unwind()
+            .await
+            .map_err(DataFusionError::ExecutionJoin)??;
+        Ok(row_count as u64)
+    }
+}
+
+impl Debug for ArrowFileSink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ArrowFileSink").finish()
+    }
+}
+
+impl DisplayAs for ArrowFileSink {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(f, "ArrowFileSink(file_groups=",)?;
+                FileGroupDisplay(&self.config.file_groups).fmt_as(t, f)?;
+                write!(f, ")")
             }
         }
-        Ok(row_count as u64)
+    }
+}
+
+#[async_trait]
+impl DataSink for ArrowFileSink {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> &SchemaRef {
+        self.config.output_schema()
+    }
+
+    async fn write_all(
+        &self,
+        data: SendableRecordBatchStream,
+        context: &Arc<TaskContext>,
+    ) -> Result<u64> {
+        FileSink::write_all(self, data, context).await
     }
 }
 
@@ -320,7 +330,7 @@ async fn infer_schema_from_file_stream(
     // Expected format:
     // <magic number "ARROW1"> - 6 bytes
     // <empty padding bytes [to 8 byte boundary]> - 2 bytes
-    // <continutation: 0xFFFFFFFF> - 4 bytes, not present below v0.15.0
+    // <continuation: 0xFFFFFFFF> - 4 bytes, not present below v0.15.0
     // <metadata_size: int32> - 4 bytes
     // <metadata_flatbuffer: bytes>
     // <rest of file bytes>
@@ -332,7 +342,7 @@ async fn infer_schema_from_file_stream(
     // Files should start with these magic bytes
     if bytes[0..6] != ARROW_MAGIC {
         return Err(ArrowError::ParseError(
-            "Arrow file does not contian correct header".to_string(),
+            "Arrow file does not contain correct header".to_string(),
         ))?;
     }
 
@@ -399,12 +409,11 @@ async fn collect_at_least_n_bytes(
 
 #[cfg(test)]
 mod tests {
-    use chrono::DateTime;
-    use object_store::{chunked::ChunkedStore, memory::InMemory, path::Path};
-
+    use super::*;
     use crate::execution::context::SessionContext;
 
-    use super::*;
+    use chrono::DateTime;
+    use object_store::{chunked::ChunkedStore, memory::InMemory, path::Path};
 
     #[tokio::test]
     async fn test_infer_schema_stream() -> Result<()> {
@@ -435,7 +444,7 @@ mod tests {
                 .infer_schema(
                     &state,
                     &(store.clone() as Arc<dyn ObjectStore>),
-                    &[object_meta.clone()],
+                    std::slice::from_ref(&object_meta),
                 )
                 .await?;
             let actual_fields = inferred_schema
@@ -474,7 +483,7 @@ mod tests {
             .infer_schema(
                 &state,
                 &(store.clone() as Arc<dyn ObjectStore>),
-                &[object_meta.clone()],
+                std::slice::from_ref(&object_meta),
             )
             .await;
 

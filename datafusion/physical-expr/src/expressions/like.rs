@@ -15,24 +15,42 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use std::{any::Any, sync::Arc};
 
-use crate::{physical_expr::down_cast_any_ref, PhysicalExpr};
-
-use crate::expressions::datum::apply_cmp;
+use crate::PhysicalExpr;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Schema};
-use datafusion_common::{internal_err, DataFusionError, Result};
+use datafusion_common::{internal_err, Result};
 use datafusion_expr::ColumnarValue;
+use datafusion_physical_expr_common::datum::apply_cmp;
 
 // Like expression
-#[derive(Debug, Hash)]
+#[derive(Debug, Eq)]
 pub struct LikeExpr {
     negated: bool,
     case_insensitive: bool,
     expr: Arc<dyn PhysicalExpr>,
     pattern: Arc<dyn PhysicalExpr>,
+}
+
+// Manually derive PartialEq and Hash to work around https://github.com/rust-lang/rust/issues/78808
+impl PartialEq for LikeExpr {
+    fn eq(&self, other: &Self) -> bool {
+        self.negated == other.negated
+            && self.case_insensitive == other.case_insensitive
+            && self.expr.eq(&other.expr)
+            && self.pattern.eq(&other.pattern)
+    }
+}
+
+impl Hash for LikeExpr {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.negated.hash(state);
+        self.case_insensitive.hash(state);
+        self.expr.hash(state);
+        self.pattern.hash(state);
+    }
 }
 
 impl LikeExpr {
@@ -112,8 +130,8 @@ impl PhysicalExpr for LikeExpr {
         }
     }
 
-    fn children(&self) -> Vec<Arc<dyn PhysicalExpr>> {
-        vec![self.expr.clone(), self.pattern.clone()]
+    fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+        vec![&self.expr, &self.pattern]
     }
 
     fn with_new_children(
@@ -123,28 +141,17 @@ impl PhysicalExpr for LikeExpr {
         Ok(Arc::new(LikeExpr::new(
             self.negated,
             self.case_insensitive,
-            children[0].clone(),
-            children[1].clone(),
+            Arc::clone(&children[0]),
+            Arc::clone(&children[1]),
         )))
-    }
-
-    fn dyn_hash(&self, state: &mut dyn Hasher) {
-        let mut s = state;
-        self.hash(&mut s);
     }
 }
 
-impl PartialEq<dyn Any> for LikeExpr {
-    fn eq(&self, other: &dyn Any) -> bool {
-        down_cast_any_ref(other)
-            .downcast_ref::<Self>()
-            .map(|x| {
-                self.negated == x.negated
-                    && self.case_insensitive == x.case_insensitive
-                    && self.expr.eq(&x.expr)
-                    && self.pattern.eq(&x.pattern)
-            })
-            .unwrap_or(false)
+/// used for optimize Dictionary like
+fn can_like_type(from_type: &DataType) -> bool {
+    match from_type {
+        DataType::Dictionary(_, inner_type_from) => **inner_type_from == DataType::Utf8,
+        _ => false,
     }
 }
 
@@ -158,7 +165,7 @@ pub fn like(
 ) -> Result<Arc<dyn PhysicalExpr>> {
     let expr_type = &expr.data_type(input_schema)?;
     let pattern_type = &pattern.data_type(input_schema)?;
-    if !expr_type.eq(pattern_type) {
+    if !expr_type.eq(pattern_type) && !can_like_type(expr_type) {
         return internal_err!(
             "The type of {expr_type} AND {pattern_type} of like physical should be same"
         );

@@ -217,8 +217,7 @@ impl FileGroupPartitioner {
             return None;
         }
 
-        let target_partition_size =
-            (total_size as usize + (target_partitions) - 1) / (target_partitions);
+        let target_partition_size = (total_size as usize).div_ceil(target_partitions);
 
         let current_partition_index: usize = 0;
         let current_partition_size: usize = 0;
@@ -256,7 +255,7 @@ impl FileGroupPartitioner {
                 },
             )
             .flatten()
-            .group_by(|(partition_idx, _)| *partition_idx)
+            .chunk_by(|(partition_idx, _)| *partition_idx)
             .into_iter()
             .map(|(_, group)| group.map(|(_, vals)| vals).collect_vec())
             .collect_vec();
@@ -394,7 +393,7 @@ mod test {
     #[test]
     fn repartition_empty_file_only() {
         let partitioned_file_empty = pfile("empty", 0);
-        let file_group = vec![vec![partitioned_file_empty.clone()]];
+        let file_group = vec![vec![partitioned_file_empty]];
 
         let partitioned_files = FileGroupPartitioner::new()
             .with_target_partitions(4)
@@ -782,7 +781,7 @@ mod test {
         assert_partitioned_files(expected, actual);
     }
 
-    /// Asserts that the two groups of `ParititonedFile` are the same
+    /// Asserts that the two groups of [`PartitionedFile`] are the same
     /// (PartitionedFile doesn't implement PartialEq)
     fn assert_partitioned_files(
         expected: Option<Vec<Vec<PartitionedFile>>>,
@@ -817,10 +816,7 @@ mod test {
             .with_preserve_order_within_groups(true)
             .repartition_file_groups(&file_groups);
 
-        assert_partitioned_files(
-            repartitioned.clone(),
-            repartitioned_preserving_sort.clone(),
-        );
+        assert_partitioned_files(repartitioned.clone(), repartitioned_preserving_sort);
         repartitioned
     }
 }

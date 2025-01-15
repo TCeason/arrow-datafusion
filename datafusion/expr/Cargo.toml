@@ -28,23 +28,30 @@ license = { workspace = true }
 authors = { workspace = true }
 rust-version = { workspace = true }
 
+[lints]
+workspace = true
+
 [lib]
 name = "datafusion_expr"
 path = "src/lib.rs"
 
 [features]
+recursive_protection = ["dep:recursive"]
 
 [dependencies]
-ahash = { version = "0.8", default-features = false, features = [
-    "runtime-rng",
-] }
 arrow = { workspace = true }
-arrow-array = { workspace = true }
+chrono = { workspace = true }
 datafusion-common = { workspace = true }
+datafusion-doc = { workspace = true }
+datafusion-expr-common = { workspace = true }
+datafusion-functions-aggregate-common = { workspace = true }
+datafusion-functions-window-common = { workspace = true }
+datafusion-physical-expr-common = { workspace = true }
+indexmap = { workspace = true }
 paste = "^1.0"
+recursive = { workspace = true, optional = true }
+serde_json = { workspace = true }
 sqlparser = { workspace = true }
-strum = { version = "0.26.1", features = ["derive"] }
-strum_macros = "0.26.0"
 
 [dev-dependencies]
 ctor = { workspace = true }

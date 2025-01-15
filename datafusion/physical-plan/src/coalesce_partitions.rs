@@ -21,40 +21,58 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use super::expressions::PhysicalSortExpr;
 use super::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use super::stream::{ObservedStream, RecordBatchReceiverStream};
-use super::{DisplayAs, SendableRecordBatchStream, Statistics};
+use super::{
+    DisplayAs, ExecutionPlanProperties, PlanProperties, SendableRecordBatchStream,
+    Statistics,
+};
 
 use crate::{DisplayFormatType, ExecutionPlan, Partitioning};
 
-use arrow::datatypes::SchemaRef;
-use datafusion_common::{internal_err, DataFusionError, Result};
+use crate::execution_plan::CardinalityEffect;
+use datafusion_common::{internal_err, Result};
 use datafusion_execution::TaskContext;
-use datafusion_physical_expr::EquivalenceProperties;
 
 /// Merge execution plan executes partitions in parallel and combines them into a single
 /// partition. No guarantees are made about the order of the resulting partition.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CoalescePartitionsExec {
     /// Input execution plan
     input: Arc<dyn ExecutionPlan>,
     /// Execution metrics
     metrics: ExecutionPlanMetricsSet,
+    cache: PlanProperties,
 }
 
 impl CoalescePartitionsExec {
     /// Create a new CoalescePartitionsExec
     pub fn new(input: Arc<dyn ExecutionPlan>) -> Self {
+        let cache = Self::compute_properties(&input);
         CoalescePartitionsExec {
             input,
             metrics: ExecutionPlanMetricsSet::new(),
+            cache,
         }
     }
 
     /// Input execution plan
     pub fn input(&self) -> &Arc<dyn ExecutionPlan> {
         &self.input
+    }
+
+    /// This function creates the cache object that stores the plan properties such as schema, equivalence properties, ordering, partitioning, etc.
+    fn compute_properties(input: &Arc<dyn ExecutionPlan>) -> PlanProperties {
+        // Coalescing partitions loses existing orderings:
+        let mut eq_properties = input.equivalence_properties().clone();
+        eq_properties.clear_orderings();
+        eq_properties.clear_per_partition_constants();
+        PlanProperties::new(
+            eq_properties,                        // Equivalence Properties
+            Partitioning::UnknownPartitioning(1), // Output Partitioning
+            input.pipeline_behavior(),
+            input.boundedness(),
+        )
     }
 }
 
@@ -73,39 +91,21 @@ impl DisplayAs for CoalescePartitionsExec {
 }
 
 impl ExecutionPlan for CoalescePartitionsExec {
+    fn name(&self) -> &'static str {
+        "CoalescePartitionsExec"
+    }
+
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
         self
     }
 
-    fn schema(&self) -> SchemaRef {
-        self.input.schema()
+    fn properties(&self) -> &PlanProperties {
+        &self.cache
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![self.input.clone()]
-    }
-
-    /// Specifies whether this plan generates an infinite stream of records.
-    /// If the plan does not support pipelining, but its input(s) are
-    /// infinite, returns an error to indicate this.
-    fn unbounded_output(&self, children: &[bool]) -> Result<bool> {
-        Ok(children[0])
-    }
-    /// Get the output partitioning of this plan
-    fn output_partitioning(&self) -> Partitioning {
-        Partitioning::UnknownPartitioning(1)
-    }
-
-    fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        None
-    }
-
-    fn equivalence_properties(&self) -> EquivalenceProperties {
-        let mut output_eq = self.input.equivalence_properties();
-        // Coalesce partitions loses existing orderings.
-        output_eq.clear_orderings();
-        output_eq
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
     }
 
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
@@ -116,7 +116,9 @@ impl ExecutionPlan for CoalescePartitionsExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(CoalescePartitionsExec::new(children[0].clone())))
+        Ok(Arc::new(CoalescePartitionsExec::new(Arc::clone(
+            &children[0],
+        ))))
     }
 
     fn execute(
@@ -154,7 +156,11 @@ impl ExecutionPlan for CoalescePartitionsExec {
                 // spawn independent tasks whose resulting streams (of batches)
                 // are sent to the channel for consumption.
                 for part_i in 0..input_partitions {
-                    builder.run_input(self.input.clone(), part_i, context.clone());
+                    builder.run_input(
+                        Arc::clone(&self.input),
+                        part_i,
+                        Arc::clone(&context),
+                    );
                 }
 
                 let stream = builder.build();
@@ -170,20 +176,28 @@ impl ExecutionPlan for CoalescePartitionsExec {
     fn statistics(&self) -> Result<Statistics> {
         self.input.statistics()
     }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        true
+    }
+
+    fn cardinality_effect(&self) -> CardinalityEffect {
+        CardinalityEffect::Equal
+    }
 }
 
 #[cfg(test)]
 mod tests {
-
-    use arrow::datatypes::{DataType, Field, Schema};
-    use futures::FutureExt;
-
     use super::*;
     use crate::test::exec::{
         assert_strong_count_converges_to_zero, BlockingExec, PanicExec,
     };
     use crate::test::{self, assert_is_pending};
     use crate::{collect, common};
+
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    use futures::FutureExt;
 
     #[tokio::test]
     async fn merge() -> Result<()> {
@@ -198,7 +212,10 @@ mod tests {
         let merge = CoalescePartitionsExec::new(csv);
 
         // output of CoalescePartitionsExec should have a single partition
-        assert_eq!(merge.output_partitioning().partition_count(), 1);
+        assert_eq!(
+            merge.properties().output_partitioning().partition_count(),
+            1
+        );
 
         // the result should contain 4 batches (one per input partition)
         let iter = merge.execute(0, task_ctx)?;
@@ -220,10 +237,10 @@ mod tests {
 
         let blocking_exec = Arc::new(BlockingExec::new(Arc::clone(&schema), 2));
         let refs = blocking_exec.refs();
-        let coaelesce_partitions_exec =
+        let coalesce_partitions_exec =
             Arc::new(CoalescePartitionsExec::new(blocking_exec));
 
-        let fut = collect(coaelesce_partitions_exec, task_ctx);
+        let fut = collect(coalesce_partitions_exec, task_ctx);
         let mut fut = fut.boxed();
 
         assert_is_pending(&mut fut);

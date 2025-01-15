@@ -18,21 +18,19 @@
 //! Module containing helper methods/traits related to enabling
 //! write support for the various file formats
 
-use std::io::{Error, Write};
-use std::pin::Pin;
+use std::io::Write;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 use crate::datasource::file_format::file_compression_type::FileCompressionType;
+use crate::datasource::physical_plan::FileSinkConfig;
 use crate::error::Result;
 
 use arrow_array::RecordBatch;
-use datafusion_common::DataFusionError;
-
+use arrow_schema::Schema;
 use bytes::Bytes;
-use futures::future::BoxFuture;
+use object_store::buffered::BufWriter;
 use object_store::path::Path;
-use object_store::{MultipartId, ObjectStore};
+use object_store::ObjectStore;
 use tokio::io::AsyncWrite;
 
 pub(crate) mod demux;
@@ -69,79 +67,6 @@ impl Write for SharedBuffer {
     }
 }
 
-/// Stores data needed during abortion of MultiPart writers
-#[derive(Clone)]
-pub(crate) struct MultiPart {
-    /// A shared reference to the object store
-    store: Arc<dyn ObjectStore>,
-    multipart_id: MultipartId,
-    location: Path,
-}
-
-impl MultiPart {
-    /// Create a new `MultiPart`
-    pub fn new(
-        store: Arc<dyn ObjectStore>,
-        multipart_id: MultipartId,
-        location: Path,
-    ) -> Self {
-        Self {
-            store,
-            multipart_id,
-            location,
-        }
-    }
-}
-
-/// A wrapper struct with abort method and writer
-pub(crate) struct AbortableWrite<W: AsyncWrite + Unpin + Send> {
-    writer: W,
-    multipart: MultiPart,
-}
-
-impl<W: AsyncWrite + Unpin + Send> AbortableWrite<W> {
-    /// Create a new `AbortableWrite` instance with the given writer, and write mode.
-    pub(crate) fn new(writer: W, multipart: MultiPart) -> Self {
-        Self { writer, multipart }
-    }
-
-    /// handling of abort for different write modes
-    pub(crate) fn abort_writer(&self) -> Result<BoxFuture<'static, Result<()>>> {
-        let multi = self.multipart.clone();
-        Ok(Box::pin(async move {
-            multi
-                .store
-                .abort_multipart(&multi.location, &multi.multipart_id)
-                .await
-                .map_err(DataFusionError::ObjectStore)
-        }))
-    }
-}
-
-impl<W: AsyncWrite + Unpin + Send> AsyncWrite for AbortableWrite<W> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::result::Result<usize, Error>> {
-        Pin::new(&mut self.get_mut().writer).poll_write(cx, buf)
-    }
-
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::result::Result<(), Error>> {
-        Pin::new(&mut self.get_mut().writer).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::result::Result<(), Error>> {
-        Pin::new(&mut self.get_mut().writer).poll_shutdown(cx)
-    }
-}
-
 /// A trait that defines the methods required for a RecordBatch serializer.
 pub trait BatchSerializer: Sync + Send {
     /// Asynchronously serializes a `RecordBatch` and returns the serialized bytes.
@@ -150,19 +75,37 @@ pub trait BatchSerializer: Sync + Send {
     fn serialize(&self, batch: RecordBatch, initial: bool) -> Result<Bytes>;
 }
 
-/// Returns an [`AbortableWrite`] which writes to the given object store location
-/// with the specified compression
+/// Returns an [`AsyncWrite`] which writes to the given object store location
+/// with the specified compression.
+/// We drop the `AbortableWrite` struct and the writer will not try to cleanup on failure.
+/// Users can configure automatic cleanup with their cloud provider.
 pub(crate) async fn create_writer(
     file_compression_type: FileCompressionType,
     location: &Path,
     object_store: Arc<dyn ObjectStore>,
-) -> Result<AbortableWrite<Box<dyn AsyncWrite + Send + Unpin>>> {
-    let (multipart_id, writer) = object_store
-        .put_multipart(location)
-        .await
-        .map_err(DataFusionError::ObjectStore)?;
-    Ok(AbortableWrite::new(
-        file_compression_type.convert_async_writer(writer)?,
-        MultiPart::new(object_store, multipart_id, location.clone()),
-    ))
+) -> Result<Box<dyn AsyncWrite + Send + Unpin>> {
+    let buf_writer = BufWriter::new(object_store, location.clone());
+    file_compression_type.convert_async_writer(buf_writer)
+}
+
+/// Converts table schema to writer schema, which may differ in the case
+/// of hive style partitioning where some columns are removed from the
+/// underlying files.
+pub(crate) fn get_writer_schema(config: &FileSinkConfig) -> Arc<Schema> {
+    if !config.table_partition_cols.is_empty() && !config.keep_partition_by_columns {
+        let schema = config.output_schema();
+        let partition_names: Vec<_> =
+            config.table_partition_cols.iter().map(|(s, _)| s).collect();
+        Arc::new(Schema::new_with_metadata(
+            schema
+                .fields()
+                .iter()
+                .filter(|f| !partition_names.contains(&f.name()))
+                .map(|f| (**f).clone())
+                .collect::<Vec<_>>(),
+            schema.metadata().clone(),
+        ))
+    } else {
+        Arc::clone(config.output_schema())
+    }
 }

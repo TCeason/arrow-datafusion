@@ -20,28 +20,32 @@ mod ddl;
 pub mod display;
 pub mod dml;
 mod extension;
+pub(crate) mod invariants;
+pub use invariants::{assert_expected_schema, check_subquery_expr, InvariantLevel};
 mod plan;
 mod statement;
+pub mod tree_node;
 
 pub use builder::{
     build_join_schema, table_scan, union, wrap_projection_for_join_if_necessary,
-    LogicalPlanBuilder, UNNAMED_TABLE,
+    LogicalPlanBuilder, LogicalTableSource, UNNAMED_TABLE,
 };
 pub use ddl::{
-    CreateCatalog, CreateCatalogSchema, CreateExternalTable, CreateMemoryTable,
-    CreateView, DdlStatement, DropCatalogSchema, DropTable, DropView,
+    CreateCatalog, CreateCatalogSchema, CreateExternalTable, CreateFunction,
+    CreateFunctionBody, CreateIndex, CreateMemoryTable, CreateView, DdlStatement,
+    DropCatalogSchema, DropFunction, DropTable, DropView, OperateFunctionArg,
 };
 pub use dml::{DmlStatement, WriteOp};
 pub use plan::{
-    projection_schema, Aggregate, Analyze, CrossJoin, DescribeTable, Distinct,
-    DistinctOn, EmptyRelation, Explain, Extension, Filter, Join, JoinConstraint,
-    JoinType, Limit, LogicalPlan, Partitioning, PlanType, Prepare, Projection,
-    RecursiveQuery, Repartition, Sort, StringifiedPlan, Subquery, SubqueryAlias,
-    TableScan, ToStringifiedPlan, Union, Unnest, Values, Window,
+    projection_schema, Aggregate, Analyze, ColumnUnnestList, DescribeTable, Distinct,
+    DistinctOn, EmptyRelation, Explain, Extension, FetchType, Filter, Join,
+    JoinConstraint, JoinType, Limit, LogicalPlan, Partitioning, PlanType, Projection,
+    RecursiveQuery, Repartition, SkipType, Sort, StringifiedPlan, Subquery,
+    SubqueryAlias, TableScan, ToStringifiedPlan, Union, Unnest, Values, Window,
 };
 pub use statement::{
-    SetVariable, Statement, TransactionAccessMode, TransactionConclusion, TransactionEnd,
-    TransactionIsolationLevel, TransactionStart,
+    Deallocate, Execute, Prepare, SetVariable, Statement, TransactionAccessMode,
+    TransactionConclusion, TransactionEnd, TransactionIsolationLevel, TransactionStart,
 };
 
 pub use display::display_schema;

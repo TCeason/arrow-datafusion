@@ -20,6 +20,8 @@
 use std::any::Any;
 use std::sync::Arc;
 
+use super::FileGroupPartitioner;
+use crate::datasource::listing::PartitionedFile;
 use crate::datasource::physical_plan::{
     FileMeta, FileOpenFuture, FileOpener, FileScanConfig,
 };
@@ -29,22 +31,22 @@ use crate::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
 };
 
+use arrow::buffer::Buffer;
 use arrow_ipc::reader::FileDecoder;
 use arrow_schema::SchemaRef;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::Statistics;
 use datafusion_execution::TaskContext;
-use datafusion_physical_expr::{EquivalenceProperties, LexOrdering, PhysicalSortExpr};
+use datafusion_physical_expr::{EquivalenceProperties, LexOrdering};
+use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion_physical_plan::PlanProperties;
 
 use futures::StreamExt;
 use itertools::Itertools;
 use object_store::{GetOptions, GetRange, GetResultPayload, ObjectStore};
 
-use super::FileGroupPartitioner;
-
 /// Execution plan for scanning Arrow data source
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct ArrowExec {
     base_config: FileScanConfig,
     projected_statistics: Statistics,
@@ -52,6 +54,7 @@ pub struct ArrowExec {
     projected_output_ordering: Vec<LexOrdering>,
     /// Execution metrics
     metrics: ExecutionPlanMetricsSet,
+    cache: PlanProperties,
 }
 
 impl ArrowExec {
@@ -59,18 +62,53 @@ impl ArrowExec {
     pub fn new(base_config: FileScanConfig) -> Self {
         let (projected_schema, projected_statistics, projected_output_ordering) =
             base_config.project();
-
+        let cache = Self::compute_properties(
+            Arc::clone(&projected_schema),
+            &projected_output_ordering,
+            &base_config,
+        );
         Self {
             base_config,
             projected_schema,
             projected_statistics,
             projected_output_ordering,
             metrics: ExecutionPlanMetricsSet::new(),
+            cache,
         }
     }
     /// Ref to the base configs
     pub fn base_config(&self) -> &FileScanConfig {
         &self.base_config
+    }
+
+    fn output_partitioning_helper(file_scan_config: &FileScanConfig) -> Partitioning {
+        Partitioning::UnknownPartitioning(file_scan_config.file_groups.len())
+    }
+
+    /// This function creates the cache object that stores the plan properties such as schema, equivalence properties, ordering, partitioning, etc.
+    fn compute_properties(
+        schema: SchemaRef,
+        projected_output_ordering: &[LexOrdering],
+        file_scan_config: &FileScanConfig,
+    ) -> PlanProperties {
+        // Equivalence Properties
+        let eq_properties =
+            EquivalenceProperties::new_with_orderings(schema, projected_output_ordering);
+
+        PlanProperties::new(
+            eq_properties,
+            Self::output_partitioning_helper(file_scan_config), // Output Partitioning
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        )
+    }
+
+    fn with_file_groups(mut self, file_groups: Vec<Vec<PartitionedFile>>) -> Self {
+        self.base_config.file_groups = file_groups;
+        // Changing file groups may invalidate output partitioning. Update it also
+        let output_partitioning = Self::output_partitioning_helper(&self.base_config);
+        self.cache = self.cache.with_partitioning(output_partitioning);
+        self
     }
 }
 
@@ -86,32 +124,19 @@ impl DisplayAs for ArrowExec {
 }
 
 impl ExecutionPlan for ArrowExec {
+    fn name(&self) -> &'static str {
+        "ArrowExec"
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
 
-    fn schema(&self) -> SchemaRef {
-        self.projected_schema.clone()
+    fn properties(&self) -> &PlanProperties {
+        &self.cache
     }
 
-    fn output_partitioning(&self) -> Partitioning {
-        Partitioning::UnknownPartitioning(self.base_config.file_groups.len())
-    }
-
-    fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        self.projected_output_ordering
-            .first()
-            .map(|ordering| ordering.as_slice())
-    }
-
-    fn equivalence_properties(&self) -> EquivalenceProperties {
-        EquivalenceProperties::new_with_orderings(
-            self.schema(),
-            &self.projected_output_ordering,
-        )
-    }
-
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         Vec::new()
     }
 
@@ -133,12 +158,14 @@ impl ExecutionPlan for ArrowExec {
         let repartitioned_file_groups_option = FileGroupPartitioner::new()
             .with_target_partitions(target_partitions)
             .with_repartition_file_min_size(repartition_file_min_size)
-            .with_preserve_order_within_groups(self.output_ordering().is_some())
+            .with_preserve_order_within_groups(
+                self.properties().output_ordering().is_some(),
+            )
             .repartition_file_groups(&self.base_config.file_groups);
 
         if let Some(repartitioned_file_groups) = repartitioned_file_groups_option {
             let mut new_plan = self.clone();
-            new_plan.base_config.file_groups = repartitioned_file_groups;
+            new_plan = new_plan.with_file_groups(repartitioned_file_groups);
             return Ok(Some(Arc::new(new_plan)));
         }
         Ok(None)
@@ -156,7 +183,7 @@ impl ExecutionPlan for ArrowExec {
 
         let opener = ArrowOpener {
             object_store,
-            projection: self.base_config.projection.clone(),
+            projection: self.base_config.file_column_projection_indices(),
         };
         let stream =
             FileStream::new(&self.base_config, partition, opener, &self.metrics)?;
@@ -170,6 +197,23 @@ impl ExecutionPlan for ArrowExec {
     fn statistics(&self) -> Result<Statistics> {
         Ok(self.projected_statistics.clone())
     }
+
+    fn fetch(&self) -> Option<usize> {
+        self.base_config.limit
+    }
+
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        let new_config = self.base_config.clone().with_limit(limit);
+
+        Some(Arc::new(Self {
+            base_config: new_config,
+            projected_statistics: self.projected_statistics.clone(),
+            projected_schema: Arc::clone(&self.projected_schema),
+            projected_output_ordering: self.projected_output_ordering.clone(),
+            metrics: self.metrics.clone(),
+            cache: self.cache.clone(),
+        }))
+    }
 }
 
 pub struct ArrowOpener {
@@ -179,7 +223,7 @@ pub struct ArrowOpener {
 
 impl FileOpener for ArrowOpener {
     fn open(&self, file_meta: FileMeta) -> Result<FileOpenFuture> {
-        let object_store = self.object_store.clone();
+        let object_store = Arc::clone(&self.object_store);
         let projection = self.projection.clone();
         Ok(Box::pin(async move {
             let range = file_meta.range.clone();
@@ -258,7 +302,10 @@ impl FileOpener for ArrowOpener {
                     for (dict_block, dict_result) in
                         footer.dictionaries().iter().flatten().zip(dict_results)
                     {
-                        decoder.read_dictionary(dict_block, &dict_result.into())?;
+                        decoder.read_dictionary(
+                            dict_block,
+                            &Buffer::from_bytes(dict_result.into()),
+                        )?;
                     }
 
                     // filter recordbatches according to range
@@ -293,11 +340,12 @@ impl FileOpener for ArrowOpener {
                             .into_iter()
                             .zip(recordbatch_results)
                             .filter_map(move |(block, data)| {
-                                match decoder.read_record_batch(&block, &data.into()) {
-                                    Ok(Some(record_batch)) => Some(Ok(record_batch)),
-                                    Ok(None) => None,
-                                    Err(err) => Some(Err(err)),
-                                }
+                                decoder
+                                    .read_record_batch(
+                                        &block,
+                                        &Buffer::from_bytes(data.into()),
+                                    )
+                                    .transpose()
                             }),
                     )
                     .boxed())

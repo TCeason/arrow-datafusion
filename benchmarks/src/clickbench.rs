@@ -16,16 +16,16 @@
 // under the License.
 
 use std::path::Path;
-use std::{path::PathBuf, time::Instant};
+use std::path::PathBuf;
 
+use crate::util::{BenchmarkRun, CommonOpt};
 use datafusion::{
     error::{DataFusionError, Result},
     prelude::SessionContext,
 };
 use datafusion_common::exec_datafusion_err;
+use datafusion_common::instant::Instant;
 use structopt::StructOpt;
-
-use crate::{BenchmarkRun, CommonOpt};
 
 /// Run the clickbench benchmark
 ///
@@ -115,7 +115,15 @@ impl RunOpt {
             None => queries.min_query_id()..=queries.max_query_id(),
         };
 
-        let config = self.common.config();
+        // configure parquet options
+        let mut config = self.common.config();
+        {
+            let parquet_options = &mut config.options_mut().execution.parquet;
+            // The hits_partitioned dataset specifies string columns
+            // as binary due to how it was written. Force it to strings
+            parquet_options.binary_as_string = true;
+        }
+
         let ctx = SessionContext::new_with_config(config);
         self.register_hits(&ctx).await?;
 
@@ -137,12 +145,15 @@ impl RunOpt {
                 );
                 benchmark_run.write_iter(elapsed, row_count);
             }
+            if self.common.debug {
+                ctx.sql(sql).await?.explain(false, false)?.show().await?;
+            }
         }
         benchmark_run.maybe_write_json(self.output_path.as_ref())?;
         Ok(())
     }
 
-    /// Registrs the `hits.parquet` as a table named `hits`
+    /// Registers the `hits.parquet` as a table named `hits`
     async fn register_hits(&self, ctx: &SessionContext) -> Result<()> {
         let options = Default::default();
         let path = self.path.as_os_str().to_str().unwrap();

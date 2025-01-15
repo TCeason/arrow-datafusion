@@ -15,11 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::fs;
-
-use crate::datasource::object_store::ObjectStoreUrl;
 use crate::execution::context::SessionState;
 use datafusion_common::{DataFusionError, Result};
+use datafusion_execution::object_store::ObjectStoreUrl;
 use datafusion_optimizer::OptimizerConfig;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
@@ -27,6 +25,7 @@ use glob::Pattern;
 use itertools::Itertools;
 use log::debug;
 use object_store::path::Path;
+use object_store::path::DELIMITER;
 use object_store::{ObjectMeta, ObjectStore};
 use std::sync::Arc;
 use url::Url;
@@ -54,7 +53,7 @@ impl ListingTableUrl {
     /// subdirectories.
     ///
     /// Similarly `s3://BUCKET/blob.csv` refers to `blob.csv` in the S3 bucket `BUCKET`,
-    /// wherease `s3://BUCKET/foo/` refers to all objects with the prefix `foo/` in the
+    /// whereas `s3://BUCKET/foo/` refers to all objects with the prefix `foo/` in the
     /// S3 bucket `BUCKET`
     ///
     /// # URL Encoding
@@ -116,37 +115,6 @@ impl ListingTableUrl {
         }
     }
 
-    /// Get object store for specified input_url
-    /// if input_url is actually not a url, we assume it is a local file path
-    /// if we have a local path, create it if not exists so ListingTableUrl::parse works
-    #[deprecated(note = "Use parse")]
-    pub fn parse_create_local_if_not_exists(
-        s: impl AsRef<str>,
-        is_directory: bool,
-    ) -> Result<Self> {
-        let s = s.as_ref();
-        let is_valid_url = Url::parse(s).is_ok();
-
-        match is_valid_url {
-            true => ListingTableUrl::parse(s),
-            false => {
-                let path = std::path::PathBuf::from(s);
-                if !path.exists() {
-                    if is_directory {
-                        fs::create_dir_all(path)?;
-                    } else {
-                        // ensure parent directory exists
-                        if let Some(parent) = path.parent() {
-                            fs::create_dir_all(parent)?;
-                        }
-                        fs::File::create(path)?;
-                    }
-                }
-                ListingTableUrl::parse(s)
-            }
-        }
-    }
-
     /// Creates a new [`ListingTableUrl`] interpreting `s` as a filesystem path
     #[cfg(not(target_arch = "wasm32"))]
     fn parse_path(s: &str) -> Result<Self> {
@@ -189,34 +157,61 @@ impl ListingTableUrl {
 
     /// Returns `true` if `path` matches this [`ListingTableUrl`]
     pub fn contains(&self, path: &Path, ignore_subdirectory: bool) -> bool {
-        match self.strip_prefix(path) {
-            Some(mut segments) => match &self.glob {
-                Some(glob) => {
-                    if ignore_subdirectory {
-                        segments
-                            .next()
-                            .map_or(false, |file_name| glob.matches(file_name))
-                    } else {
-                        let stripped = segments.join("/");
-                        glob.matches(&stripped)
-                    }
+        let Some(all_segments) = self.strip_prefix(path) else {
+            return false;
+        };
+
+        // remove any segments that contain `=` as they are allowed even
+        // when ignore subdirectories is `true`.
+        let mut segments = all_segments.filter(|s| !s.contains('='));
+
+        match &self.glob {
+            Some(glob) => {
+                if ignore_subdirectory {
+                    segments
+                        .next()
+                        .is_some_and(|file_name| glob.matches(file_name))
+                } else {
+                    let stripped = segments.join(DELIMITER);
+                    glob.matches(&stripped)
                 }
-                None => {
-                    if ignore_subdirectory {
-                        let has_subdirectory = segments.collect::<Vec<_>>().len() > 1;
-                        !has_subdirectory
-                    } else {
-                        true
-                    }
-                }
-            },
-            None => false,
+            }
+            // where we are ignoring subdirectories, we require
+            // the path to be either empty, or contain just the
+            // final file name segment.
+            None if ignore_subdirectory => segments.count() <= 1,
+            // in this case, any valid path at or below the url is allowed
+            None => true,
         }
     }
 
     /// Returns `true` if `path` refers to a collection of objects
     pub fn is_collection(&self) -> bool {
-        self.url.as_str().ends_with('/')
+        self.url.path().ends_with(DELIMITER)
+    }
+
+    /// Returns the file extension of the last path segment if it exists
+    ///
+    /// Examples:
+    /// ```rust
+    /// use datafusion::datasource::listing::ListingTableUrl;
+    /// let url = ListingTableUrl::parse("file:///foo/bar.csv").unwrap();
+    /// assert_eq!(url.file_extension(), Some("csv"));
+    /// let url = ListingTableUrl::parse("file:///foo/bar").unwrap();
+    /// assert_eq!(url.file_extension(), None);
+    /// let url = ListingTableUrl::parse("file:///foo/bar.").unwrap();
+    /// assert_eq!(url.file_extension(), None);
+    /// ```
+    pub fn file_extension(&self) -> Option<&str> {
+        if let Some(segments) = self.url.path_segments() {
+            if let Some(last_segment) = segments.last() {
+                if last_segment.contains(".") && !last_segment.ends_with(".") {
+                    return last_segment.split('.').last();
+                }
+            }
+        }
+
+        None
     }
 
     /// Strips the prefix of this [`ListingTableUrl`] from the provided path, returning
@@ -225,7 +220,6 @@ impl ListingTableUrl {
         &'a self,
         path: &'b Path,
     ) -> Option<impl Iterator<Item = &'b str> + 'a> {
-        use object_store::path::DELIMITER;
         let mut stripped = path.as_ref().strip_prefix(self.prefix.as_ref())?;
         if !stripped.is_empty() && !self.prefix.as_ref().is_empty() {
             stripped = stripped.strip_prefix(DELIMITER)?;
@@ -234,7 +228,7 @@ impl ListingTableUrl {
     }
 
     /// List all files identified by this [`ListingTableUrl`] for the provided `file_extension`
-    pub(crate) async fn list_all_files<'a>(
+    pub async fn list_all_files<'a>(
         &'a self,
         ctx: &'a SessionState,
         store: &'a dyn ObjectStore,
@@ -487,10 +481,90 @@ mod tests {
         test("/a/b*.txt", Some(("/a/", "b*.txt")));
         test("/a/b/**/c*.txt", Some(("/a/b/", "**/c*.txt")));
 
-        // https://github.com/apache/arrow-datafusion/issues/2465
+        // https://github.com/apache/datafusion/issues/2465
         test(
             "/a/b/c//alltypes_plain*.parquet",
             Some(("/a/b/c//", "alltypes_plain*.parquet")),
+        );
+    }
+
+    #[test]
+    fn test_is_collection() {
+        fn test(input: &str, expected: bool, message: &str) {
+            let url = ListingTableUrl::parse(input).unwrap();
+            assert_eq!(url.is_collection(), expected, "{message}");
+        }
+
+        test("https://a.b.c/path/", true, "path ends with / - collection");
+        test(
+            "https://a.b.c/path/?a=b",
+            true,
+            "path ends with / - with query args - collection",
+        );
+        test(
+            "https://a.b.c/path?a=b/",
+            false,
+            "path not ends with / - query ends with / - not collection",
+        );
+        test(
+            "https://a.b.c/path/#a=b",
+            true,
+            "path ends with / - with fragment - collection",
+        );
+        test(
+            "https://a.b.c/path#a=b/",
+            false,
+            "path not ends with / - fragment ends with / - not collection",
+        );
+    }
+
+    #[test]
+    fn test_file_extension() {
+        fn test(input: &str, expected: Option<&str>, message: &str) {
+            let url = ListingTableUrl::parse(input).unwrap();
+            assert_eq!(url.file_extension(), expected, "{message}");
+        }
+
+        test("https://a.b.c/path/", None, "path ends with / - not a file");
+        test(
+            "https://a.b.c/path/?a=b",
+            None,
+            "path ends with / - with query args - not a file",
+        );
+        test(
+            "https://a.b.c/path?a=b/",
+            None,
+            "path not ends with / - query ends with / but no file extension",
+        );
+        test(
+            "https://a.b.c/path/#a=b",
+            None,
+            "path ends with / - with fragment - not a file",
+        );
+        test(
+            "https://a.b.c/path#a=b/",
+            None,
+            "path not ends with / - fragment ends with / but no file extension",
+        );
+        test(
+            "file///some/path/",
+            None,
+            "file path ends with / - not a file",
+        );
+        test(
+            "file///some/path/file",
+            None,
+            "file path does not end with - no extension",
+        );
+        test(
+            "file///some/path/file.",
+            None,
+            "file path ends with . - no value after .",
+        );
+        test(
+            "file///some/path/file.ext",
+            Some("ext"),
+            "file path ends with .ext - extension is ext",
         );
     }
 }

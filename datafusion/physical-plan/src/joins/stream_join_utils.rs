@@ -19,34 +19,29 @@
 //! related functionality, used both in join calculations and optimization rules.
 
 use std::collections::{HashMap, VecDeque};
+use std::mem::size_of;
 use std::sync::Arc;
-use std::task::{Context, Poll};
-use std::usize;
 
-use crate::joins::utils::{JoinFilter, JoinHashMapType, StatefulStreamResult};
+use crate::joins::utils::{JoinFilter, JoinHashMapType};
 use crate::metrics::{ExecutionPlanMetricsSet, MetricBuilder};
-use crate::{handle_async_state, handle_state, metrics, ExecutionPlan};
+use crate::{metrics, ExecutionPlan};
 
 use arrow::compute::concat_batches;
 use arrow_array::{ArrowPrimitiveType, NativeAdapter, PrimitiveArray, RecordBatch};
 use arrow_buffer::{ArrowNativeType, BooleanBufferBuilder};
 use arrow_schema::{Schema, SchemaRef};
-use datafusion_common::tree_node::{Transformed, TreeNode};
+use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{
-    arrow_datafusion_err, plan_datafusion_err, DataFusionError, JoinSide, Result,
-    ScalarValue,
+    arrow_datafusion_err, DataFusionError, HashSet, JoinSide, Result, ScalarValue,
 };
-use datafusion_execution::SendableRecordBatchStream;
 use datafusion_expr::interval_arithmetic::Interval;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::intervals::cp_solver::ExprIntervalGraph;
 use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr::{PhysicalExpr, PhysicalSortExpr};
 
-use async_trait::async_trait;
-use futures::{ready, FutureExt, StreamExt};
+use datafusion_physical_expr_common::sort_expr::LexOrdering;
 use hashbrown::raw::RawTable;
-use hashbrown::HashSet;
 
 /// Implementation of `JoinHashMapType` for `PruningJoinHashMap`.
 impl JoinHashMapType for PruningJoinHashMap {
@@ -159,8 +154,7 @@ impl PruningJoinHashMap {
     /// # Returns
     /// The size of the hash map in bytes.
     pub(crate) fn size(&self) -> usize {
-        self.map.allocation_info().1.size()
-            + self.next.capacity() * std::mem::size_of::<u64>()
+        self.map.allocation_info().1.size() + self.next.capacity() * size_of::<u64>()
     }
 
     /// Removes hash values from the map and the list based on the given pruning
@@ -246,7 +240,7 @@ pub fn map_origin_col_to_filter_col(
     Ok(col_to_col_map)
 }
 
-/// This function analyzes [`PhysicalSortExpr`] graphs with respect to monotonicity
+/// This function analyzes [`PhysicalSortExpr`] graphs with respect to output orderings
 /// (sorting) properties. This is necessary since monotonically increasing and/or
 /// decreasing expressions are required when using join filter expressions for
 /// data pruning purposes.
@@ -275,7 +269,7 @@ pub fn convert_sort_expr_with_filter_schema(
     sort_expr: &PhysicalSortExpr,
 ) -> Result<Option<Arc<dyn PhysicalExpr>>> {
     let column_map = map_origin_col_to_filter_col(filter, schema, side)?;
-    let expr = sort_expr.expr.clone();
+    let expr = Arc::clone(&sort_expr.expr);
     // Get main schema columns:
     let expr_columns = collect_columns(&expr);
     // Calculation is possible with `column_map` since sort exprs belong to a child.
@@ -284,14 +278,16 @@ pub fn convert_sort_expr_with_filter_schema(
     if all_columns_are_included {
         // Since we are sure that one to one column mapping includes all columns, we convert
         // the sort expression into a filter expression.
-        let converted_filter_expr = expr.transform_up(&|p| {
-            convert_filter_columns(p.as_ref(), &column_map).map(|transformed| {
-                match transformed {
-                    Some(transformed) => Transformed::Yes(transformed),
-                    None => Transformed::No(p),
-                }
+        let converted_filter_expr = expr
+            .transform_up(|p| {
+                convert_filter_columns(p.as_ref(), &column_map).map(|transformed| {
+                    match transformed {
+                        Some(transformed) => Transformed::yes(transformed),
+                        None => Transformed::no(p),
+                    }
+                })
             })
-        })?;
+            .data()?;
         // Search the converted `PhysicalExpr` in filter expression; if an exact
         // match is found, use this sorted expression in graph traversals.
         if check_filter_expr_contains_sort_information(
@@ -372,34 +368,40 @@ impl SortedFilterExpr {
         filter_expr: Arc<dyn PhysicalExpr>,
         filter_schema: &Schema,
     ) -> Result<Self> {
-        let dt = &filter_expr.data_type(filter_schema)?;
+        let dt = filter_expr.data_type(filter_schema)?;
         Ok(Self {
             origin_sorted_expr,
             filter_expr,
-            interval: Interval::make_unbounded(dt)?,
+            interval: Interval::make_unbounded(&dt)?,
             node_index: 0,
         })
     }
+
     /// Get origin expr information
     pub fn origin_sorted_expr(&self) -> &PhysicalSortExpr {
         &self.origin_sorted_expr
     }
+
     /// Get filter expr information
     pub fn filter_expr(&self) -> &Arc<dyn PhysicalExpr> {
         &self.filter_expr
     }
+
     /// Get interval information
     pub fn interval(&self) -> &Interval {
         &self.interval
     }
+
     /// Sets interval
     pub fn set_interval(&mut self, interval: Interval) {
         self.interval = interval;
     }
+
     /// Node index in ExprIntervalGraph
     pub fn node_index(&self) -> usize {
         self.node_index
     }
+
     /// Node index setter in ExprIntervalGraph
     pub fn set_node_index(&mut self, node_index: usize) {
         self.node_index = node_index;
@@ -412,41 +414,45 @@ impl SortedFilterExpr {
 /// on the first or the last value of the expression in `build_input_buffer`
 /// and `probe_batch`.
 ///
-/// # Arguments
+/// # Parameters
 ///
 /// * `build_input_buffer` - The [RecordBatch] on the build side of the join.
 /// * `build_sorted_filter_expr` - Build side [SortedFilterExpr] to update.
 /// * `probe_batch` - The `RecordBatch` on the probe side of the join.
 /// * `probe_sorted_filter_expr` - Probe side `SortedFilterExpr` to update.
 ///
-/// ### Note
-/// ```text
+/// ## Note
 ///
-/// Interval arithmetic is used to calculate viable join ranges for build-side
-/// pruning. This is done by first creating an interval for join filter values in
-/// the build side of the join, which spans [-∞, FV] or [FV, ∞] depending on the
-/// ordering (descending/ascending) of the filter expression. Here, FV denotes the
-/// first value on the build side. This range is then compared with the probe side
-/// interval, which either spans [-∞, LV] or [LV, ∞] depending on the ordering
-/// (ascending/descending) of the probe side. Here, LV denotes the last value on
-/// the probe side.
+/// Utilizing interval arithmetic, this function computes feasible join intervals
+/// on the pruning side by evaluating the prospective value ranges that might
+/// emerge in subsequent data batches from the enforcer side. This is done by
+/// first creating an interval for join filter values in the pruning side of the
+/// join, which spans `[-∞, FV]` or `[FV, ∞]` depending on the ordering (descending/
+/// ascending) of the filter expression. Here, `FV` denotes the first value on the
+/// pruning side. This range is then compared with the enforcer side interval,
+/// which either spans `[-∞, LV]` or `[LV, ∞]` depending on the ordering (ascending/
+/// descending) of the probe side. Here, `LV` denotes the last value on the enforcer
+/// side.
 ///
 /// As a concrete example, consider the following query:
 ///
+/// ```text
 ///   SELECT * FROM left_table, right_table
 ///   WHERE
 ///     left_key = right_key AND
 ///     a > b - 3 AND
 ///     a < b + 10
+/// ```
 ///
-/// where columns "a" and "b" come from tables "left_table" and "right_table",
+/// where columns `a` and `b` come from tables `left_table` and `right_table`,
 /// respectively. When a new `RecordBatch` arrives at the right side, the
-/// condition a > b - 3 will possibly indicate a prunable range for the left
+/// condition `a > b - 3` will possibly indicate a prunable range for the left
 /// side. Conversely, when a new `RecordBatch` arrives at the left side, the
-/// condition a < b + 10 will possibly indicate prunability for the right side.
-/// Let’s inspect what happens when a new RecordBatch` arrives at the right
+/// condition `a < b + 10` will possibly indicate prunability for the right side.
+/// Let’s inspect what happens when a new `RecordBatch` arrives at the right
 /// side (i.e. when the left side is the build side):
 ///
+/// ```text
 ///         Build      Probe
 ///       +-------+  +-------+
 ///       | a | z |  | b | y |
@@ -459,13 +465,13 @@ impl SortedFilterExpr {
 ///       |+--|--+|  |+--|--+|
 ///       | 7 | 1 |  | 6 | 3 |
 ///       +-------+  +-------+
+/// ```
 ///
 /// In this case, the interval representing viable (i.e. joinable) values for
-/// column "a" is [1, ∞], and the interval representing possible future values
-/// for column "b" is [6, ∞]. With these intervals at hand, we next calculate
+/// column `a` is `[1, ∞]`, and the interval representing possible future values
+/// for column `b` is `[6, ∞]`. With these intervals at hand, we next calculate
 /// intervals for the whole filter expression and propagate join constraint by
 /// traversing the expression graph.
-/// ```
 pub fn calculate_filter_expr_intervals(
     build_input_buffer: &RecordBatch,
     build_sorted_filter_expr: &mut SortedFilterExpr,
@@ -627,352 +633,6 @@ pub fn record_visited_indices<T: ArrowPrimitiveType>(
     }
 }
 
-/// Represents the various states of an eager join stream operation.
-///
-/// This enum is used to track the current state of streaming during a join
-/// operation. It provides indicators as to which side of the join needs to be
-/// pulled next or if one (or both) sides have been exhausted. This allows
-/// for efficient management of resources and optimal performance during the
-/// join process.
-#[derive(Clone, Debug)]
-pub enum EagerJoinStreamState {
-    /// Indicates that the next step should pull from the right side of the join.
-    PullRight,
-
-    /// Indicates that the next step should pull from the left side of the join.
-    PullLeft,
-
-    /// State representing that the right side of the join has been fully processed.
-    RightExhausted,
-
-    /// State representing that the left side of the join has been fully processed.
-    LeftExhausted,
-
-    /// Represents a state where both sides of the join are exhausted.
-    ///
-    /// The `final_result` field indicates whether the join operation has
-    /// produced a final result or not.
-    BothExhausted { final_result: bool },
-}
-
-/// `EagerJoinStream` is an asynchronous trait designed for managing incremental
-/// join operations between two streams, such as those used in `SymmetricHashJoinExec`
-/// and `SortMergeJoinExec`. Unlike traditional join approaches that need to scan
-/// one side of the join fully before proceeding, `EagerJoinStream` facilitates
-/// more dynamic join operations by working with streams as they emit data. This
-/// approach allows for more efficient processing, particularly in scenarios
-/// where waiting for complete data materialization is not feasible or optimal.
-/// The trait provides a framework for handling various states of such a join
-/// process, ensuring that join logic is efficiently executed as data becomes
-/// available from either stream.
-///
-/// Implementors of this trait can perform eager joins of data from two different
-/// asynchronous streams, typically referred to as left and right streams. The
-/// trait provides a comprehensive set of methods to control and execute the join
-/// process, leveraging the states defined in `EagerJoinStreamState`. Methods are
-/// primarily focused on asynchronously fetching data batches from each stream,
-/// processing them, and managing transitions between various states of the join.
-///
-/// This trait's default implementations use a state machine approach to navigate
-/// different stages of the join operation, handling data from both streams and
-/// determining when the join completes.
-///
-/// State Transitions:
-/// - From `PullLeft` to `PullRight` or `LeftExhausted`:
-///   - In `fetch_next_from_left_stream`, when fetching a batch from the left stream:
-///     - On success (`Some(Ok(batch))`), state transitions to `PullRight` for
-///       processing the batch.
-///     - On error (`Some(Err(e))`), the error is returned, and the state remains
-///       unchanged.
-///     - On no data (`None`), state changes to `LeftExhausted`, returning `Continue`
-///       to proceed with the join process.
-/// - From `PullRight` to `PullLeft` or `RightExhausted`:
-///   - In `fetch_next_from_right_stream`, when fetching from the right stream:
-///     - If a batch is available, state changes to `PullLeft` for processing.
-///     - On error, the error is returned without changing the state.
-///     - If right stream is exhausted (`None`), state transitions to `RightExhausted`,
-///       with a `Continue` result.
-/// - Handling `RightExhausted` and `LeftExhausted`:
-///   - Methods `handle_right_stream_end` and `handle_left_stream_end` manage scenarios
-///     when streams are exhausted:
-///     - They attempt to continue processing with the other stream.
-///     - If both streams are exhausted, state changes to `BothExhausted { final_result: false }`.
-/// - Transition to `BothExhausted { final_result: true }`:
-///   - Occurs in `prepare_for_final_results_after_exhaustion` when both streams are
-///     exhausted, indicating completion of processing and availability of final results.
-#[async_trait]
-pub trait EagerJoinStream {
-    /// Implements the main polling logic for the join stream.
-    ///
-    /// This method continuously checks the state of the join stream and
-    /// acts accordingly by delegating the handling to appropriate sub-methods
-    /// depending on the current state.
-    ///
-    /// # Arguments
-    ///
-    /// * `cx` - A context that facilitates cooperative non-blocking execution within a task.
-    ///
-    /// # Returns
-    ///
-    /// * `Poll<Option<Result<RecordBatch>>>` - A polled result, either a `RecordBatch` or None.
-    fn poll_next_impl(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<RecordBatch>>>
-    where
-        Self: Send,
-    {
-        loop {
-            return match self.state() {
-                EagerJoinStreamState::PullRight => {
-                    handle_async_state!(self.fetch_next_from_right_stream(), cx)
-                }
-                EagerJoinStreamState::PullLeft => {
-                    handle_async_state!(self.fetch_next_from_left_stream(), cx)
-                }
-                EagerJoinStreamState::RightExhausted => {
-                    handle_async_state!(self.handle_right_stream_end(), cx)
-                }
-                EagerJoinStreamState::LeftExhausted => {
-                    handle_async_state!(self.handle_left_stream_end(), cx)
-                }
-                EagerJoinStreamState::BothExhausted {
-                    final_result: false,
-                } => {
-                    handle_state!(self.prepare_for_final_results_after_exhaustion())
-                }
-                EagerJoinStreamState::BothExhausted { final_result: true } => {
-                    Poll::Ready(None)
-                }
-            };
-        }
-    }
-    /// Asynchronously pulls the next batch from the right stream.
-    ///
-    /// This default implementation checks for the next value in the right stream.
-    /// If a batch is found, the state is switched to `PullLeft`, and the batch handling
-    /// is delegated to `process_batch_from_right`. If the stream ends, the state is set to `RightExhausted`.
-    ///
-    /// # Returns
-    ///
-    /// * `Result<StatefulStreamResult<Option<RecordBatch>>>` - The state result after pulling the batch.
-    async fn fetch_next_from_right_stream(
-        &mut self,
-    ) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
-        match self.right_stream().next().await {
-            Some(Ok(batch)) => {
-                if batch.num_rows() == 0 {
-                    return Ok(StatefulStreamResult::Continue);
-                }
-                self.set_state(EagerJoinStreamState::PullLeft);
-                self.process_batch_from_right(batch)
-            }
-            Some(Err(e)) => Err(e),
-            None => {
-                self.set_state(EagerJoinStreamState::RightExhausted);
-                Ok(StatefulStreamResult::Continue)
-            }
-        }
-    }
-
-    /// Asynchronously pulls the next batch from the left stream.
-    ///
-    /// This default implementation checks for the next value in the left stream.
-    /// If a batch is found, the state is switched to `PullRight`, and the batch handling
-    /// is delegated to `process_batch_from_left`. If the stream ends, the state is set to `LeftExhausted`.
-    ///
-    /// # Returns
-    ///
-    /// * `Result<StatefulStreamResult<Option<RecordBatch>>>` - The state result after pulling the batch.
-    async fn fetch_next_from_left_stream(
-        &mut self,
-    ) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
-        match self.left_stream().next().await {
-            Some(Ok(batch)) => {
-                if batch.num_rows() == 0 {
-                    return Ok(StatefulStreamResult::Continue);
-                }
-                self.set_state(EagerJoinStreamState::PullRight);
-                self.process_batch_from_left(batch)
-            }
-            Some(Err(e)) => Err(e),
-            None => {
-                self.set_state(EagerJoinStreamState::LeftExhausted);
-                Ok(StatefulStreamResult::Continue)
-            }
-        }
-    }
-
-    /// Asynchronously handles the scenario when the right stream is exhausted.
-    ///
-    /// In this default implementation, when the right stream is exhausted, it attempts
-    /// to pull from the left stream. If a batch is found in the left stream, it delegates
-    /// the handling to `process_batch_from_left`. If both streams are exhausted, the state is set
-    /// to indicate both streams are exhausted without final results yet.
-    ///
-    /// # Returns
-    ///
-    /// * `Result<StatefulStreamResult<Option<RecordBatch>>>` - The state result after checking the exhaustion state.
-    async fn handle_right_stream_end(
-        &mut self,
-    ) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
-        match self.left_stream().next().await {
-            Some(Ok(batch)) => {
-                if batch.num_rows() == 0 {
-                    return Ok(StatefulStreamResult::Continue);
-                }
-                self.process_batch_after_right_end(batch)
-            }
-            Some(Err(e)) => Err(e),
-            None => {
-                self.set_state(EagerJoinStreamState::BothExhausted {
-                    final_result: false,
-                });
-                Ok(StatefulStreamResult::Continue)
-            }
-        }
-    }
-
-    /// Asynchronously handles the scenario when the left stream is exhausted.
-    ///
-    /// When the left stream is exhausted, this default
-    /// implementation tries to pull from the right stream and delegates the batch
-    /// handling to `process_batch_after_left_end`. If both streams are exhausted, the state
-    /// is updated to indicate so.
-    ///
-    /// # Returns
-    ///
-    /// * `Result<StatefulStreamResult<Option<RecordBatch>>>` - The state result after checking the exhaustion state.
-    async fn handle_left_stream_end(
-        &mut self,
-    ) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
-        match self.right_stream().next().await {
-            Some(Ok(batch)) => {
-                if batch.num_rows() == 0 {
-                    return Ok(StatefulStreamResult::Continue);
-                }
-                self.process_batch_after_left_end(batch)
-            }
-            Some(Err(e)) => Err(e),
-            None => {
-                self.set_state(EagerJoinStreamState::BothExhausted {
-                    final_result: false,
-                });
-                Ok(StatefulStreamResult::Continue)
-            }
-        }
-    }
-
-    /// Handles the state when both streams are exhausted and final results are yet to be produced.
-    ///
-    /// This default implementation switches the state to indicate both streams are
-    /// exhausted with final results and then invokes the handling for this specific
-    /// scenario via `process_batches_before_finalization`.
-    ///
-    /// # Returns
-    ///
-    /// * `Result<StatefulStreamResult<Option<RecordBatch>>>` - The state result after both streams are exhausted.
-    fn prepare_for_final_results_after_exhaustion(
-        &mut self,
-    ) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
-        self.set_state(EagerJoinStreamState::BothExhausted { final_result: true });
-        self.process_batches_before_finalization()
-    }
-
-    /// Handles a pulled batch from the right stream.
-    ///
-    /// # Arguments
-    ///
-    /// * `batch` - The pulled `RecordBatch` from the right stream.
-    ///
-    /// # Returns
-    ///
-    /// * `Result<StatefulStreamResult<Option<RecordBatch>>>` - The state result after processing the batch.
-    fn process_batch_from_right(
-        &mut self,
-        batch: RecordBatch,
-    ) -> Result<StatefulStreamResult<Option<RecordBatch>>>;
-
-    /// Handles a pulled batch from the left stream.
-    ///
-    /// # Arguments
-    ///
-    /// * `batch` - The pulled `RecordBatch` from the left stream.
-    ///
-    /// # Returns
-    ///
-    /// * `Result<StatefulStreamResult<Option<RecordBatch>>>` - The state result after processing the batch.
-    fn process_batch_from_left(
-        &mut self,
-        batch: RecordBatch,
-    ) -> Result<StatefulStreamResult<Option<RecordBatch>>>;
-
-    /// Handles the situation when only the left stream is exhausted.
-    ///
-    /// # Arguments
-    ///
-    /// * `right_batch` - The `RecordBatch` from the right stream.
-    ///
-    /// # Returns
-    ///
-    /// * `Result<StatefulStreamResult<Option<RecordBatch>>>` - The state result after the left stream is exhausted.
-    fn process_batch_after_left_end(
-        &mut self,
-        right_batch: RecordBatch,
-    ) -> Result<StatefulStreamResult<Option<RecordBatch>>>;
-
-    /// Handles the situation when only the right stream is exhausted.
-    ///
-    /// # Arguments
-    ///
-    /// * `left_batch` - The `RecordBatch` from the left stream.
-    ///
-    /// # Returns
-    ///
-    /// * `Result<StatefulStreamResult<Option<RecordBatch>>>` - The state result after the right stream is exhausted.
-    fn process_batch_after_right_end(
-        &mut self,
-        left_batch: RecordBatch,
-    ) -> Result<StatefulStreamResult<Option<RecordBatch>>>;
-
-    /// Handles the final state after both streams are exhausted.
-    ///
-    /// # Returns
-    ///
-    /// * `Result<StatefulStreamResult<Option<RecordBatch>>>` - The final state result after processing.
-    fn process_batches_before_finalization(
-        &mut self,
-    ) -> Result<StatefulStreamResult<Option<RecordBatch>>>;
-
-    /// Provides mutable access to the right stream.
-    ///
-    /// # Returns
-    ///
-    /// * `&mut SendableRecordBatchStream` - Returns a mutable reference to the right stream.
-    fn right_stream(&mut self) -> &mut SendableRecordBatchStream;
-
-    /// Provides mutable access to the left stream.
-    ///
-    /// # Returns
-    ///
-    /// * `&mut SendableRecordBatchStream` - Returns a mutable reference to the left stream.
-    fn left_stream(&mut self) -> &mut SendableRecordBatchStream;
-
-    /// Sets the current state of the join stream.
-    ///
-    /// # Arguments
-    ///
-    /// * `state` - The new state to be set.
-    fn set_state(&mut self, state: EagerJoinStreamState);
-
-    /// Fetches the current state of the join stream.
-    ///
-    /// # Returns
-    ///
-    /// * `EagerJoinStreamState` - The current state of the join stream.
-    fn state(&mut self) -> EagerJoinStreamState;
-}
-
 #[derive(Debug)]
 pub struct StreamJoinSideMetrics {
     /// Number of batches consumed by this operator
@@ -1046,7 +706,7 @@ fn update_sorted_exprs_with_node_indices(
     // Extract filter expressions from the sorted expressions:
     let filter_exprs = sorted_exprs
         .iter()
-        .map(|expr| expr.filter_expr().clone())
+        .map(|expr| Arc::clone(expr.filter_expr()))
         .collect::<Vec<_>>();
 
     // Gather corresponding node indices for the extracted filter expressions from the graph:
@@ -1059,13 +719,21 @@ fn update_sorted_exprs_with_node_indices(
     }
 }
 
-/// Prepares and sorts expressions based on a given filter, left and right execution plans, and sort expressions.
+/// Prepares and sorts expressions based on a given filter, left and right schemas,
+/// and sort expressions.
 ///
-/// # Arguments
+/// This function prepares sorted filter expressions for both the left and right
+/// sides of a join operation. It first builds the filter order for each side
+/// based on the provided `ExecutionPlan`. If both sides have valid sorted filter
+/// expressions, the function then constructs an expression interval graph and
+/// updates the sorted expressions with node indices. The final sorted filter
+/// expressions for both sides are then returned.
+///
+/// # Parameters
 ///
 /// * `filter` - The join filter to base the sorting on.
-/// * `left` - The left execution plan.
-/// * `right` - The right execution plan.
+/// * `left` - The `ExecutionPlan` for the left side of the join.
+/// * `right` - The `ExecutionPlan` for the right side of the join.
 /// * `left_sort_exprs` - The expressions to sort on the left side.
 /// * `right_sort_exprs` - The expressions to sort on the right side.
 ///
@@ -1076,12 +744,14 @@ pub fn prepare_sorted_exprs(
     filter: &JoinFilter,
     left: &Arc<dyn ExecutionPlan>,
     right: &Arc<dyn ExecutionPlan>,
-    left_sort_exprs: &[PhysicalSortExpr],
-    right_sort_exprs: &[PhysicalSortExpr],
+    left_sort_exprs: &LexOrdering,
+    right_sort_exprs: &LexOrdering,
 ) -> Result<(SortedFilterExpr, SortedFilterExpr, ExprIntervalGraph)> {
-    // Build the filter order for the left side
-    let err = || plan_datafusion_err!("Filter does not include the child order");
+    let err = || {
+        datafusion_common::plan_datafusion_err!("Filter does not include the child order")
+    };
 
+    // Build the filter order for the left side:
     let left_temp_sorted_filter_expr = build_filter_input_order(
         JoinSide::Left,
         filter,
@@ -1090,7 +760,7 @@ pub fn prepare_sorted_exprs(
     )?
     .ok_or_else(err)?;
 
-    // Build the filter order for the right side
+    // Build the filter order for the right side:
     let right_temp_sorted_filter_expr = build_filter_input_order(
         JoinSide::Right,
         filter,
@@ -1105,7 +775,7 @@ pub fn prepare_sorted_exprs(
 
     // Build the expression interval graph
     let mut graph =
-        ExprIntervalGraph::try_new(filter.expression().clone(), filter.schema())?;
+        ExprIntervalGraph::try_new(Arc::clone(filter.expression()), filter.schema())?;
 
     // Update sorted expressions with node indices
     update_sorted_exprs_with_node_indices(&mut graph, &mut sorted_exprs);
@@ -1119,22 +789,12 @@ pub fn prepare_sorted_exprs(
 
 #[cfg(test)]
 pub mod tests {
-    use std::sync::Arc;
 
     use super::*;
-    use crate::joins::stream_join_utils::{
-        build_filter_input_order, check_filter_expr_contains_sort_information,
-        convert_sort_expr_with_filter_schema, PruningJoinHashMap,
-    };
-    use crate::{
-        expressions::{Column, PhysicalSortExpr},
-        joins::test_utils::complicated_filter,
-        joins::utils::{ColumnIndex, JoinFilter},
-    };
+    use crate::{joins::test_utils::complicated_filter, joins::utils::ColumnIndex};
 
     use arrow::compute::SortOptions;
-    use arrow::datatypes::{DataType, Field, Schema};
-    use datafusion_common::JoinSide;
+    use arrow::datatypes::{DataType, Field};
     use datafusion_expr::Operator;
     use datafusion_physical_expr::expressions::{binary, cast, col};
 
@@ -1177,9 +837,9 @@ pub mod tests {
             &intermediate_schema,
         )?;
         let filter_expr = binary(
-            filter_left.clone(),
+            Arc::clone(&filter_left),
             Operator::Gt,
-            filter_right.clone(),
+            Arc::clone(&filter_right),
             &intermediate_schema,
         )?;
         let column_indices = vec![
@@ -1311,15 +971,15 @@ pub mod tests {
         let filter_expr = complicated_filter(&intermediate_schema)?;
         let column_indices = vec![
             ColumnIndex {
-                index: 0,
+                index: left_schema.index_of("la1")?,
                 side: JoinSide::Left,
             },
             ColumnIndex {
-                index: 4,
+                index: left_schema.index_of("la2")?,
                 side: JoinSide::Left,
             },
             ColumnIndex {
-                index: 0,
+                index: right_schema.index_of("ra1")?,
                 side: JoinSide::Right,
             },
         ];

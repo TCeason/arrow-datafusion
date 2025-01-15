@@ -14,17 +14,18 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 extern crate wasm_bindgen;
 
 use datafusion_common::{DFSchema, ScalarValue};
+use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_expr::lit;
-use datafusion_optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
-use datafusion_physical_expr::execution_props::ExecutionProps;
+use datafusion_expr::simplify::SimplifyContext;
+use datafusion_optimizer::simplify_expressions::ExprSimplifier;
 use datafusion_sql::sqlparser::dialect::GenericDialect;
 use datafusion_sql::sqlparser::parser::Parser;
 use std::sync::Arc;
 use wasm_bindgen::prelude::*;
-
 pub fn set_panic_hook() {
     // When the `console_error_panic_hook` feature is enabled, we can call the
     // `set_panic_hook` function at least once during initialization, and then
@@ -44,7 +45,7 @@ extern "C" {
 }
 
 #[wasm_bindgen]
-pub fn try_datafusion() {
+pub fn basic_exprs() {
     set_panic_hook();
     // Create a scalar value (from datafusion-common)
     let scalar = ScalarValue::from("Hello, World!");
@@ -61,10 +62,118 @@ pub fn try_datafusion() {
         ExprSimplifier::new(SimplifyContext::new(&execution_props).with_schema(schema));
     let simplified_expr = simplifier.simplify(expr).unwrap();
     log(&format!("Simplified Expr: {simplified_expr:?}"));
+}
 
+#[wasm_bindgen]
+pub fn basic_parse() {
     // Parse SQL (using datafusion-sql)
     let sql = "SELECT 2 + 37";
     let dialect = GenericDialect {}; // or AnsiDialect, or your own dialect ...
     let ast = Parser::parse_sql(&dialect, sql).unwrap();
     log(&format!("Parsed SQL: {ast:?}"));
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use datafusion::{
+        arrow::{
+            array::{ArrayRef, Int32Array, RecordBatch, StringArray},
+            datatypes::{DataType, Field, Schema},
+        },
+        datasource::MemTable,
+        execution::context::SessionContext,
+    };
+    use datafusion_execution::{
+        config::SessionConfig, disk_manager::DiskManagerConfig,
+        runtime_env::RuntimeEnvBuilder,
+    };
+    use datafusion_physical_plan::collect;
+    use datafusion_sql::parser::DFParser;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    fn datafusion_test() {
+        basic_exprs();
+        basic_parse();
+    }
+
+    fn get_ctx() -> Arc<SessionContext> {
+        let rt = RuntimeEnvBuilder::new()
+            .with_disk_manager(DiskManagerConfig::Disabled)
+            .build_arc()
+            .unwrap();
+        let session_config = SessionConfig::new().with_target_partitions(1);
+        Arc::new(SessionContext::new_with_config_rt(session_config, rt))
+    }
+    #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn basic_execute() {
+        let sql = "SELECT 2 + 2;";
+
+        // Execute SQL (using datafusion)
+
+        let session_context = get_ctx();
+        let statement = DFParser::parse_sql(sql).unwrap().pop_back().unwrap();
+
+        let logical_plan = session_context
+            .state()
+            .statement_to_plan(statement)
+            .await
+            .unwrap();
+        let data_frame = session_context
+            .execute_logical_plan(logical_plan)
+            .await
+            .unwrap();
+        let physical_plan = data_frame.create_physical_plan().await.unwrap();
+
+        let task_ctx = session_context.task_ctx();
+        let _ = collect(physical_plan, task_ctx).await.unwrap();
+    }
+
+    #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn basic_df_function_execute() {
+        let sql = "SELECT abs(-1.0);";
+        let statement = DFParser::parse_sql(sql).unwrap().pop_back().unwrap();
+        let ctx = get_ctx();
+        let logical_plan = ctx.state().statement_to_plan(statement).await.unwrap();
+        let data_frame = ctx.execute_logical_plan(logical_plan).await.unwrap();
+        let physical_plan = data_frame.create_physical_plan().await.unwrap();
+
+        let task_ctx = ctx.task_ctx();
+        let _ = collect(physical_plan, task_ctx).await.unwrap();
+    }
+
+    #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn test_basic_aggregate() {
+        let sql =
+            "SELECT FIRST_VALUE(value) OVER (ORDER BY id) as first_val FROM test_table;";
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+
+        let data: Vec<ArrayRef> = vec![
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(StringArray::from(vec!["a"])),
+        ];
+
+        let batch = RecordBatch::try_new(schema.clone(), data).unwrap();
+        let table = MemTable::try_new(schema.clone(), vec![vec![batch]]).unwrap();
+
+        let ctx = get_ctx();
+        ctx.register_table("test_table", Arc::new(table)).unwrap();
+
+        let statement = DFParser::parse_sql(sql).unwrap().pop_back().unwrap();
+
+        let logical_plan = ctx.state().statement_to_plan(statement).await.unwrap();
+        let data_frame = ctx.execute_logical_plan(logical_plan).await.unwrap();
+        let physical_plan = data_frame.create_physical_plan().await.unwrap();
+
+        let task_ctx = ctx.task_ctx();
+        let _ = collect(physical_plan, task_ctx).await.unwrap();
+    }
 }

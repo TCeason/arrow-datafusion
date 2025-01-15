@@ -21,6 +21,11 @@ use datafusion::error::Result;
 use datafusion_benchmarks::tpch;
 use structopt::StructOpt;
 
+#[cfg(all(feature = "snmalloc", feature = "mimalloc"))]
+compile_error!(
+    "feature \"snmalloc\" and feature \"mimalloc\" cannot be enabled at the same time"
+);
+
 #[cfg(feature = "snmalloc")]
 #[global_allocator]
 static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
@@ -47,7 +52,7 @@ enum TpchOpt {
 /// use `dbbench` instead.
 ///
 /// Note: this is kept to be backwards compatible with the benchmark names prior to
-/// <https://github.com/apache/arrow-datafusion/issues/6994>
+/// <https://github.com/apache/datafusion/issues/6994>
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();

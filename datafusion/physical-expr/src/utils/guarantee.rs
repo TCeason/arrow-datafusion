@@ -20,9 +20,9 @@
 
 use crate::utils::split_disjunction;
 use crate::{split_conjunction, PhysicalExpr};
-use datafusion_common::{Column, ScalarValue};
+use datafusion_common::{Column, HashMap, ScalarValue};
 use datafusion_expr::Operator;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter};
 use std::sync::Arc;
 
@@ -62,14 +62,14 @@ use std::sync::Arc;
 /// A guarantee can be one of two forms:
 ///
 /// 1. The column must be one the values for the predicate to be `true`. If the
-/// column takes on any other value, the predicate can not evaluate to `true`.
-/// For example,
-/// `(a = 1)`, `(a = 1 OR a = 2) or `a IN (1, 2, 3)`
+///    column takes on any other value, the predicate can not evaluate to `true`.
+///    For example,
+///    `(a = 1)`, `(a = 1 OR a = 2)` or `a IN (1, 2, 3)`
 ///
 /// 2. The column must NOT be one of the values for the predicate to be `true`.
-/// If the column can ONLY take one of these values, the predicate can not
-/// evaluate to `true`. For example,
-/// `(a != 1)`, `(a != 1 AND a != 2)` or `a NOT IN (1, 2, 3)`
+///    If the column can ONLY take one of these values, the predicate can not
+///    evaluate to `true`. For example,
+///    `(a != 1)`, `(a != 1 AND a != 2)` or `a NOT IN (1, 2, 3)`
 #[derive(Debug, Clone, PartialEq)]
 pub struct LiteralGuarantee {
     pub column: Column,
@@ -93,18 +93,18 @@ impl LiteralGuarantee {
     /// Create a new instance of the guarantee if the provided operator is
     /// supported. Returns None otherwise. See [`LiteralGuarantee::analyze`] to
     /// create these structures from an predicate (boolean expression).
-    fn try_new<'a>(
+    fn new<'a>(
         column_name: impl Into<String>,
         guarantee: Guarantee,
         literals: impl IntoIterator<Item = &'a ScalarValue>,
-    ) -> Option<Self> {
+    ) -> Self {
         let literals: HashSet<_> = literals.into_iter().cloned().collect();
 
-        Some(Self {
+        Self {
             column: Column::from_name(column_name),
             guarantee,
             literals,
-        })
+        }
     }
 
     /// Return a list of [`LiteralGuarantee`]s that must be satisfied for `expr`
@@ -124,7 +124,7 @@ impl LiteralGuarantee {
             // for an `AND` conjunction to be true, all terms individually must be true
             .fold(GuaranteeBuilder::new(), |builder, expr| {
                 if let Some(cel) = ColOpLit::try_new(expr) {
-                    return builder.aggregate_conjunct(cel);
+                    builder.aggregate_conjunct(cel)
                 } else if let Some(inlist) = expr
                     .as_any()
                     .downcast_ref::<crate::expressions::InListExpr>()
@@ -225,26 +225,21 @@ impl LiteralGuarantee {
 
 impl Display for LiteralGuarantee {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let mut sorted_literals: Vec<_> =
+            self.literals.iter().map(|lit| lit.to_string()).collect();
+        sorted_literals.sort();
         match self.guarantee {
             Guarantee::In => write!(
                 f,
                 "{} in ({})",
                 self.column.name,
-                self.literals
-                    .iter()
-                    .map(|lit| lit.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                sorted_literals.join(", ")
             ),
             Guarantee::NotIn => write!(
                 f,
                 "{} not in ({})",
                 self.column.name,
-                self.literals
-                    .iter()
-                    .map(|lit| lit.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                sorted_literals.join(", ")
             ),
         }
     }
@@ -283,7 +278,7 @@ impl<'a> GuaranteeBuilder<'a> {
         )
     }
 
-    /// Aggregates a new single column, multi literal term to ths builder
+    /// Aggregates a new single column, multi literal term to this builder
     /// combining with previously known guarantees if possible.
     ///
     /// # Examples
@@ -343,13 +338,10 @@ impl<'a> GuaranteeBuilder<'a> {
             // This is a new guarantee
             let new_values: HashSet<_> = new_values.into_iter().collect();
 
-            if let Some(guarantee) =
-                LiteralGuarantee::try_new(col.name(), guarantee, new_values)
-            {
-                // add it to the list of guarantees
-                self.guarantees.push(Some(guarantee));
-                self.map.insert(key, self.guarantees.len() - 1);
-            }
+            let guarantee = LiteralGuarantee::new(col.name(), guarantee, new_values);
+            // add it to the list of guarantees
+            self.guarantees.push(Some(guarantee));
+            self.map.insert(key, self.guarantees.len() - 1);
         }
 
         self
@@ -374,6 +366,7 @@ impl<'a> ColOpLit<'a> {
     /// 1. `col <op> literal`
     /// 2. `literal <op> col`
     /// 3. operator is `=` or `!=`
+    ///
     /// Returns None otherwise
     fn try_new(expr: &'a Arc<dyn PhysicalExpr>) -> Option<Self> {
         let binary_expr = expr
@@ -419,15 +412,16 @@ impl<'a> ColOpLit<'a> {
 
 #[cfg(test)]
 mod test {
+    use std::sync::LazyLock;
+
     use super::*;
-    use crate::create_physical_expr;
-    use crate::execution_props::ExecutionProps;
+    use crate::planner::logical2physical;
+
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
-    use datafusion_common::ToDFSchema;
     use datafusion_expr::expr_fn::*;
     use datafusion_expr::{lit, Expr};
+
     use itertools::Itertools;
-    use std::sync::OnceLock;
 
     #[test]
     fn test_literal() {
@@ -470,7 +464,7 @@ mod test {
         test_analyze(
             col("b").not_eq(lit(1)).and(col("b").eq(lit(2))),
             vec![
-                // can only be true of b is not 1 and b is is 2 (even though it is redundant)
+                // can only be true of b is not 1 and b is 2 (even though it is redundant)
                 not_in_guarantee("b", [1]),
                 in_guarantee("b", [2]),
             ],
@@ -814,7 +808,7 @@ mod test {
             vec![not_in_guarantee("b", [1, 2, 3]), in_guarantee("b", [3, 4])],
         );
         // b IN (1, 2, 3) OR b = 2
-        // TODO this should be in_guarantee("b", [1, 2, 3]) but currently we don't support to anylize this kind of disjunction. Only `ColOpLit OR ColOpLit` is supported.
+        // TODO this should be in_guarantee("b", [1, 2, 3]) but currently we don't support to analyze this kind of disjunction. Only `ColOpLit OR ColOpLit` is supported.
         test_analyze(
             col("b")
                 .in_list(vec![lit(1), lit(2), lit(3)], false)
@@ -854,7 +848,7 @@ mod test {
         S: Into<ScalarValue> + 'a,
     {
         let literals: Vec<_> = literals.into_iter().map(|s| s.into()).collect();
-        LiteralGuarantee::try_new(column, Guarantee::In, literals.iter()).unwrap()
+        LiteralGuarantee::new(column, Guarantee::In, literals.iter())
     }
 
     /// Guarantee that the expression is true if the column is NOT any of the specified values
@@ -864,27 +858,17 @@ mod test {
         S: Into<ScalarValue> + 'a,
     {
         let literals: Vec<_> = literals.into_iter().map(|s| s.into()).collect();
-        LiteralGuarantee::try_new(column, Guarantee::NotIn, literals.iter()).unwrap()
-    }
-
-    /// Convert a logical expression to a physical expression (without any simplification, etc)
-    fn logical2physical(expr: &Expr, schema: &Schema) -> Arc<dyn PhysicalExpr> {
-        let df_schema = schema.clone().to_dfschema().unwrap();
-        let execution_props = ExecutionProps::new();
-        create_physical_expr(expr, &df_schema, &execution_props).unwrap()
+        LiteralGuarantee::new(column, Guarantee::NotIn, literals.iter())
     }
 
     // Schema for testing
     fn schema() -> SchemaRef {
-        SCHEMA
-            .get_or_init(|| {
-                Arc::new(Schema::new(vec![
-                    Field::new("a", DataType::Utf8, false),
-                    Field::new("b", DataType::Int32, false),
-                ]))
-            })
-            .clone()
+        static SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+            Arc::new(Schema::new(vec![
+                Field::new("a", DataType::Utf8, false),
+                Field::new("b", DataType::Int32, false),
+            ]))
+        });
+        Arc::clone(&SCHEMA)
     }
-
-    static SCHEMA: OnceLock<SchemaRef> = OnceLock::new();
 }

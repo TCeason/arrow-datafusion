@@ -50,7 +50,7 @@ pub struct MetricBuilder<'a> {
     /// optional partition number
     partition: Option<usize>,
 
-    /// arbitrary name=value pairs identifiying this metric
+    /// arbitrary name=value pairs identifying this metric
     labels: Vec<Label>,
 }
 
@@ -123,6 +123,15 @@ impl<'a> MetricBuilder<'a> {
         count
     }
 
+    /// Consume self and create a new counter for recording the total spilled rows
+    /// triggered by an operator
+    pub fn spilled_rows(self, partition: usize) -> Count {
+        let count = Count::new();
+        self.with_partition(partition)
+            .build(MetricValue::SpilledRows(count.clone()));
+        count
+    }
+
     /// Consume self and create a new gauge for reporting current memory usage
     pub fn mem_used(self, partition: usize) -> Gauge {
         let gauge = Gauge::new();
@@ -183,7 +192,7 @@ impl<'a> MetricBuilder<'a> {
     }
 
     /// Consumes self and creates a new Timer for recording some
-    /// subset of of an operators execution time.
+    /// subset of an operators execution time.
     pub fn subset_time(
         self,
         subset_name: impl Into<Cow<'static, str>>,

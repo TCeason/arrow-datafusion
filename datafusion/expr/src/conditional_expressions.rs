@@ -19,27 +19,7 @@
 use crate::expr::Case;
 use crate::{expr_schema::ExprSchemable, Expr};
 use arrow::datatypes::DataType;
-use datafusion_common::{plan_err, DFSchema, DataFusionError, Result};
-use std::collections::HashSet;
-
-/// Currently supported types by the coalesce function.
-/// The order of these types correspond to the order on which coercion applies
-/// This should thus be from least informative to most informative
-pub static SUPPORTED_COALESCE_TYPES: &[DataType] = &[
-    DataType::Boolean,
-    DataType::UInt8,
-    DataType::UInt16,
-    DataType::UInt32,
-    DataType::UInt64,
-    DataType::Int8,
-    DataType::Int16,
-    DataType::Int32,
-    DataType::Int64,
-    DataType::Float32,
-    DataType::Float64,
-    DataType::Utf8,
-    DataType::LargeUtf8,
-];
+use datafusion_common::{plan_err, DFSchema, HashSet, Result};
 
 /// Helper struct for building [Expr::Case]
 pub struct CaseBuilder {
@@ -83,7 +63,7 @@ impl CaseBuilder {
     }
 
     fn build(&self) -> Result<Expr> {
-        // collect all "then" expressions
+        // Collect all "then" expressions
         let mut then_expr = self.then_expr.clone();
         if let Some(e) = &self.else_expr {
             then_expr.push(e.as_ref().to_owned());
@@ -98,7 +78,7 @@ impl CaseBuilder {
             .collect::<Result<Vec<_>>>()?;
 
         if then_types.contains(&DataType::Null) {
-            // cannot verify types until execution type
+            // Cannot verify types until execution type
         } else {
             let unique_types: HashSet<&DataType> = then_types.iter().collect();
             if unique_types.len() != 1 {

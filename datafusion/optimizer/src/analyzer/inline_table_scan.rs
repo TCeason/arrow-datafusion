@@ -17,21 +17,17 @@
 
 //! Analyzed rule to replace TableScan references
 //! such as DataFrames and Views and inlines the LogicalPlan.
-use std::sync::Arc;
 
 use crate::analyzer::AnalyzerRule;
+
 use datafusion_common::config::ConfigOptions;
-use datafusion_common::tree_node::{Transformed, TreeNode};
-use datafusion_common::Result;
-use datafusion_expr::expr::Exists;
-use datafusion_expr::expr::InSubquery;
-use datafusion_expr::{
-    logical_plan::LogicalPlan, Expr, Filter, LogicalPlanBuilder, TableScan,
-};
+use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
+use datafusion_common::{Column, Result};
+use datafusion_expr::{logical_plan::LogicalPlan, wildcard, Expr, LogicalPlanBuilder};
 
 /// Analyzed rule that inlines TableScan that provide a [`LogicalPlan`]
 /// (DataFrame / ViewTable)
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct InlineTableScan;
 
 impl InlineTableScan {
@@ -42,7 +38,7 @@ impl InlineTableScan {
 
 impl AnalyzerRule for InlineTableScan {
     fn analyze(&self, plan: LogicalPlan, _: &ConfigOptions) -> Result<LogicalPlan> {
-        plan.transform_up(&analyze_internal)
+        plan.transform_up(analyze_internal).data()
     }
 
     fn name(&self) -> &str {
@@ -51,67 +47,37 @@ impl AnalyzerRule for InlineTableScan {
 }
 
 fn analyze_internal(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
-    Ok(match plan {
-        // Match only on scans without filter / projection / fetch
-        // Views and DataFrames won't have those added
-        // during the early stage of planning
-        LogicalPlan::TableScan(TableScan {
-            table_name,
-            source,
-            projection,
-            filters,
-            ..
-        }) if filters.is_empty() && source.get_logical_plan().is_some() => {
-            let sub_plan = source.get_logical_plan().unwrap();
-            let projection_exprs = generate_projection_expr(&projection, sub_plan)?;
-            let plan = LogicalPlanBuilder::from(sub_plan.clone())
-                .project(projection_exprs)?
-                // Ensures that the reference to the inlined table remains the
-                // same, meaning we don't have to change any of the parent nodes
-                // that reference this table.
-                .alias(table_name)?
-                .build()?;
-            Transformed::Yes(plan)
-        }
-        LogicalPlan::Filter(filter) => {
-            let new_expr = filter.predicate.transform(&rewrite_subquery)?;
-            Transformed::Yes(LogicalPlan::Filter(Filter::try_new(
-                new_expr,
-                filter.input,
-            )?))
-        }
-        _ => Transformed::No(plan),
-    })
-}
+    // rewrite any subqueries in the plan first
+    let transformed_plan =
+        plan.map_subqueries(|plan| plan.transform_up(analyze_internal))?;
 
-fn rewrite_subquery(expr: Expr) -> Result<Transformed<Expr>> {
-    match expr {
-        Expr::Exists(Exists { subquery, negated }) => {
-            let plan = subquery.subquery.as_ref().clone();
-            let new_plan = plan.transform_up(&analyze_internal)?;
-            let subquery = subquery.with_plan(Arc::new(new_plan));
-            Ok(Transformed::Yes(Expr::Exists(Exists { subquery, negated })))
+    let transformed_plan = transformed_plan.transform_data(|plan| {
+        match plan {
+            // Match only on scans without filter / projection / fetch
+            // Views and DataFrames won't have those added
+            // during the early stage of planning.
+            LogicalPlan::TableScan(table_scan) if table_scan.filters.is_empty() => {
+                if let Some(sub_plan) = table_scan.source.get_logical_plan() {
+                    let sub_plan = sub_plan.into_owned();
+                    let projection_exprs =
+                        generate_projection_expr(&table_scan.projection, &sub_plan)?;
+                    LogicalPlanBuilder::from(sub_plan)
+                        .project(projection_exprs)?
+                        // Ensures that the reference to the inlined table remains the
+                        // same, meaning we don't have to change any of the parent nodes
+                        // that reference this table.
+                        .alias(table_scan.table_name)?
+                        .build()
+                        .map(Transformed::yes)
+                } else {
+                    Ok(Transformed::no(LogicalPlan::TableScan(table_scan)))
+                }
+            }
+            _ => Ok(Transformed::no(plan)),
         }
-        Expr::InSubquery(InSubquery {
-            expr,
-            subquery,
-            negated,
-        }) => {
-            let plan = subquery.subquery.as_ref().clone();
-            let new_plan = plan.transform_up(&analyze_internal)?;
-            let subquery = subquery.with_plan(Arc::new(new_plan));
-            Ok(Transformed::Yes(Expr::InSubquery(InSubquery::new(
-                expr, subquery, negated,
-            ))))
-        }
-        Expr::ScalarSubquery(subquery) => {
-            let plan = subquery.subquery.as_ref().clone();
-            let new_plan = plan.transform_up(&analyze_internal)?;
-            let subquery = subquery.with_plan(Arc::new(new_plan));
-            Ok(Transformed::Yes(Expr::ScalarSubquery(subquery)))
-        }
-        _ => Ok(Transformed::No(expr)),
-    }
+    })?;
+
+    Ok(transformed_plan)
 }
 
 fn generate_projection_expr(
@@ -121,26 +87,25 @@ fn generate_projection_expr(
     let mut exprs = vec![];
     if let Some(projection) = projection {
         for i in projection {
-            exprs.push(Expr::Column(
-                sub_plan.schema().fields()[*i].qualified_column(),
-            ));
+            exprs.push(Expr::Column(Column::from(
+                sub_plan.schema().qualified_field(*i),
+            )));
         }
     } else {
-        exprs.push(Expr::Wildcard { qualifier: None });
+        exprs.push(wildcard());
     }
     Ok(exprs)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, vec};
-
-    use arrow::datatypes::{DataType, Field, Schema};
-
-    use datafusion_expr::{col, lit, LogicalPlan, LogicalPlanBuilder, TableSource};
+    use std::{borrow::Cow, sync::Arc, vec};
 
     use crate::analyzer::inline_table_scan::InlineTableScan;
     use crate::test::assert_analyzed_plan_eq;
+
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion_expr::{col, lit, Expr, LogicalPlan, LogicalPlanBuilder, TableSource};
 
     pub struct RawTableSource {}
 
@@ -156,12 +121,14 @@ mod tests {
             ]))
         }
 
-        fn supports_filter_pushdown(
+        fn supports_filters_pushdown(
             &self,
-            _filter: &datafusion_expr::Expr,
-        ) -> datafusion_common::Result<datafusion_expr::TableProviderFilterPushDown>
+            filters: &[&Expr],
+        ) -> datafusion_common::Result<Vec<datafusion_expr::TableProviderFilterPushDown>>
         {
-            Ok(datafusion_expr::TableProviderFilterPushDown::Inexact)
+            Ok((0..filters.len())
+                .map(|_| datafusion_expr::TableProviderFilterPushDown::Inexact)
+                .collect())
         }
     }
 
@@ -185,20 +152,22 @@ mod tests {
             self
         }
 
-        fn supports_filter_pushdown(
+        fn supports_filters_pushdown(
             &self,
-            _filter: &datafusion_expr::Expr,
-        ) -> datafusion_common::Result<datafusion_expr::TableProviderFilterPushDown>
+            filters: &[&Expr],
+        ) -> datafusion_common::Result<Vec<datafusion_expr::TableProviderFilterPushDown>>
         {
-            Ok(datafusion_expr::TableProviderFilterPushDown::Exact)
+            Ok((0..filters.len())
+                .map(|_| datafusion_expr::TableProviderFilterPushDown::Exact)
+                .collect())
         }
 
         fn schema(&self) -> arrow::datatypes::SchemaRef {
             Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]))
         }
 
-        fn get_logical_plan(&self) -> Option<&LogicalPlan> {
-            Some(&self.plan)
+        fn get_logical_plan(&self) -> Option<Cow<LogicalPlan>> {
+            Some(Cow::Borrowed(&self.plan))
         }
     }
 
@@ -212,10 +181,10 @@ mod tests {
         let plan = scan.filter(col("x.a").eq(lit(1)))?.build()?;
         let expected = "Filter: x.a = Int32(1)\
         \n  SubqueryAlias: x\
-        \n    Projection: y.a, y.b\
+        \n    Projection: *\
         \n      TableScan: y";
 
-        assert_analyzed_plan_eq(Arc::new(InlineTableScan::new()), &plan, expected)
+        assert_analyzed_plan_eq(Arc::new(InlineTableScan::new()), plan, expected)
     }
 
     #[test]
@@ -231,6 +200,6 @@ mod tests {
         \n  Projection: y.a\
         \n    TableScan: y";
 
-        assert_analyzed_plan_eq(Arc::new(InlineTableScan::new()), &plan, expected)
+        assert_analyzed_plan_eq(Arc::new(InlineTableScan::new()), plan, expected)
     }
 }

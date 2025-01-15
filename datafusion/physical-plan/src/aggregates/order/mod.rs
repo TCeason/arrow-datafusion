@@ -19,18 +19,19 @@ use arrow_array::ArrayRef;
 use arrow_schema::Schema;
 use datafusion_common::Result;
 use datafusion_expr::EmitTo;
-use datafusion_physical_expr::PhysicalSortExpr;
+use datafusion_physical_expr_common::sort_expr::LexOrdering;
+use std::mem::size_of;
 
 mod full;
 mod partial;
 
 use crate::InputOrderMode;
-pub(crate) use full::GroupOrderingFull;
-pub(crate) use partial::GroupOrderingPartial;
+pub use full::GroupOrderingFull;
+pub use partial::GroupOrderingPartial;
 
 /// Ordering information for each group in the hash table
 #[derive(Debug)]
-pub(crate) enum GroupOrdering {
+pub enum GroupOrdering {
     /// Groups are not ordered
     None,
     /// Groups are ordered by some pre-set of the group keys
@@ -40,11 +41,11 @@ pub(crate) enum GroupOrdering {
 }
 
 impl GroupOrdering {
-    /// Create a `GroupOrdering` for the the specified ordering
+    /// Create a `GroupOrdering` for the specified ordering
     pub fn try_new(
         input_schema: &Schema,
         mode: &InputOrderMode,
-        ordering: &[PhysicalSortExpr],
+        ordering: &LexOrdering,
     ) -> Result<Self> {
         match mode {
             InputOrderMode::Linear => Ok(GroupOrdering::None),
@@ -87,7 +88,7 @@ impl GroupOrdering {
     /// Called when new groups are added in a batch
     ///
     /// * `total_num_groups`: total number of groups (so max
-    /// group_index is total_num_groups - 1).
+    ///   group_index is total_num_groups - 1).
     ///
     /// * `group_values`: group key values for *each row* in the batch
     ///
@@ -117,8 +118,8 @@ impl GroupOrdering {
     }
 
     /// Return the size of memory used by the ordering state, in bytes
-    pub(crate) fn size(&self) -> usize {
-        std::mem::size_of::<Self>()
+    pub fn size(&self) -> usize {
+        size_of::<Self>()
             + match self {
                 GroupOrdering::None => 0,
                 GroupOrdering::Partial(partial) => partial.size(),

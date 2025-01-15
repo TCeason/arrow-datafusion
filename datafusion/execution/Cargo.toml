@@ -28,21 +28,25 @@ license = { workspace = true }
 authors = { workspace = true }
 rust-version = { workspace = true }
 
+[lints]
+workspace = true
+
 [lib]
 name = "datafusion_execution"
 path = "src/lib.rs"
 
 [dependencies]
 arrow = { workspace = true }
-chrono = { version = "0.4", default-features = false }
 dashmap = { workspace = true }
-datafusion-common = { workspace = true }
+datafusion-common = { workspace = true, default-features = true }
 datafusion-expr = { workspace = true }
 futures = { workspace = true }
-hashbrown = { version = "0.14", features = ["raw"] }
 log = { workspace = true }
 object_store = { workspace = true }
 parking_lot = { workspace = true }
 rand = { workspace = true }
 tempfile = { workspace = true }
 url = { workspace = true }
+
+[dev-dependencies]
+chrono = { workspace = true }

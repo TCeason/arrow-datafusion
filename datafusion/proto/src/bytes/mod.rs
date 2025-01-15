@@ -16,6 +16,7 @@
 // under the License.
 
 //! Serialization / Deserialization to Bytes
+use crate::logical_plan::to_proto::serialize_expr;
 use crate::logical_plan::{
     self, AsLogicalPlan, DefaultLogicalExtensionCodec, LogicalExtensionCodec,
 };
@@ -23,7 +24,7 @@ use crate::physical_plan::{
     AsExecutionPlan, DefaultPhysicalExtensionCodec, PhysicalExtensionCodec,
 };
 use crate::protobuf;
-use datafusion_common::{plan_datafusion_err, DataFusionError, Result};
+use datafusion_common::{plan_datafusion_err, Result};
 use datafusion_expr::{
     create_udaf, create_udf, create_udwf, AggregateUDF, Expr, LogicalPlan, Volatility,
     WindowUDF,
@@ -38,6 +39,7 @@ use std::sync::Arc;
 use datafusion::execution::registry::FunctionRegistry;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
+use datafusion_expr::planner::ExprPlanner;
 
 mod registry;
 
@@ -87,8 +89,8 @@ pub trait Serializeable: Sized {
 impl Serializeable for Expr {
     fn to_bytes(&self) -> Result<Bytes> {
         let mut buffer = BytesMut::new();
-        let protobuf: protobuf::LogicalExprNode = self
-            .try_into()
+        let extension_codec = DefaultLogicalExtensionCodec {};
+        let protobuf: protobuf::LogicalExprNode = serialize_expr(self, &extension_codec)
             .map_err(|e| plan_datafusion_err!("Error encoding expr as protobuf: {e}"))?;
 
         protobuf
@@ -98,7 +100,7 @@ impl Serializeable for Expr {
         let bytes: Bytes = buffer.into();
 
         // the produced byte stream may lead to "recursion limit" errors, see
-        // https://github.com/apache/arrow-datafusion/issues/3968
+        // https://github.com/apache/datafusion/issues/3968
         // Until the underlying prost issue ( https://github.com/tokio-rs/prost/issues/736 ) is fixed, we try to
         // deserialize the data here and check for errors.
         //
@@ -114,7 +116,7 @@ impl Serializeable for Expr {
                 Ok(Arc::new(create_udf(
                     name,
                     vec![],
-                    Arc::new(arrow::datatypes::DataType::Null),
+                    arrow::datatypes::DataType::Null,
                     Volatility::Immutable,
                     Arc::new(|_| unimplemented!()),
                 )))
@@ -140,6 +142,34 @@ impl Serializeable for Expr {
                     Arc::new(|| unimplemented!()),
                 )))
             }
+            fn register_udaf(
+                &mut self,
+                _udaf: Arc<AggregateUDF>,
+            ) -> Result<Option<Arc<AggregateUDF>>> {
+                datafusion_common::internal_err!(
+                    "register_udaf called in Placeholder Registry!"
+                )
+            }
+            fn register_udf(
+                &mut self,
+                _udf: Arc<datafusion_expr::ScalarUDF>,
+            ) -> Result<Option<Arc<datafusion_expr::ScalarUDF>>> {
+                datafusion_common::internal_err!(
+                    "register_udf called in Placeholder Registry!"
+                )
+            }
+            fn register_udwf(
+                &mut self,
+                _udaf: Arc<WindowUDF>,
+            ) -> Result<Option<Arc<WindowUDF>>> {
+                datafusion_common::internal_err!(
+                    "register_udwf called in Placeholder Registry!"
+                )
+            }
+
+            fn expr_planners(&self) -> Vec<Arc<dyn ExprPlanner>> {
+                vec![]
+            }
         }
         Expr::from_bytes_with_registry(&bytes, &PlaceHolderRegistry)?;
 
@@ -153,7 +183,8 @@ impl Serializeable for Expr {
         let protobuf = protobuf::LogicalExprNode::decode(bytes)
             .map_err(|e| plan_datafusion_err!("Error decoding expr as protobuf: {e}"))?;
 
-        logical_plan::from_proto::parse_expr(&protobuf, registry)
+        let extension_codec = DefaultLogicalExtensionCodec {};
+        logical_plan::from_proto::parse_expr(&protobuf, registry, &extension_codec)
             .map_err(|e| plan_datafusion_err!("Error parsing protobuf into Expr: {e}"))
     }
 }

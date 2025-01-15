@@ -15,33 +15,37 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow::csv::WriterBuilder;
-use datafusion_common::file_options::arrow_writer::ArrowWriterOptions;
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::str::FromStr;
 use std::sync::Arc;
 
-use crate::common::{byte_to_string, proto_error, str_to_byte};
 use crate::protobuf::logical_plan_node::LogicalPlanType::CustomScan;
 use crate::protobuf::{
-    copy_to_node, file_type_writer_options, CustomTableScanNode,
-    LogicalExprNodeCollection, SqlOption,
+    dml_node, ColumnUnnestListItem, ColumnUnnestListRecursion, CteWorkTableScanNode,
+    CustomTableScanNode, DmlNode, SortExprNodeCollection,
 };
 use crate::{
-    convert_required,
+    convert_required, into_required,
     protobuf::{
         self, listing_table_scan_node::FileFormatType,
         logical_plan_node::LogicalPlanType, LogicalExtensionNode, LogicalPlanNode,
     },
 };
 
+use crate::protobuf::{proto_error, ToProtoError};
 use arrow::datatypes::{DataType, Schema, SchemaRef};
+use datafusion::datasource::cte_worktable::CteWorkTable;
 #[cfg(feature = "parquet")]
 use datafusion::datasource::file_format::parquet::ParquetFormat;
+use datafusion::datasource::file_format::{
+    file_type_to_format, format_as_file_type, FileFormatFactory,
+};
 use datafusion::{
     datasource::{
-        file_format::{avro::AvroFormat, csv::CsvFormat, FileFormat},
+        file_format::{
+            avro::AvroFormat, csv::CsvFormat, json::JsonFormat as OtherNdJsonFormat,
+            FileFormat,
+        },
         listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl},
         view::ViewTable,
         TableProvider,
@@ -49,43 +53,35 @@ use datafusion::{
     datasource::{provider_as_source, source_as_provider},
     prelude::SessionContext,
 };
+use datafusion_common::file_options::file_type::FileType;
 use datafusion_common::{
-    context, file_options::StatementOptions, internal_err, not_impl_err,
-    parsers::CompressionTypeVariant, plan_datafusion_err, DataFusionError, FileType,
-    FileTypeWriterOptions, OwnedTableReference, Result,
+    context, internal_datafusion_err, internal_err, not_impl_err, DataFusionError,
+    Result, TableReference,
 };
 use datafusion_expr::{
     dml,
     logical_plan::{
         builder::project, Aggregate, CreateCatalog, CreateCatalogSchema,
-        CreateExternalTable, CreateView, CrossJoin, DdlStatement, Distinct,
-        EmptyRelation, Extension, Join, JoinConstraint, Limit, Prepare, Projection,
-        Repartition, Sort, SubqueryAlias, TableScan, Values, Window,
+        CreateExternalTable, CreateView, DdlStatement, Distinct, EmptyRelation,
+        Extension, Join, JoinConstraint, Prepare, Projection, Repartition, Sort,
+        SubqueryAlias, TableScan, Values, Window,
     },
-    DistinctOn, DropView, Expr, LogicalPlan, LogicalPlanBuilder,
+    DistinctOn, DropView, Expr, LogicalPlan, LogicalPlanBuilder, ScalarUDF, SortExpr,
+    Statement, WindowUDF,
+};
+use datafusion_expr::{
+    AggregateUDF, ColumnUnnestList, DmlStatement, FetchType, RecursiveQuery, SkipType,
+    Unnest,
 };
 
-use datafusion::parquet::file::properties::{WriterProperties, WriterVersion};
-use datafusion_common::file_options::csv_writer::CsvWriterOptions;
-use datafusion_common::file_options::parquet_writer::ParquetWriterOptions;
-use datafusion_expr::dml::CopyOptions;
+use self::to_proto::{serialize_expr, serialize_exprs};
+use crate::logical_plan::to_proto::serialize_sorts;
 use prost::bytes::BufMut;
 use prost::Message;
 
+pub mod file_formats;
 pub mod from_proto;
 pub mod to_proto;
-
-impl From<from_proto::Error> for DataFusionError {
-    fn from(e: from_proto::Error) -> Self {
-        plan_datafusion_err!("{}", e)
-    }
-}
-
-impl From<to_proto::Error> for DataFusionError {
-    fn from(e: to_proto::Error) -> Self {
-        plan_datafusion_err!("{}", e)
-    }
-}
 
 pub trait AsLogicalPlan: Debug + Send + Sync + Clone {
     fn try_decode(buf: &[u8]) -> Result<Self>
@@ -124,15 +120,59 @@ pub trait LogicalExtensionCodec: Debug + Send + Sync {
     fn try_decode_table_provider(
         &self,
         buf: &[u8],
+        table_ref: &TableReference,
         schema: SchemaRef,
         ctx: &SessionContext,
     ) -> Result<Arc<dyn TableProvider>>;
 
     fn try_encode_table_provider(
         &self,
+        table_ref: &TableReference,
         node: Arc<dyn TableProvider>,
         buf: &mut Vec<u8>,
     ) -> Result<()>;
+
+    fn try_decode_file_format(
+        &self,
+        _buf: &[u8],
+        _ctx: &SessionContext,
+    ) -> Result<Arc<dyn FileFormatFactory>> {
+        not_impl_err!("LogicalExtensionCodec is not provided for file format")
+    }
+
+    fn try_encode_file_format(
+        &self,
+        _buf: &mut Vec<u8>,
+        _node: Arc<dyn FileFormatFactory>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn try_decode_udf(&self, name: &str, _buf: &[u8]) -> Result<Arc<ScalarUDF>> {
+        not_impl_err!("LogicalExtensionCodec is not provided for scalar function {name}")
+    }
+
+    fn try_encode_udf(&self, _node: &ScalarUDF, _buf: &mut Vec<u8>) -> Result<()> {
+        Ok(())
+    }
+
+    fn try_decode_udaf(&self, name: &str, _buf: &[u8]) -> Result<Arc<AggregateUDF>> {
+        not_impl_err!(
+            "LogicalExtensionCodec is not provided for aggregate function {name}"
+        )
+    }
+
+    fn try_encode_udaf(&self, _node: &AggregateUDF, _buf: &mut Vec<u8>) -> Result<()> {
+        Ok(())
+    }
+
+    fn try_decode_udwf(&self, name: &str, _buf: &[u8]) -> Result<Arc<WindowUDF>> {
+        not_impl_err!("LogicalExtensionCodec is not provided for window function {name}")
+    }
+
+    fn try_encode_udwf(&self, _node: &WindowUDF, _buf: &mut Vec<u8>) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -155,6 +195,7 @@ impl LogicalExtensionCodec for DefaultLogicalExtensionCodec {
     fn try_decode_table_provider(
         &self,
         _buf: &[u8],
+        _table_ref: &TableReference,
         _schema: SchemaRef,
         _ctx: &SessionContext,
     ) -> Result<Arc<dyn TableProvider>> {
@@ -163,6 +204,7 @@ impl LogicalExtensionCodec for DefaultLogicalExtensionCodec {
 
     fn try_encode_table_provider(
         &self,
+        _table_ref: &TableReference,
         _node: Arc<dyn TableProvider>,
         _buf: &mut Vec<u8>,
     ) -> Result<()> {
@@ -181,10 +223,10 @@ macro_rules! into_logical_plan {
     }};
 }
 
-fn from_owned_table_reference(
-    table_ref: Option<&protobuf::OwnedTableReference>,
+fn from_table_reference(
+    table_ref: Option<&protobuf::TableReference>,
     error_context: &str,
-) -> Result<OwnedTableReference> {
+) -> Result<TableReference> {
     let table_ref = table_ref.ok_or_else(|| {
         DataFusionError::Internal(format!(
             "Protobuf deserialization error, {error_context} was missing required field name."
@@ -239,24 +281,18 @@ impl AsLogicalPlan for LogicalPlanNode {
                     values
                         .values_list
                         .chunks_exact(n_cols)
-                        .map(|r| {
-                            r.iter()
-                                .map(|expr| from_proto::parse_expr(expr, ctx))
-                                .collect::<Result<Vec<_>, from_proto::Error>>()
-                        })
+                        .map(|r| from_proto::parse_exprs(r, ctx, extension_codec))
                         .collect::<Result<Vec<_>, _>>()
                         .map_err(|e| e.into())
                 }?;
+
                 LogicalPlanBuilder::values(values)?.build()
             }
             LogicalPlanType::Projection(projection) => {
                 let input: LogicalPlan =
                     into_logical_plan!(projection.input, ctx, extension_codec)?;
-                let expr: Vec<Expr> = projection
-                    .expr
-                    .iter()
-                    .map(|expr| from_proto::parse_expr(expr, ctx))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let expr: Vec<Expr> =
+                    from_proto::parse_exprs(&projection.expr, ctx, extension_codec)?;
 
                 let new_proj = project(input, expr)?;
                 match projection.optional_alias.as_ref() {
@@ -277,7 +313,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                 let expr: Expr = selection
                     .expr
                     .as_ref()
-                    .map(|expr| from_proto::parse_expr(expr, ctx))
+                    .map(|expr| from_proto::parse_expr(expr, ctx, extension_codec))
                     .transpose()?
                     .ok_or_else(|| {
                         DataFusionError::Internal("expression required".to_string())
@@ -288,26 +324,17 @@ impl AsLogicalPlan for LogicalPlanNode {
             LogicalPlanType::Window(window) => {
                 let input: LogicalPlan =
                     into_logical_plan!(window.input, ctx, extension_codec)?;
-                let window_expr = window
-                    .window_expr
-                    .iter()
-                    .map(|expr| from_proto::parse_expr(expr, ctx))
-                    .collect::<Result<Vec<Expr>, _>>()?;
+                let window_expr =
+                    from_proto::parse_exprs(&window.window_expr, ctx, extension_codec)?;
                 LogicalPlanBuilder::from(input).window(window_expr)?.build()
             }
             LogicalPlanType::Aggregate(aggregate) => {
                 let input: LogicalPlan =
                     into_logical_plan!(aggregate.input, ctx, extension_codec)?;
-                let group_expr = aggregate
-                    .group_expr
-                    .iter()
-                    .map(|expr| from_proto::parse_expr(expr, ctx))
-                    .collect::<Result<Vec<Expr>, _>>()?;
-                let aggr_expr = aggregate
-                    .aggr_expr
-                    .iter()
-                    .map(|expr| from_proto::parse_expr(expr, ctx))
-                    .collect::<Result<Vec<Expr>, _>>()?;
+                let group_expr =
+                    from_proto::parse_exprs(&aggregate.group_expr, ctx, extension_codec)?;
+                let aggr_expr =
+                    from_proto::parse_exprs(&aggregate.aggr_expr, ctx, extension_codec)?;
                 LogicalPlanBuilder::from(input)
                     .aggregate(group_expr, aggr_expr)?
                     .build()
@@ -325,20 +352,16 @@ impl AsLogicalPlan for LogicalPlanNode {
                     projection = Some(column_indices);
                 }
 
-                let filters = scan
-                    .filters
-                    .iter()
-                    .map(|expr| from_proto::parse_expr(expr, ctx))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let filters =
+                    from_proto::parse_exprs(&scan.filters, ctx, extension_codec)?;
 
                 let mut all_sort_orders = vec![];
                 for order in &scan.file_sort_order {
-                    let file_sort_order = order
-                        .logical_expr_nodes
-                        .iter()
-                        .map(|expr| from_proto::parse_expr(expr, ctx))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    all_sort_orders.push(file_sort_order)
+                    all_sort_orders.push(from_proto::parse_sorts(
+                        &order.sort_expr_nodes,
+                        ctx,
+                        extension_codec,
+                    )?)
                 }
 
                 let file_format: Arc<dyn FileFormat> =
@@ -347,24 +370,37 @@ impl AsLogicalPlan for LogicalPlanNode {
                             "logical_plan::from_proto() Unsupported file format '{self:?}'"
                         ))
                     })? {
-                        #[cfg(feature = "parquet")]
-                        &FileFormatType::Parquet(protobuf::ParquetFormat {}) => {
-                            Arc::new(ParquetFormat::default())
+                        #[cfg_attr(not(feature = "parquet"), allow(unused_variables))]
+                        FileFormatType::Parquet(protobuf::ParquetFormat {options}) => {
+                            #[cfg(feature = "parquet")]
+                            {
+                                let mut parquet = ParquetFormat::default();
+                                if let Some(options) = options {
+                                    parquet = parquet.with_options(options.try_into()?)
+                                }
+                                Arc::new(parquet)
+                            }
+                            #[cfg(not(feature = "parquet"))]
+                            panic!("Unable to process parquet file since `parquet` feature is not enabled");
                         }
                         FileFormatType::Csv(protobuf::CsvFormat {
-                            has_header,
-                            delimiter,
-                            quote,
-                            optional_escape
+                            options
                         }) => {
-                            let mut csv = CsvFormat::default()
-                            .with_has_header(*has_header)
-                            .with_delimiter(str_to_byte(delimiter, "delimiter")?)
-                            .with_quote(str_to_byte(quote, "quote")?);
-                            if let Some(protobuf::csv_format::OptionalEscape::Escape(escape)) = optional_escape {
-                                csv = csv.with_quote(str_to_byte(escape, "escape")?);
+                            let mut csv = CsvFormat::default();
+                            if let Some(options) = options {
+                                csv = csv.with_options(options.try_into()?)
                             }
-                            Arc::new(csv)},
+                            Arc::new(csv)
+                        },
+                        FileFormatType::Json(protobuf::NdJsonFormat {
+                            options
+                        }) => {
+                            let mut json = OtherNdJsonFormat::default();
+                            if let Some(options) = options {
+                                json = json.with_options(options.try_into()?)
+                            }
+                            Arc::new(json)
+                        }
                         FileFormatType::Avro(..) => Arc::new(AvroFormat),
                     };
 
@@ -407,10 +443,8 @@ impl AsLogicalPlan for LogicalPlanNode {
                         .get_file_statistic_cache(),
                 );
 
-                let table_name = from_owned_table_reference(
-                    scan.table_name.as_ref(),
-                    "ListingTableScan",
-                )?;
+                let table_name =
+                    from_table_reference(scan.table_name.as_ref(), "ListingTableScan")?;
 
                 LogicalPlanBuilder::scan_with_filters(
                     table_name,
@@ -420,7 +454,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                 )?
                 .build()
             }
-            LogicalPlanType::CustomScan(scan) => {
+            CustomScan(scan) => {
                 let schema: Schema = convert_required!(scan.schema)?;
                 let schema = Arc::new(schema);
                 let mut projection = None;
@@ -433,19 +467,18 @@ impl AsLogicalPlan for LogicalPlanNode {
                     projection = Some(column_indices);
                 }
 
-                let filters = scan
-                    .filters
-                    .iter()
-                    .map(|expr| from_proto::parse_expr(expr, ctx))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let filters =
+                    from_proto::parse_exprs(&scan.filters, ctx, extension_codec)?;
+
+                let table_name =
+                    from_table_reference(scan.table_name.as_ref(), "CustomScan")?;
+
                 let provider = extension_codec.try_decode_table_provider(
                     &scan.custom_table_data,
+                    &table_name,
                     schema,
                     ctx,
                 )?;
-
-                let table_name =
-                    from_owned_table_reference(scan.table_name.as_ref(), "CustomScan")?;
 
                 LogicalPlanBuilder::scan_with_filters(
                     table_name,
@@ -458,12 +491,12 @@ impl AsLogicalPlan for LogicalPlanNode {
             LogicalPlanType::Sort(sort) => {
                 let input: LogicalPlan =
                     into_logical_plan!(sort.input, ctx, extension_codec)?;
-                let sort_expr: Vec<Expr> = sort
-                    .expr
-                    .iter()
-                    .map(|expr| from_proto::parse_expr(expr, ctx))
-                    .collect::<Result<Vec<Expr>, _>>()?;
-                LogicalPlanBuilder::from(input).sort(sort_expr)?.build()
+                let sort_expr: Vec<SortExpr> =
+                    from_proto::parse_sorts(&sort.expr, ctx, extension_codec)?;
+                let fetch: Option<usize> = sort.fetch.try_into().ok();
+                LogicalPlanBuilder::from(input)
+                    .sort_with_limit(sort_expr, fetch)?
+                    .build()
             }
             LogicalPlanType::Repartition(repartition) => {
                 use datafusion::logical_expr::Partitioning;
@@ -471,9 +504,9 @@ impl AsLogicalPlan for LogicalPlanNode {
                     into_logical_plan!(repartition.input, ctx, extension_codec)?;
                 use protobuf::repartition_node::PartitionMethod;
                 let pb_partition_method = repartition.partition_method.as_ref().ok_or_else(|| {
-                    DataFusionError::Internal(String::from(
-                        "Protobuf deserialization error, RepartitionNode was missing required field 'partition_method'",
-                    ))
+                    internal_datafusion_err!(
+                        "Protobuf deserialization error, RepartitionNode was missing required field 'partition_method'"
+                    )
                 })?;
 
                 let partitioning_scheme = match pb_partition_method {
@@ -481,10 +514,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                         hash_expr: pb_hash_expr,
                         partition_count,
                     }) => Partitioning::Hash(
-                        pb_hash_expr
-                            .iter()
-                            .map(|expr| from_proto::parse_expr(expr, ctx))
-                            .collect::<Result<Vec<_>, _>>()?,
+                        from_proto::parse_exprs(pb_hash_expr, ctx, extension_codec)?,
                         *partition_count as usize,
                     ),
                     PartitionMethod::RoundRobin(partition_count) => {
@@ -502,7 +532,7 @@ impl AsLogicalPlan for LogicalPlanNode {
             LogicalPlanType::CreateExternalTable(create_extern_table) => {
                 let pb_schema = (create_extern_table.schema.clone()).ok_or_else(|| {
                     DataFusionError::Internal(String::from(
-                        "Protobuf deserialization error, CreateExternalTableNode was missing required field schema.",
+                        "Protobuf deserialization error, CreateExternalTableNode was missing required field schema."
                     ))
                 })?;
 
@@ -524,52 +554,42 @@ impl AsLogicalPlan for LogicalPlanNode {
 
                 let mut order_exprs = vec![];
                 for expr in &create_extern_table.order_exprs {
-                    let order_expr = expr
-                        .logical_expr_nodes
-                        .iter()
-                        .map(|expr| from_proto::parse_expr(expr, ctx))
-                        .collect::<Result<Vec<Expr>, _>>()?;
-                    order_exprs.push(order_expr)
+                    order_exprs.push(from_proto::parse_sorts(
+                        &expr.sort_expr_nodes,
+                        ctx,
+                        extension_codec,
+                    )?);
                 }
 
                 let mut column_defaults =
                     HashMap::with_capacity(create_extern_table.column_defaults.len());
                 for (col_name, expr) in &create_extern_table.column_defaults {
-                    let expr = from_proto::parse_expr(expr, ctx)?;
+                    let expr = from_proto::parse_expr(expr, ctx, extension_codec)?;
                     column_defaults.insert(col_name.clone(), expr);
                 }
 
-                let file_compression_type = protobuf::CompressionTypeVariant::try_from(
-                    create_extern_table.file_compression_type,
-                )
-                .map_err(|_| {
-                    proto_error(format!(
-                        "Unknown file compression type {}",
-                        create_extern_table.file_compression_type
-                    ))
-                })?;
-
-                Ok(LogicalPlan::Ddl(DdlStatement::CreateExternalTable(CreateExternalTable {
-                    schema: pb_schema.try_into()?,
-                    name: from_owned_table_reference(create_extern_table.name.as_ref(), "CreateExternalTable")?,
-                    location: create_extern_table.location.clone(),
-                    file_type: create_extern_table.file_type.clone(),
-                    has_header: create_extern_table.has_header,
-                    delimiter: create_extern_table.delimiter.chars().next().ok_or_else(|| {
-                        DataFusionError::Internal(String::from("Protobuf deserialization error, unable to parse CSV delimiter"))
-                    })?,
-                    table_partition_cols: create_extern_table
-                        .table_partition_cols
-                        .clone(),
-                    order_exprs,
-                    if_not_exists: create_extern_table.if_not_exists,
-                    file_compression_type: file_compression_type.into(),
-                    definition,
-                    unbounded: create_extern_table.unbounded,
-                    options: create_extern_table.options.clone(),
-                    constraints: constraints.into(),
-                    column_defaults,
-                })))
+                Ok(LogicalPlan::Ddl(DdlStatement::CreateExternalTable(
+                    CreateExternalTable {
+                        schema: pb_schema.try_into()?,
+                        name: from_table_reference(
+                            create_extern_table.name.as_ref(),
+                            "CreateExternalTable",
+                        )?,
+                        location: create_extern_table.location.clone(),
+                        file_type: create_extern_table.file_type.clone(),
+                        table_partition_cols: create_extern_table
+                            .table_partition_cols
+                            .clone(),
+                        order_exprs,
+                        if_not_exists: create_extern_table.if_not_exists,
+                        temporary: create_extern_table.temporary,
+                        definition,
+                        unbounded: create_extern_table.unbounded,
+                        options: create_extern_table.options.clone(),
+                        constraints: constraints.into(),
+                        column_defaults,
+                    },
+                )))
             }
             LogicalPlanType::CreateView(create_view) => {
                 let plan = create_view
@@ -584,10 +604,8 @@ impl AsLogicalPlan for LogicalPlanNode {
                 };
 
                 Ok(LogicalPlan::Ddl(DdlStatement::CreateView(CreateView {
-                    name: from_owned_table_reference(
-                        create_view.name.as_ref(),
-                        "CreateView",
-                    )?,
+                    name: from_table_reference(create_view.name.as_ref(), "CreateView")?,
+                    temporary: create_view.temporary,
                     input: Arc::new(plan),
                     or_replace: create_view.or_replace,
                     definition,
@@ -640,7 +658,7 @@ impl AsLogicalPlan for LogicalPlanNode {
             LogicalPlanType::SubqueryAlias(aliased_relation) => {
                 let input: LogicalPlan =
                     into_logical_plan!(aliased_relation.input, ctx, extension_codec)?;
-                let alias = from_owned_table_reference(
+                let alias = from_table_reference(
                     aliased_relation.alias.as_ref(),
                     "SubqueryAlias",
                 )?;
@@ -660,16 +678,10 @@ impl AsLogicalPlan for LogicalPlanNode {
                 LogicalPlanBuilder::from(input).limit(skip, fetch)?.build()
             }
             LogicalPlanType::Join(join) => {
-                let left_keys: Vec<Expr> = join
-                    .left_join_key
-                    .iter()
-                    .map(|expr| from_proto::parse_expr(expr, ctx))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let right_keys: Vec<Expr> = join
-                    .right_join_key
-                    .iter()
-                    .map(|expr| from_proto::parse_expr(expr, ctx))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let left_keys: Vec<Expr> =
+                    from_proto::parse_exprs(&join.left_join_key, ctx, extension_codec)?;
+                let right_keys: Vec<Expr> =
+                    from_proto::parse_exprs(&join.right_join_key, ctx, extension_codec)?;
                 let join_type =
                     protobuf::JoinType::try_from(join.join_type).map_err(|_| {
                         proto_error(format!(
@@ -689,7 +701,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                 let filter: Option<Expr> = join
                     .filter
                     .as_ref()
-                    .map(|expr| from_proto::parse_expr(expr, ctx))
+                    .map(|expr| from_proto::parse_expr(expr, ctx, extension_codec))
                     .map_or(Ok(None), |v| v.map(Some))?;
 
                 let builder = LogicalPlanBuilder::from(into_logical_plan!(
@@ -708,7 +720,12 @@ impl AsLogicalPlan for LogicalPlanNode {
                         // The equijoin keys in using-join must be column.
                         let using_keys = left_keys
                             .into_iter()
-                            .map(|key| key.try_into_col())
+                            .map(|key| {
+                                key.try_as_col().cloned()
+                                    .ok_or_else(|| internal_datafusion_err!(
+                                        "Using join keys must be column references, got: {key:?}"
+                                    ))
+                            })
                             .collect::<Result<Vec<_>, _>>()?;
                         builder.join_using(
                             into_logical_plan!(join.right, ctx, extension_codec)?,
@@ -721,23 +738,18 @@ impl AsLogicalPlan for LogicalPlanNode {
                 builder.build()
             }
             LogicalPlanType::Union(union) => {
-                let mut input_plans: Vec<LogicalPlan> = union
-                    .inputs
-                    .iter()
-                    .map(|i| i.try_into_logical_plan(ctx, extension_codec))
-                    .collect::<Result<_>>()?;
-
-                if input_plans.len() < 2 {
+                if union.inputs.len() < 2 {
                     return  Err( DataFusionError::Internal(String::from(
                         "Protobuf deserialization error, Union was require at least two input.",
                     )));
                 }
+                let (first, rest) = union.inputs.split_first().unwrap();
+                let mut builder = LogicalPlanBuilder::from(
+                    first.try_into_logical_plan(ctx, extension_codec)?,
+                );
 
-                let first = input_plans.pop().ok_or_else(|| DataFusionError::Internal(String::from(
-                    "Protobuf deserialization error, Union was require at least two input.",
-                )))?;
-                let mut builder = LogicalPlanBuilder::from(first);
-                for plan in input_plans {
+                for i in rest {
+                    let plan = i.try_into_logical_plan(ctx, extension_codec)?;
                     builder = builder.union(plan)?;
                 }
                 builder.build()
@@ -766,25 +778,20 @@ impl AsLogicalPlan for LogicalPlanNode {
             LogicalPlanType::DistinctOn(distinct_on) => {
                 let input: LogicalPlan =
                     into_logical_plan!(distinct_on.input, ctx, extension_codec)?;
-                let on_expr = distinct_on
-                    .on_expr
-                    .iter()
-                    .map(|expr| from_proto::parse_expr(expr, ctx))
-                    .collect::<Result<Vec<Expr>, _>>()?;
-                let select_expr = distinct_on
-                    .select_expr
-                    .iter()
-                    .map(|expr| from_proto::parse_expr(expr, ctx))
-                    .collect::<Result<Vec<Expr>, _>>()?;
+                let on_expr =
+                    from_proto::parse_exprs(&distinct_on.on_expr, ctx, extension_codec)?;
+                let select_expr = from_proto::parse_exprs(
+                    &distinct_on.select_expr,
+                    ctx,
+                    extension_codec,
+                )?;
                 let sort_expr = match distinct_on.sort_expr.len() {
                     0 => None,
-                    _ => Some(
-                        distinct_on
-                            .sort_expr
-                            .iter()
-                            .map(|expr| from_proto::parse_expr(expr, ctx))
-                            .collect::<Result<Vec<Expr>, _>>()?,
-                    ),
+                    _ => Some(from_proto::parse_sorts(
+                        &distinct_on.sort_expr,
+                        ctx,
+                        extension_codec,
+                    )?),
                 };
                 LogicalPlanBuilder::from(input)
                     .distinct_on(on_expr, select_expr, sort_expr)?
@@ -815,7 +822,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                 let provider = ViewTable::try_new(input, definition)?;
 
                 let table_name =
-                    from_owned_table_reference(scan.table_name.as_ref(), "ViewScan")?;
+                    from_table_reference(scan.table_name.as_ref(), "ViewScan")?;
 
                 LogicalPlanBuilder::scan(
                     table_name,
@@ -836,92 +843,110 @@ impl AsLogicalPlan for LogicalPlanNode {
                     .prepare(prepare.name.clone(), data_types)?
                     .build()
             }
-            LogicalPlanType::DropView(dropview) => Ok(datafusion_expr::LogicalPlan::Ddl(
-                datafusion_expr::DdlStatement::DropView(DropView {
-                    name: from_owned_table_reference(dropview.name.as_ref(), "DropView")?,
+            LogicalPlanType::DropView(dropview) => {
+                Ok(LogicalPlan::Ddl(DdlStatement::DropView(DropView {
+                    name: from_table_reference(dropview.name.as_ref(), "DropView")?,
                     if_exists: dropview.if_exists,
                     schema: Arc::new(convert_required!(dropview.schema)?),
-                }),
-            )),
+                })))
+            }
             LogicalPlanType::CopyTo(copy) => {
                 let input: LogicalPlan =
                     into_logical_plan!(copy.input, ctx, extension_codec)?;
 
-                let copy_options = match &copy.copy_options {
-                    Some(copy_to_node::CopyOptions::SqlOptions(opt)) => {
-                        let options = opt
-                            .option
-                            .iter()
-                            .map(|o| (o.key.clone(), o.value.clone()))
-                            .collect();
-                        CopyOptions::SQLOptions(StatementOptions::from(&options))
-                    }
-                    Some(copy_to_node::CopyOptions::WriterOptions(opt)) => {
-                        match &opt.file_type {
-                            Some(ft) => match ft {
-                                file_type_writer_options::FileType::ArrowOptions(_) => {
-                                    CopyOptions::WriterOptions(Box::new(
-                                        FileTypeWriterOptions::Arrow(
-                                            ArrowWriterOptions::new(),
-                                        ),
-                                    ))
-                                }
-                                file_type_writer_options::FileType::CsvOptions(
-                                    writer_options,
-                                ) => {
-                                    let writer_builder =
-                                        csv_writer_options_from_proto(writer_options)?;
-                                    CopyOptions::WriterOptions(Box::new(
-                                        FileTypeWriterOptions::CSV(
-                                            CsvWriterOptions::new(
-                                                writer_builder,
-                                                CompressionTypeVariant::UNCOMPRESSED,
-                                            ),
-                                        ),
-                                    ))
-                                }
-                                file_type_writer_options::FileType::ParquetOptions(
-                                    writer_options,
-                                ) => {
-                                    let writer_properties =
-                                        match &writer_options.writer_properties {
-                                            Some(serialized_writer_options) => {
-                                                writer_properties_from_proto(
-                                                    serialized_writer_options,
-                                                )?
-                                            }
-                                            _ => WriterProperties::default(),
-                                        };
-                                    CopyOptions::WriterOptions(Box::new(
-                                        FileTypeWriterOptions::Parquet(
-                                            ParquetWriterOptions::new(writer_properties),
-                                        ),
-                                    ))
-                                }
-                                _ => {
-                                    return Err(proto_error(
-                                        "WriterOptions unsupported file_type",
-                                    ))
-                                }
-                            },
-                            None => {
-                                return Err(proto_error(
-                                    "WriterOptions missing file_type",
-                                ))
-                            }
-                        }
-                    }
-                    None => return Err(proto_error("CopyTo missing CopyOptions")),
-                };
-                Ok(datafusion_expr::LogicalPlan::Copy(
-                    datafusion_expr::dml::CopyTo {
-                        input: Arc::new(input),
-                        output_url: copy.output_url.clone(),
-                        file_format: FileType::from_str(&copy.file_type)?,
-                        copy_options,
-                    },
-                ))
+                let file_type: Arc<dyn FileType> = format_as_file_type(
+                    extension_codec.try_decode_file_format(&copy.file_type, ctx)?,
+                );
+
+                Ok(LogicalPlan::Copy(dml::CopyTo {
+                    input: Arc::new(input),
+                    output_url: copy.output_url.clone(),
+                    partition_by: copy.partition_by.clone(),
+                    file_type,
+                    options: Default::default(),
+                }))
             }
+            LogicalPlanType::Unnest(unnest) => {
+                let input: LogicalPlan =
+                    into_logical_plan!(unnest.input, ctx, extension_codec)?;
+                Ok(LogicalPlan::Unnest(Unnest {
+                    input: Arc::new(input),
+                    exec_columns: unnest.exec_columns.iter().map(|c| c.into()).collect(),
+                    list_type_columns: unnest
+                        .list_type_columns
+                        .iter()
+                        .map(|c| {
+                            let recursion_item = c.recursion.as_ref().unwrap();
+                            (
+                                c.input_index as _,
+                                ColumnUnnestList {
+                                    output_column: recursion_item
+                                        .output_column
+                                        .as_ref()
+                                        .unwrap()
+                                        .into(),
+                                    depth: recursion_item.depth as _,
+                                },
+                            )
+                        })
+                        .collect(),
+                    struct_type_columns: unnest
+                        .struct_type_columns
+                        .iter()
+                        .map(|c| *c as usize)
+                        .collect(),
+                    dependency_indices: unnest
+                        .dependency_indices
+                        .iter()
+                        .map(|c| *c as usize)
+                        .collect(),
+                    schema: Arc::new(convert_required!(unnest.schema)?),
+                    options: into_required!(unnest.options)?,
+                }))
+            }
+            LogicalPlanType::RecursiveQuery(recursive_query_node) => {
+                let static_term = recursive_query_node
+                    .static_term
+                    .as_ref()
+                    .ok_or_else(|| DataFusionError::Internal(String::from(
+                        "Protobuf deserialization error, RecursiveQueryNode was missing required field static_term.",
+                    )))?
+                    .try_into_logical_plan(ctx, extension_codec)?;
+
+                let recursive_term = recursive_query_node
+                    .recursive_term
+                    .as_ref()
+                    .ok_or_else(|| DataFusionError::Internal(String::from(
+                        "Protobuf deserialization error, RecursiveQueryNode was missing required field recursive_term.",
+                    )))?
+                    .try_into_logical_plan(ctx, extension_codec)?;
+
+                Ok(LogicalPlan::RecursiveQuery(RecursiveQuery {
+                    name: recursive_query_node.name.clone(),
+                    static_term: Arc::new(static_term),
+                    recursive_term: Arc::new(recursive_term),
+                    is_distinct: recursive_query_node.is_distinct,
+                }))
+            }
+            LogicalPlanType::CteWorkTableScan(cte_work_table_scan_node) => {
+                let CteWorkTableScanNode { name, schema } = cte_work_table_scan_node;
+                let schema = convert_required!(*schema)?;
+                let cte_work_table = CteWorkTable::new(name.as_str(), Arc::new(schema));
+                LogicalPlanBuilder::scan(
+                    name.as_str(),
+                    provider_as_source(Arc::new(cte_work_table)),
+                    None,
+                )?
+                .build()
+            }
+            LogicalPlanType::Dml(dml_node) => Ok(LogicalPlan::Dml(
+                datafusion::logical_expr::DmlStatement::new(
+                    from_table_reference(dml_node.table_name.as_ref(), "DML ")?,
+                    Arc::new(convert_required!(dml_node.schema)?),
+                    dml_node.dml_type().into(),
+                    Arc::new(into_logical_plan!(dml_node.input, ctx, extension_codec)?),
+                ),
+            )),
         }
     }
 
@@ -939,12 +964,9 @@ impl AsLogicalPlan for LogicalPlanNode {
                 } else {
                     values[0].len()
                 } as u64;
-                let values_list = values
-                    .iter()
-                    .flatten()
-                    .map(|v| v.try_into())
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(protobuf::LogicalPlanNode {
+                let values_list =
+                    serialize_exprs(values.iter().flatten(), extension_codec)?;
+                Ok(LogicalPlanNode {
                     logical_plan_type: Some(LogicalPlanType::Values(
                         protobuf::ValuesNode {
                             n_cols,
@@ -978,10 +1000,8 @@ impl AsLogicalPlan for LogicalPlanNode {
                 };
                 let schema: protobuf::Schema = schema.as_ref().try_into()?;
 
-                let filters: Vec<protobuf::LogicalExprNode> = filters
-                    .iter()
-                    .map(|filter| filter.try_into())
-                    .collect::<Result<Vec<_>, _>>()?;
+                let filters: Vec<protobuf::LogicalExprNode> =
+                    serialize_exprs(filters, extension_codec)?;
 
                 if let Some(listing_table) = source.downcast_ref::<ListingTable>() {
                     let any = listing_table.options().format.as_any();
@@ -989,29 +1009,27 @@ impl AsLogicalPlan for LogicalPlanNode {
                         let mut maybe_some_type = None;
 
                         #[cfg(feature = "parquet")]
-                        if any.is::<ParquetFormat>() {
+                        if let Some(parquet) = any.downcast_ref::<ParquetFormat>() {
+                            let options = parquet.options();
                             maybe_some_type =
-                                Some(FileFormatType::Parquet(protobuf::ParquetFormat {}))
+                                Some(FileFormatType::Parquet(protobuf::ParquetFormat {
+                                    options: Some(options.try_into()?),
+                                }));
                         };
 
                         if let Some(csv) = any.downcast_ref::<CsvFormat>() {
+                            let options = csv.options();
                             maybe_some_type =
                                 Some(FileFormatType::Csv(protobuf::CsvFormat {
-                                    delimiter: byte_to_string(
-                                        csv.delimiter(),
-                                        "delimiter",
-                                    )?,
-                                    has_header: csv.has_header(),
-                                    quote: byte_to_string(csv.quote(), "quote")?,
-                                    optional_escape: if let Some(escape) = csv.escape() {
-                                        Some(
-                                            protobuf::csv_format::OptionalEscape::Escape(
-                                                byte_to_string(escape, "escape")?,
-                                            ),
-                                        )
-                                    } else {
-                                        None
-                                    },
+                                    options: Some(options.try_into()?),
+                                }));
+                        }
+
+                        if let Some(json) = any.downcast_ref::<OtherNdJsonFormat>() {
+                            let options = json.options();
+                            maybe_some_type =
+                                Some(FileFormatType::Json(protobuf::NdJsonFormat {
+                                    options: Some(options.try_into()?),
                                 }))
                         }
 
@@ -1032,18 +1050,15 @@ impl AsLogicalPlan for LogicalPlanNode {
 
                     let options = listing_table.options();
 
-                    let mut exprs_vec: Vec<LogicalExprNodeCollection> = vec![];
+                    let mut exprs_vec: Vec<SortExprNodeCollection> = vec![];
                     for order in &options.file_sort_order {
-                        let expr_vec = LogicalExprNodeCollection {
-                            logical_expr_nodes: order
-                                .iter()
-                                .map(|expr| expr.try_into())
-                                .collect::<Result<Vec<_>, to_proto::Error>>()?,
+                        let expr_vec = SortExprNodeCollection {
+                            sort_expr_nodes: serialize_sorts(order, extension_codec)?,
                         };
                         exprs_vec.push(expr_vec);
                     }
 
-                    Ok(protobuf::LogicalPlanNode {
+                    Ok(LogicalPlanNode {
                         logical_plan_type: Some(LogicalPlanType::ListingScan(
                             protobuf::ListingTableScanNode {
                                 file_format_type: Some(file_format_type),
@@ -1069,12 +1084,12 @@ impl AsLogicalPlan for LogicalPlanNode {
                         )),
                     })
                 } else if let Some(view_table) = source.downcast_ref::<ViewTable>() {
-                    Ok(protobuf::LogicalPlanNode {
+                    Ok(LogicalPlanNode {
                         logical_plan_type: Some(LogicalPlanType::ViewScan(Box::new(
                             protobuf::ViewTableScanNode {
                                 table_name: Some(table_name.clone().into()),
                                 input: Some(Box::new(
-                                    protobuf::LogicalPlanNode::try_from_logical_plan(
+                                    LogicalPlanNode::try_from_logical_plan(
                                         view_table.logical_plan(),
                                         extension_codec,
                                     )?,
@@ -1088,10 +1103,24 @@ impl AsLogicalPlan for LogicalPlanNode {
                             },
                         ))),
                     })
+                } else if let Some(cte_work_table) = source.downcast_ref::<CteWorkTable>()
+                {
+                    let name = cte_work_table.name().to_string();
+                    let schema = cte_work_table.schema();
+                    let schema: protobuf::Schema = schema.as_ref().try_into()?;
+
+                    Ok(LogicalPlanNode {
+                        logical_plan_type: Some(LogicalPlanType::CteWorkTableScan(
+                            protobuf::CteWorkTableScanNode {
+                                name,
+                                schema: Some(schema),
+                            },
+                        )),
+                    })
                 } else {
                     let mut bytes = vec![];
                     extension_codec
-                        .try_encode_table_provider(provider, &mut bytes)
+                        .try_encode_table_provider(table_name, provider, &mut bytes)
                         .map_err(|e| context!("Error serializing custom table", e))?;
                     let scan = CustomScan(CustomTableScanNode {
                         table_name: Some(table_name.clone().into()),
@@ -1107,46 +1136,44 @@ impl AsLogicalPlan for LogicalPlanNode {
                 }
             }
             LogicalPlan::Projection(Projection { expr, input, .. }) => {
-                Ok(protobuf::LogicalPlanNode {
+                Ok(LogicalPlanNode {
                     logical_plan_type: Some(LogicalPlanType::Projection(Box::new(
                         protobuf::ProjectionNode {
                             input: Some(Box::new(
-                                protobuf::LogicalPlanNode::try_from_logical_plan(
+                                LogicalPlanNode::try_from_logical_plan(
                                     input.as_ref(),
                                     extension_codec,
                                 )?,
                             )),
-                            expr: expr
-                                .iter()
-                                .map(|expr| expr.try_into())
-                                .collect::<Result<Vec<_>, to_proto::Error>>()?,
+                            expr: serialize_exprs(expr, extension_codec)?,
                             optional_alias: None,
                         },
                     ))),
                 })
             }
             LogicalPlan::Filter(filter) => {
-                let input: protobuf::LogicalPlanNode =
-                    protobuf::LogicalPlanNode::try_from_logical_plan(
-                        filter.input.as_ref(),
-                        extension_codec,
-                    )?;
-                Ok(protobuf::LogicalPlanNode {
+                let input: LogicalPlanNode = LogicalPlanNode::try_from_logical_plan(
+                    filter.input.as_ref(),
+                    extension_codec,
+                )?;
+                Ok(LogicalPlanNode {
                     logical_plan_type: Some(LogicalPlanType::Selection(Box::new(
                         protobuf::SelectionNode {
                             input: Some(Box::new(input)),
-                            expr: Some((&filter.predicate).try_into()?),
+                            expr: Some(serialize_expr(
+                                &filter.predicate,
+                                extension_codec,
+                            )?),
                         },
                     ))),
                 })
             }
             LogicalPlan::Distinct(Distinct::All(input)) => {
-                let input: protobuf::LogicalPlanNode =
-                    protobuf::LogicalPlanNode::try_from_logical_plan(
-                        input.as_ref(),
-                        extension_codec,
-                    )?;
-                Ok(protobuf::LogicalPlanNode {
+                let input: LogicalPlanNode = LogicalPlanNode::try_from_logical_plan(
+                    input.as_ref(),
+                    extension_codec,
+                )?;
+                Ok(LogicalPlanNode {
                     logical_plan_type: Some(LogicalPlanType::Distinct(Box::new(
                         protobuf::DistinctNode {
                             input: Some(Box::new(input)),
@@ -1161,29 +1188,19 @@ impl AsLogicalPlan for LogicalPlanNode {
                 input,
                 ..
             })) => {
-                let input: protobuf::LogicalPlanNode =
-                    protobuf::LogicalPlanNode::try_from_logical_plan(
-                        input.as_ref(),
-                        extension_codec,
-                    )?;
+                let input: LogicalPlanNode = LogicalPlanNode::try_from_logical_plan(
+                    input.as_ref(),
+                    extension_codec,
+                )?;
                 let sort_expr = match sort_expr {
                     None => vec![],
-                    Some(sort_expr) => sort_expr
-                        .iter()
-                        .map(|expr| expr.try_into())
-                        .collect::<Result<Vec<_>, _>>()?,
+                    Some(sort_expr) => serialize_sorts(sort_expr, extension_codec)?,
                 };
-                Ok(protobuf::LogicalPlanNode {
+                Ok(LogicalPlanNode {
                     logical_plan_type: Some(LogicalPlanType::DistinctOn(Box::new(
                         protobuf::DistinctOnNode {
-                            on_expr: on_expr
-                                .iter()
-                                .map(|expr| expr.try_into())
-                                .collect::<Result<Vec<_>, _>>()?,
-                            select_expr: select_expr
-                                .iter()
-                                .map(|expr| expr.try_into())
-                                .collect::<Result<Vec<_>, _>>()?,
+                            on_expr: serialize_exprs(on_expr, extension_codec)?,
+                            select_expr: serialize_exprs(select_expr, extension_codec)?,
                             sort_expr,
                             input: Some(Box::new(input)),
                         },
@@ -1193,19 +1210,15 @@ impl AsLogicalPlan for LogicalPlanNode {
             LogicalPlan::Window(Window {
                 input, window_expr, ..
             }) => {
-                let input: protobuf::LogicalPlanNode =
-                    protobuf::LogicalPlanNode::try_from_logical_plan(
-                        input.as_ref(),
-                        extension_codec,
-                    )?;
-                Ok(protobuf::LogicalPlanNode {
+                let input: LogicalPlanNode = LogicalPlanNode::try_from_logical_plan(
+                    input.as_ref(),
+                    extension_codec,
+                )?;
+                Ok(LogicalPlanNode {
                     logical_plan_type: Some(LogicalPlanType::Window(Box::new(
                         protobuf::WindowNode {
                             input: Some(Box::new(input)),
-                            window_expr: window_expr
-                                .iter()
-                                .map(|expr| expr.try_into())
-                                .collect::<Result<Vec<_>, _>>()?,
+                            window_expr: serialize_exprs(window_expr, extension_codec)?,
                         },
                     ))),
                 })
@@ -1216,23 +1229,16 @@ impl AsLogicalPlan for LogicalPlanNode {
                 input,
                 ..
             }) => {
-                let input: protobuf::LogicalPlanNode =
-                    protobuf::LogicalPlanNode::try_from_logical_plan(
-                        input.as_ref(),
-                        extension_codec,
-                    )?;
-                Ok(protobuf::LogicalPlanNode {
+                let input: LogicalPlanNode = LogicalPlanNode::try_from_logical_plan(
+                    input.as_ref(),
+                    extension_codec,
+                )?;
+                Ok(LogicalPlanNode {
                     logical_plan_type: Some(LogicalPlanType::Aggregate(Box::new(
                         protobuf::AggregateNode {
                             input: Some(Box::new(input)),
-                            group_expr: group_expr
-                                .iter()
-                                .map(|expr| expr.try_into())
-                                .collect::<Result<Vec<_>, _>>()?,
-                            aggr_expr: aggr_expr
-                                .iter()
-                                .map(|expr| expr.try_into())
-                                .collect::<Result<Vec<_>, _>>()?,
+                            group_expr: serialize_exprs(group_expr, extension_codec)?,
+                            aggr_expr: serialize_exprs(aggr_expr, extension_codec)?,
                         },
                     ))),
                 })
@@ -1247,20 +1253,23 @@ impl AsLogicalPlan for LogicalPlanNode {
                 null_equals_null,
                 ..
             }) => {
-                let left: protobuf::LogicalPlanNode =
-                    protobuf::LogicalPlanNode::try_from_logical_plan(
-                        left.as_ref(),
-                        extension_codec,
-                    )?;
-                let right: protobuf::LogicalPlanNode =
-                    protobuf::LogicalPlanNode::try_from_logical_plan(
-                        right.as_ref(),
-                        extension_codec,
-                    )?;
+                let left: LogicalPlanNode = LogicalPlanNode::try_from_logical_plan(
+                    left.as_ref(),
+                    extension_codec,
+                )?;
+                let right: LogicalPlanNode = LogicalPlanNode::try_from_logical_plan(
+                    right.as_ref(),
+                    extension_codec,
+                )?;
                 let (left_join_key, right_join_key) = on
                     .iter()
-                    .map(|(l, r)| Ok((l.try_into()?, r.try_into()?)))
-                    .collect::<Result<Vec<_>, to_proto::Error>>()?
+                    .map(|(l, r)| {
+                        Ok((
+                            serialize_expr(l, extension_codec)?,
+                            serialize_expr(r, extension_codec)?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, ToProtoError>>()?
                     .into_iter()
                     .unzip();
                 let join_type: protobuf::JoinType = join_type.to_owned().into();
@@ -1268,9 +1277,9 @@ impl AsLogicalPlan for LogicalPlanNode {
                     join_constraint.to_owned().into();
                 let filter = filter
                     .as_ref()
-                    .map(|e| e.try_into())
+                    .map(|e| serialize_expr(e, extension_codec))
                     .map_or(Ok(None), |v| v.map(Some))?;
-                Ok(protobuf::LogicalPlanNode {
+                Ok(LogicalPlanNode {
                     logical_plan_type: Some(LogicalPlanType::Join(Box::new(
                         protobuf::JoinNode {
                             left: Some(Box::new(left)),
@@ -1289,51 +1298,57 @@ impl AsLogicalPlan for LogicalPlanNode {
                 not_impl_err!("LogicalPlan serde is not yet implemented for subqueries")
             }
             LogicalPlan::SubqueryAlias(SubqueryAlias { input, alias, .. }) => {
-                let input: protobuf::LogicalPlanNode =
-                    protobuf::LogicalPlanNode::try_from_logical_plan(
-                        input.as_ref(),
-                        extension_codec,
-                    )?;
-                Ok(protobuf::LogicalPlanNode {
+                let input: LogicalPlanNode = LogicalPlanNode::try_from_logical_plan(
+                    input.as_ref(),
+                    extension_codec,
+                )?;
+                Ok(LogicalPlanNode {
                     logical_plan_type: Some(LogicalPlanType::SubqueryAlias(Box::new(
                         protobuf::SubqueryAliasNode {
                             input: Some(Box::new(input)),
-                            alias: Some(alias.to_owned_reference().into()),
+                            alias: Some((*alias).clone().into()),
                         },
                     ))),
                 })
             }
-            LogicalPlan::Limit(Limit { input, skip, fetch }) => {
-                let input: protobuf::LogicalPlanNode =
-                    protobuf::LogicalPlanNode::try_from_logical_plan(
-                        input.as_ref(),
-                        extension_codec,
-                    )?;
-                Ok(protobuf::LogicalPlanNode {
+            LogicalPlan::Limit(limit) => {
+                let input: LogicalPlanNode = LogicalPlanNode::try_from_logical_plan(
+                    limit.input.as_ref(),
+                    extension_codec,
+                )?;
+                let SkipType::Literal(skip) = limit.get_skip_type()? else {
+                    return Err(proto_error(
+                        "LogicalPlan::Limit only supports literal skip values",
+                    ));
+                };
+                let FetchType::Literal(fetch) = limit.get_fetch_type()? else {
+                    return Err(proto_error(
+                        "LogicalPlan::Limit only supports literal fetch values",
+                    ));
+                };
+
+                Ok(LogicalPlanNode {
                     logical_plan_type: Some(LogicalPlanType::Limit(Box::new(
                         protobuf::LimitNode {
                             input: Some(Box::new(input)),
-                            skip: *skip as i64,
+                            skip: skip as i64,
                             fetch: fetch.unwrap_or(i64::MAX as usize) as i64,
                         },
                     ))),
                 })
             }
             LogicalPlan::Sort(Sort { input, expr, fetch }) => {
-                let input: protobuf::LogicalPlanNode =
-                    protobuf::LogicalPlanNode::try_from_logical_plan(
-                        input.as_ref(),
-                        extension_codec,
-                    )?;
-                let selection_expr: Vec<protobuf::LogicalExprNode> = expr
-                    .iter()
-                    .map(|expr| expr.try_into())
-                    .collect::<Result<Vec<_>, to_proto::Error>>()?;
-                Ok(protobuf::LogicalPlanNode {
+                let input: LogicalPlanNode = LogicalPlanNode::try_from_logical_plan(
+                    input.as_ref(),
+                    extension_codec,
+                )?;
+                let sort_expr: Vec<protobuf::SortExprNode> =
+                    serialize_sorts(expr, extension_codec)?;
+                Ok(LogicalPlanNode {
                     logical_plan_type: Some(LogicalPlanType::Sort(Box::new(
                         protobuf::SortNode {
                             input: Some(Box::new(input)),
-                            expr: selection_expr,
+                            expr: sort_expr,
                             fetch: fetch.map(|f| f as i64).unwrap_or(-1i64),
                         },
                     ))),
@@ -1344,11 +1359,10 @@ impl AsLogicalPlan for LogicalPlanNode {
                 partitioning_scheme,
             }) => {
                 use datafusion::logical_expr::Partitioning;
-                let input: protobuf::LogicalPlanNode =
-                    protobuf::LogicalPlanNode::try_from_logical_plan(
-                        input.as_ref(),
-                        extension_codec,
-                    )?;
+                let input: LogicalPlanNode = LogicalPlanNode::try_from_logical_plan(
+                    input.as_ref(),
+                    extension_codec,
+                )?;
 
                 // Assumed common usize field was batch size
                 // Used u64 to avoid any nastyness involving large values, most data clusters are probably uniformly 64 bits any ways
@@ -1357,10 +1371,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                 let pb_partition_method = match partitioning_scheme {
                     Partitioning::Hash(exprs, partition_count) => {
                         PartitionMethod::Hash(protobuf::HashRepartition {
-                            hash_expr: exprs
-                                .iter()
-                                .map(|expr| expr.try_into())
-                                .collect::<Result<Vec<_>, to_proto::Error>>()?,
+                            hash_expr: serialize_exprs(exprs, extension_codec)?,
                             partition_count: *partition_count as u64,
                         })
                     }
@@ -1372,7 +1383,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                     }
                 };
 
-                Ok(protobuf::LogicalPlanNode {
+                Ok(LogicalPlanNode {
                     logical_plan_type: Some(LogicalPlanType::Repartition(Box::new(
                         protobuf::RepartitionNode {
                             input: Some(Box::new(input)),
@@ -1383,7 +1394,7 @@ impl AsLogicalPlan for LogicalPlanNode {
             }
             LogicalPlan::EmptyRelation(EmptyRelation {
                 produce_one_row, ..
-            }) => Ok(protobuf::LogicalPlanNode {
+            }) => Ok(LogicalPlanNode {
                 logical_plan_type: Some(LogicalPlanType::EmptyRelation(
                     protobuf::EmptyRelationNode {
                         produce_one_row: *produce_one_row,
@@ -1395,28 +1406,22 @@ impl AsLogicalPlan for LogicalPlanNode {
                     name,
                     location,
                     file_type,
-                    has_header,
-                    delimiter,
                     schema: df_schema,
                     table_partition_cols,
                     if_not_exists,
                     definition,
-                    file_compression_type,
                     order_exprs,
                     unbounded,
                     options,
                     constraints,
                     column_defaults,
+                    temporary,
                 },
             )) => {
-                let mut converted_order_exprs: Vec<LogicalExprNodeCollection> = vec![];
+                let mut converted_order_exprs: Vec<SortExprNodeCollection> = vec![];
                 for order in order_exprs {
-                    let temp = LogicalExprNodeCollection {
-                        logical_expr_nodes: order
-                            .iter()
-                            .map(|expr| expr.try_into())
-                            .collect::<Result<Vec<_>, to_proto::Error>>(
-                        )?,
+                    let temp = SortExprNodeCollection {
+                        sort_expr_nodes: serialize_sorts(order, extension_codec)?,
                     };
                     converted_order_exprs.push(temp);
                 }
@@ -1424,26 +1429,22 @@ impl AsLogicalPlan for LogicalPlanNode {
                 let mut converted_column_defaults =
                     HashMap::with_capacity(column_defaults.len());
                 for (col_name, expr) in column_defaults {
-                    converted_column_defaults.insert(col_name.clone(), expr.try_into()?);
+                    converted_column_defaults
+                        .insert(col_name.clone(), serialize_expr(expr, extension_codec)?);
                 }
 
-                let file_compression_type =
-                    protobuf::CompressionTypeVariant::from(file_compression_type);
-
-                Ok(protobuf::LogicalPlanNode {
+                Ok(LogicalPlanNode {
                     logical_plan_type: Some(LogicalPlanType::CreateExternalTable(
                         protobuf::CreateExternalTableNode {
                             name: Some(name.clone().into()),
                             location: location.clone(),
                             file_type: file_type.clone(),
-                            has_header: *has_header,
                             schema: Some(df_schema.try_into()?),
                             table_partition_cols: table_partition_cols.clone(),
                             if_not_exists: *if_not_exists,
-                            delimiter: String::from(*delimiter),
+                            temporary: *temporary,
                             order_exprs: converted_order_exprs,
                             definition: definition.clone().unwrap_or_default(),
-                            file_compression_type: file_compression_type.into(),
                             unbounded: *unbounded,
                             options: options.clone(),
                             constraints: Some(constraints.clone().into()),
@@ -1457,7 +1458,8 @@ impl AsLogicalPlan for LogicalPlanNode {
                 input,
                 or_replace,
                 definition,
-            })) => Ok(protobuf::LogicalPlanNode {
+                temporary,
+            })) => Ok(LogicalPlanNode {
                 logical_plan_type: Some(LogicalPlanType::CreateView(Box::new(
                     protobuf::CreateViewNode {
                         name: Some(name.clone().into()),
@@ -1466,6 +1468,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                             extension_codec,
                         )?)),
                         or_replace: *or_replace,
+                        temporary: *temporary,
                         definition: definition.clone().unwrap_or_default(),
                     },
                 ))),
@@ -1476,7 +1479,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                     if_not_exists,
                     schema: df_schema,
                 },
-            )) => Ok(protobuf::LogicalPlanNode {
+            )) => Ok(LogicalPlanNode {
                 logical_plan_type: Some(LogicalPlanType::CreateCatalogSchema(
                     protobuf::CreateCatalogSchemaNode {
                         schema_name: schema_name.clone(),
@@ -1489,7 +1492,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                 catalog_name,
                 if_not_exists,
                 schema: df_schema,
-            })) => Ok(protobuf::LogicalPlanNode {
+            })) => Ok(LogicalPlanNode {
                 logical_plan_type: Some(LogicalPlanType::CreateCatalog(
                     protobuf::CreateCatalogNode {
                         catalog_name: catalog_name.clone(),
@@ -1499,11 +1502,11 @@ impl AsLogicalPlan for LogicalPlanNode {
                 )),
             }),
             LogicalPlan::Analyze(a) => {
-                let input = protobuf::LogicalPlanNode::try_from_logical_plan(
+                let input = LogicalPlanNode::try_from_logical_plan(
                     a.input.as_ref(),
                     extension_codec,
                 )?;
-                Ok(protobuf::LogicalPlanNode {
+                Ok(LogicalPlanNode {
                     logical_plan_type: Some(LogicalPlanType::Analyze(Box::new(
                         protobuf::AnalyzeNode {
                             input: Some(Box::new(input)),
@@ -1513,11 +1516,11 @@ impl AsLogicalPlan for LogicalPlanNode {
                 })
             }
             LogicalPlan::Explain(a) => {
-                let input = protobuf::LogicalPlanNode::try_from_logical_plan(
+                let input = LogicalPlanNode::try_from_logical_plan(
                     a.plan.as_ref(),
                     extension_codec,
                 )?;
-                Ok(protobuf::LogicalPlanNode {
+                Ok(LogicalPlanNode {
                     logical_plan_type: Some(LogicalPlanType::Explain(Box::new(
                         protobuf::ExplainNode {
                             input: Some(Box::new(input)),
@@ -1530,35 +1533,12 @@ impl AsLogicalPlan for LogicalPlanNode {
                 let inputs: Vec<LogicalPlanNode> = union
                     .inputs
                     .iter()
-                    .map(|i| {
-                        protobuf::LogicalPlanNode::try_from_logical_plan(
-                            i,
-                            extension_codec,
-                        )
-                    })
+                    .map(|i| LogicalPlanNode::try_from_logical_plan(i, extension_codec))
                     .collect::<Result<_>>()?;
-                Ok(protobuf::LogicalPlanNode {
+                Ok(LogicalPlanNode {
                     logical_plan_type: Some(LogicalPlanType::Union(
                         protobuf::UnionNode { inputs },
                     )),
-                })
-            }
-            LogicalPlan::CrossJoin(CrossJoin { left, right, .. }) => {
-                let left = protobuf::LogicalPlanNode::try_from_logical_plan(
-                    left.as_ref(),
-                    extension_codec,
-                )?;
-                let right = protobuf::LogicalPlanNode::try_from_logical_plan(
-                    right.as_ref(),
-                    extension_codec,
-                )?;
-                Ok(protobuf::LogicalPlanNode {
-                    logical_plan_type: Some(LogicalPlanType::CrossJoin(Box::new(
-                        protobuf::CrossJoinNode {
-                            left: Some(Box::new(left)),
-                            right: Some(Box::new(right)),
-                        },
-                    ))),
                 })
             }
             LogicalPlan::Extension(extension) => {
@@ -1569,30 +1549,23 @@ impl AsLogicalPlan for LogicalPlanNode {
                     .node
                     .inputs()
                     .iter()
-                    .map(|i| {
-                        protobuf::LogicalPlanNode::try_from_logical_plan(
-                            i,
-                            extension_codec,
-                        )
-                    })
+                    .map(|i| LogicalPlanNode::try_from_logical_plan(i, extension_codec))
                     .collect::<Result<_>>()?;
 
-                Ok(protobuf::LogicalPlanNode {
+                Ok(LogicalPlanNode {
                     logical_plan_type: Some(LogicalPlanType::Extension(
                         LogicalExtensionNode { node: buf, inputs },
                     )),
                 })
             }
-            LogicalPlan::Prepare(Prepare {
+            LogicalPlan::Statement(Statement::Prepare(Prepare {
                 name,
                 data_types,
                 input,
-            }) => {
-                let input = protobuf::LogicalPlanNode::try_from_logical_plan(
-                    input,
-                    extension_codec,
-                )?;
-                Ok(protobuf::LogicalPlanNode {
+            })) => {
+                let input =
+                    LogicalPlanNode::try_from_logical_plan(input, extension_codec)?;
+                Ok(LogicalPlanNode {
                     logical_plan_type: Some(LogicalPlanType::Prepare(Box::new(
                         protobuf::PrepareNode {
                             name: name.clone(),
@@ -1605,11 +1578,55 @@ impl AsLogicalPlan for LogicalPlanNode {
                     ))),
                 })
             }
-            LogicalPlan::Unnest(_) => Err(proto_error(
-                "LogicalPlan serde is not yet implemented for Unnest",
-            )),
+            LogicalPlan::Unnest(Unnest {
+                input,
+                exec_columns,
+                list_type_columns,
+                struct_type_columns,
+                dependency_indices,
+                schema,
+                options,
+            }) => {
+                let input =
+                    LogicalPlanNode::try_from_logical_plan(input, extension_codec)?;
+                let proto_unnest_list_items = list_type_columns
+                    .iter()
+                    .map(|(index, ul)| ColumnUnnestListItem {
+                        input_index: *index as _,
+                        recursion: Some(ColumnUnnestListRecursion {
+                            output_column: Some(ul.output_column.to_owned().into()),
+                            depth: ul.depth as _,
+                        }),
+                    })
+                    .collect();
+                Ok(LogicalPlanNode {
+                    logical_plan_type: Some(LogicalPlanType::Unnest(Box::new(
+                        protobuf::UnnestNode {
+                            input: Some(Box::new(input)),
+                            exec_columns: exec_columns
+                                .iter()
+                                .map(|col| col.into())
+                                .collect(),
+                            list_type_columns: proto_unnest_list_items,
+                            struct_type_columns: struct_type_columns
+                                .iter()
+                                .map(|c| *c as u64)
+                                .collect(),
+                            dependency_indices: dependency_indices
+                                .iter()
+                                .map(|c| *c as u64)
+                                .collect(),
+                            schema: Some(schema.try_into()?),
+                            options: Some(options.into()),
+                        },
+                    ))),
+                })
+            }
             LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(_)) => Err(proto_error(
                 "LogicalPlan serde is not yet implemented for CreateMemoryTable",
+            )),
+            LogicalPlan::Ddl(DdlStatement::CreateIndex(_)) => Err(proto_error(
+                "LogicalPlan serde is not yet implemented for CreateIndex",
             )),
             LogicalPlan::Ddl(DdlStatement::DropTable(_)) => Err(proto_error(
                 "LogicalPlan serde is not yet implemented for DropTable",
@@ -1618,7 +1635,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                 name,
                 if_exists,
                 schema,
-            })) => Ok(protobuf::LogicalPlanNode {
+            })) => Ok(LogicalPlanNode {
                 logical_plan_type: Some(LogicalPlanType::DropView(
                     protobuf::DropViewNode {
                         name: Some(name.clone().into()),
@@ -1630,100 +1647,54 @@ impl AsLogicalPlan for LogicalPlanNode {
             LogicalPlan::Ddl(DdlStatement::DropCatalogSchema(_)) => Err(proto_error(
                 "LogicalPlan serde is not yet implemented for DropCatalogSchema",
             )),
+            LogicalPlan::Ddl(DdlStatement::CreateFunction(_)) => Err(proto_error(
+                "LogicalPlan serde is not yet implemented for CreateFunction",
+            )),
+            LogicalPlan::Ddl(DdlStatement::DropFunction(_)) => Err(proto_error(
+                "LogicalPlan serde is not yet implemented for DropFunction",
+            )),
             LogicalPlan::Statement(_) => Err(proto_error(
                 "LogicalPlan serde is not yet implemented for Statement",
             )),
-            LogicalPlan::Dml(_) => Err(proto_error(
-                "LogicalPlan serde is not yet implemented for Dml",
-            )),
+            LogicalPlan::Dml(DmlStatement {
+                table_name,
+                table_schema,
+                op,
+                input,
+                ..
+            }) => {
+                let input =
+                    LogicalPlanNode::try_from_logical_plan(input, extension_codec)?;
+                let dml_type: dml_node::Type = op.into();
+                Ok(LogicalPlanNode {
+                    logical_plan_type: Some(LogicalPlanType::Dml(Box::new(DmlNode {
+                        input: Some(Box::new(input)),
+                        schema: Some(table_schema.try_into()?),
+                        table_name: Some(table_name.clone().into()),
+                        dml_type: dml_type.into(),
+                    }))),
+                })
+            }
             LogicalPlan::Copy(dml::CopyTo {
                 input,
                 output_url,
-                file_format,
-                copy_options,
+                file_type,
+                partition_by,
+                ..
             }) => {
-                let input = protobuf::LogicalPlanNode::try_from_logical_plan(
-                    input,
-                    extension_codec,
-                )?;
+                let input =
+                    LogicalPlanNode::try_from_logical_plan(input, extension_codec)?;
+                let mut buf = Vec::new();
+                extension_codec
+                    .try_encode_file_format(&mut buf, file_type_to_format(file_type)?)?;
 
-                let copy_options_proto: Option<copy_to_node::CopyOptions> =
-                    match copy_options {
-                        CopyOptions::SQLOptions(opt) => {
-                            let options: Vec<SqlOption> = opt
-                                .clone()
-                                .into_inner()
-                                .iter()
-                                .map(|(k, v)| SqlOption {
-                                    key: k.to_string(),
-                                    value: v.to_string(),
-                                })
-                                .collect();
-                            Some(copy_to_node::CopyOptions::SqlOptions(
-                                protobuf::SqlOptions { option: options },
-                            ))
-                        }
-                        CopyOptions::WriterOptions(opt) => {
-                            match opt.as_ref() {
-                                FileTypeWriterOptions::Arrow(_) => {
-                                    let arrow_writer_options =
-                                        file_type_writer_options::FileType::ArrowOptions(
-                                            protobuf::ArrowWriterOptions {},
-                                        );
-                                    Some(copy_to_node::CopyOptions::WriterOptions(
-                                        protobuf::FileTypeWriterOptions {
-                                            file_type: Some(arrow_writer_options),
-                                        },
-                                    ))
-                                }
-                                FileTypeWriterOptions::CSV(csv_opts) => {
-                                    let csv_options = &csv_opts.writer_options;
-                                    let csv_writer_options = csv_writer_options_to_proto(
-                                        csv_options,
-                                        &csv_opts.compression,
-                                    );
-                                    let csv_options =
-                                        file_type_writer_options::FileType::CsvOptions(
-                                            csv_writer_options,
-                                        );
-                                    Some(copy_to_node::CopyOptions::WriterOptions(
-                                        protobuf::FileTypeWriterOptions {
-                                            file_type: Some(csv_options),
-                                        },
-                                    ))
-                                }
-                                FileTypeWriterOptions::Parquet(parquet_opts) => {
-                                    let parquet_writer_options =
-                                        protobuf::ParquetWriterOptions {
-                                            writer_properties: Some(
-                                                writer_properties_to_proto(
-                                                    &parquet_opts.writer_options,
-                                                ),
-                                            ),
-                                        };
-                                    let parquet_options = file_type_writer_options::FileType::ParquetOptions(parquet_writer_options);
-                                    Some(copy_to_node::CopyOptions::WriterOptions(
-                                        protobuf::FileTypeWriterOptions {
-                                            file_type: Some(parquet_options),
-                                        },
-                                    ))
-                                }
-                                _ => {
-                                    return Err(proto_error(
-                                        "Unsupported FileTypeWriterOptions in CopyTo",
-                                    ))
-                                }
-                            }
-                        }
-                    };
-
-                Ok(protobuf::LogicalPlanNode {
+                Ok(LogicalPlanNode {
                     logical_plan_type: Some(LogicalPlanType::CopyTo(Box::new(
                         protobuf::CopyToNode {
                             input: Some(Box::new(input)),
                             output_url: output_url.to_string(),
-                            file_type: file_format.to_string(),
-                            copy_options: copy_options_proto,
+                            file_type: buf,
+                            partition_by: partition_by.clone(),
                         },
                     ))),
                 })
@@ -1731,80 +1702,27 @@ impl AsLogicalPlan for LogicalPlanNode {
             LogicalPlan::DescribeTable(_) => Err(proto_error(
                 "LogicalPlan serde is not yet implemented for DescribeTable",
             )),
-            LogicalPlan::RecursiveQuery(_) => Err(proto_error(
-                "LogicalPlan serde is not yet implemented for RecursiveQuery",
-            )),
-        }
-    }
-}
+            LogicalPlan::RecursiveQuery(recursive) => {
+                let static_term = LogicalPlanNode::try_from_logical_plan(
+                    recursive.static_term.as_ref(),
+                    extension_codec,
+                )?;
+                let recursive_term = LogicalPlanNode::try_from_logical_plan(
+                    recursive.recursive_term.as_ref(),
+                    extension_codec,
+                )?;
 
-pub(crate) fn csv_writer_options_to_proto(
-    csv_options: &WriterBuilder,
-    compression: &CompressionTypeVariant,
-) -> protobuf::CsvWriterOptions {
-    let compression: protobuf::CompressionTypeVariant = compression.into();
-    protobuf::CsvWriterOptions {
-        compression: compression.into(),
-        delimiter: (csv_options.delimiter() as char).to_string(),
-        has_header: csv_options.header(),
-        date_format: csv_options.date_format().unwrap_or("").to_owned(),
-        datetime_format: csv_options.datetime_format().unwrap_or("").to_owned(),
-        timestamp_format: csv_options.timestamp_format().unwrap_or("").to_owned(),
-        time_format: csv_options.time_format().unwrap_or("").to_owned(),
-        null_value: csv_options.null().to_owned(),
-    }
-}
-
-pub(crate) fn csv_writer_options_from_proto(
-    writer_options: &protobuf::CsvWriterOptions,
-) -> Result<WriterBuilder> {
-    let mut builder = WriterBuilder::new();
-    if !writer_options.delimiter.is_empty() {
-        if let Some(delimiter) = writer_options.delimiter.chars().next() {
-            if delimiter.is_ascii() {
-                builder = builder.with_delimiter(delimiter as u8);
-            } else {
-                return Err(proto_error("CSV Delimiter is not ASCII"));
+                Ok(LogicalPlanNode {
+                    logical_plan_type: Some(LogicalPlanType::RecursiveQuery(Box::new(
+                        protobuf::RecursiveQueryNode {
+                            name: recursive.name.clone(),
+                            static_term: Some(Box::new(static_term)),
+                            recursive_term: Some(Box::new(recursive_term)),
+                            is_distinct: recursive.is_distinct,
+                        },
+                    ))),
+                })
             }
-        } else {
-            return Err(proto_error("Error parsing CSV Delimiter"));
         }
     }
-    Ok(builder
-        .with_header(writer_options.has_header)
-        .with_date_format(writer_options.date_format.clone())
-        .with_datetime_format(writer_options.datetime_format.clone())
-        .with_timestamp_format(writer_options.timestamp_format.clone())
-        .with_time_format(writer_options.time_format.clone())
-        .with_null(writer_options.null_value.clone()))
-}
-
-pub(crate) fn writer_properties_to_proto(
-    props: &WriterProperties,
-) -> protobuf::WriterProperties {
-    protobuf::WriterProperties {
-        data_page_size_limit: props.data_page_size_limit() as u64,
-        dictionary_page_size_limit: props.dictionary_page_size_limit() as u64,
-        data_page_row_count_limit: props.data_page_row_count_limit() as u64,
-        write_batch_size: props.write_batch_size() as u64,
-        max_row_group_size: props.max_row_group_size() as u64,
-        writer_version: format!("{:?}", props.writer_version()),
-        created_by: props.created_by().to_string(),
-    }
-}
-
-pub(crate) fn writer_properties_from_proto(
-    props: &protobuf::WriterProperties,
-) -> Result<WriterProperties, DataFusionError> {
-    let writer_version =
-        WriterVersion::from_str(&props.writer_version).map_err(proto_error)?;
-    Ok(WriterProperties::builder()
-        .set_created_by(props.created_by.clone())
-        .set_writer_version(writer_version)
-        .set_dictionary_page_size_limit(props.dictionary_page_size_limit as usize)
-        .set_data_page_row_count_limit(props.data_page_row_count_limit as usize)
-        .set_data_page_size_limit(props.data_page_size_limit as usize)
-        .set_write_batch_size(props.write_batch_size as usize)
-        .set_max_row_group_size(props.max_row_group_size as usize)
-        .build())
 }

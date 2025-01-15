@@ -17,56 +17,62 @@
 
 //! Expression rewriter
 
-use crate::expr::{Alias, Unnest};
-use crate::logical_plan::Projection;
-use crate::{Expr, ExprSchemable, LogicalPlan, LogicalPlanBuilder};
-use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRewriter};
-use datafusion_common::Result;
-use datafusion_common::{Column, DFSchema};
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::fmt::Debug;
 use std::sync::Arc;
+
+use crate::expr::{Alias, Sort, Unnest};
+use crate::logical_plan::Projection;
+use crate::{Expr, ExprSchemable, LogicalPlan, LogicalPlanBuilder};
+
+use datafusion_common::config::ConfigOptions;
+use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
+use datafusion_common::TableReference;
+use datafusion_common::{Column, DFSchema, Result};
 
 mod order_by;
 pub use order_by::rewrite_sort_cols_by_aggs;
 
-/// Recursively call [`Column::normalize_with_schemas`] on all [`Column`] expressions
+/// Trait for rewriting [`Expr`]s into function calls.
+///
+/// This trait is used with `FunctionRegistry::register_function_rewrite` to
+/// to evaluating `Expr`s using functions that may not be built in to DataFusion
+///
+/// For example, concatenating arrays `a || b` is represented as
+/// `Operator::ArrowAt`, but can be implemented by calling a function
+/// `array_concat` from the `functions-nested` crate.
+// This is not used in datafusion internally, but it is still helpful for downstream project so don't remove it.
+pub trait FunctionRewrite: Debug {
+    /// Return a human readable name for this rewrite
+    fn name(&self) -> &str;
+
+    /// Potentially rewrite `expr` to some other expression
+    ///
+    /// Note that recursion is handled by the caller -- this method should only
+    /// handle `expr`, not recurse to its children.
+    fn rewrite(
+        &self,
+        expr: Expr,
+        schema: &DFSchema,
+        config: &ConfigOptions,
+    ) -> Result<Transformed<Expr>>;
+}
+
+/// Recursively call `LogicalPlanBuilder::normalize` on all [`Column`] expressions
 /// in the `expr` expression tree.
 pub fn normalize_col(expr: Expr, plan: &LogicalPlan) -> Result<Expr> {
-    expr.transform(&|expr| {
+    expr.transform(|expr| {
         Ok({
             if let Expr::Column(c) = expr {
                 let col = LogicalPlanBuilder::normalize(plan, c)?;
-                Transformed::Yes(Expr::Column(col))
+                Transformed::yes(Expr::Column(col))
             } else {
-                Transformed::No(expr)
+                Transformed::no(expr)
             }
         })
     })
-}
-
-/// Recursively call [`Column::normalize_with_schemas`] on all [`Column`] expressions
-/// in the `expr` expression tree.
-#[deprecated(
-    since = "20.0.0",
-    note = "use normalize_col_with_schemas_and_ambiguity_check instead"
-)]
-#[allow(deprecated)]
-pub fn normalize_col_with_schemas(
-    expr: Expr,
-    schemas: &[&Arc<DFSchema>],
-    using_columns: &[HashSet<Column>],
-) -> Result<Expr> {
-    expr.transform(&|expr| {
-        Ok({
-            if let Expr::Column(c) = expr {
-                let col = c.normalize_with_schemas(schemas, using_columns)?;
-                Transformed::Yes(Expr::Column(col))
-            } else {
-                Transformed::No(expr)
-            }
-        })
-    })
+    .data()
 }
 
 /// See [`Column::normalize_with_schemas_and_ambiguity_check`] for usage
@@ -76,26 +82,27 @@ pub fn normalize_col_with_schemas_and_ambiguity_check(
     using_columns: &[HashSet<Column>],
 ) -> Result<Expr> {
     // Normalize column inside Unnest
-    if let Expr::Unnest(Unnest { exprs }) = expr {
+    if let Expr::Unnest(Unnest { expr }) = expr {
         let e = normalize_col_with_schemas_and_ambiguity_check(
-            exprs[0].clone(),
+            expr.as_ref().clone(),
             schemas,
             using_columns,
         )?;
-        return Ok(Expr::Unnest(Unnest { exprs: vec![e] }));
+        return Ok(Expr::Unnest(Unnest { expr: Box::new(e) }));
     }
 
-    expr.transform(&|expr| {
+    expr.transform(|expr| {
         Ok({
             if let Expr::Column(c) = expr {
                 let col =
                     c.normalize_with_schemas_and_ambiguity_check(schemas, using_columns)?;
-                Transformed::Yes(Expr::Column(col))
+                Transformed::yes(Expr::Column(col))
             } else {
-                Transformed::No(expr)
+                Transformed::no(expr)
             }
         })
     })
+    .data()
 }
 
 /// Recursively normalize all [`Column`] expressions in a list of expression trees
@@ -109,21 +116,36 @@ pub fn normalize_cols(
         .collect()
 }
 
+pub fn normalize_sorts(
+    sorts: impl IntoIterator<Item = impl Into<Sort>>,
+    plan: &LogicalPlan,
+) -> Result<Vec<Sort>> {
+    sorts
+        .into_iter()
+        .map(|e| {
+            let sort = e.into();
+            normalize_col(sort.expr, plan)
+                .map(|expr| Sort::new(expr, sort.asc, sort.nulls_first))
+        })
+        .collect()
+}
+
 /// Recursively replace all [`Column`] expressions in a given expression tree with
 /// `Column` expressions provided by the hash map argument.
 pub fn replace_col(expr: Expr, replace_map: &HashMap<&Column, &Column>) -> Result<Expr> {
-    expr.transform(&|expr| {
+    expr.transform(|expr| {
         Ok({
             if let Expr::Column(c) = &expr {
                 match replace_map.get(c) {
-                    Some(new_c) => Transformed::Yes(Expr::Column((*new_c).to_owned())),
-                    None => Transformed::No(expr),
+                    Some(new_c) => Transformed::yes(Expr::Column((*new_c).to_owned())),
+                    None => Transformed::no(expr),
                 }
             } else {
-                Transformed::No(expr)
+                Transformed::no(expr)
             }
         })
     })
+    .data()
 }
 
 /// Recursively 'unnormalize' (remove all qualifiers) from an
@@ -132,20 +154,21 @@ pub fn replace_col(expr: Expr, replace_map: &HashMap<&Column, &Column>) -> Resul
 /// For example, if there were expressions like `foo.bar` this would
 /// rewrite it to just `bar`.
 pub fn unnormalize_col(expr: Expr) -> Expr {
-    expr.transform(&|expr| {
+    expr.transform(|expr| {
         Ok({
             if let Expr::Column(c) = expr {
                 let col = Column {
                     relation: None,
                     name: c.name,
                 };
-                Transformed::Yes(Expr::Column(col))
+                Transformed::yes(Expr::Column(col))
             } else {
-                Transformed::No(expr)
+                Transformed::no(expr)
             }
         })
     })
-    .expect("Unnormalize is infallable")
+    .data()
+    .expect("Unnormalize is infallible")
 }
 
 /// Create a Column from the Scalar Expr
@@ -154,13 +177,20 @@ pub fn create_col_from_scalar_expr(
     subqry_alias: String,
 ) -> Result<Column> {
     match scalar_expr {
-        Expr::Alias(Alias { name, .. }) => Ok(Column::new(Some(subqry_alias), name)),
-        Expr::Column(Column { relation: _, name }) => {
-            Ok(Column::new(Some(subqry_alias), name))
-        }
+        Expr::Alias(Alias { name, .. }) => Ok(Column::new(
+            Some::<TableReference>(subqry_alias.into()),
+            name,
+        )),
+        Expr::Column(Column { relation: _, name }) => Ok(Column::new(
+            Some::<TableReference>(subqry_alias.into()),
+            name,
+        )),
         _ => {
-            let scalar_column = scalar_expr.display_name()?;
-            Ok(Column::new(Some(subqry_alias), scalar_column))
+            let scalar_column = scalar_expr.schema_name().to_string();
+            Ok(Column::new(
+                Some::<TableReference>(subqry_alias.into()),
+                scalar_column,
+            ))
         }
     }
 }
@@ -174,47 +204,41 @@ pub fn unnormalize_cols(exprs: impl IntoIterator<Item = Expr>) -> Vec<Expr> {
 /// Recursively remove all the ['OuterReferenceColumn'] and return the inside Column
 /// in the expression tree.
 pub fn strip_outer_reference(expr: Expr) -> Expr {
-    expr.transform(&|expr| {
+    expr.transform(|expr| {
         Ok({
             if let Expr::OuterReferenceColumn(_, col) = expr {
-                Transformed::Yes(Expr::Column(col))
+                Transformed::yes(Expr::Column(col))
             } else {
-                Transformed::No(expr)
+                Transformed::no(expr)
             }
         })
     })
-    .expect("strip_outer_reference is infallable")
+    .data()
+    .expect("strip_outer_reference is infallible")
 }
 
 /// Returns plan with expressions coerced to types compatible with
 /// schema types
 pub fn coerce_plan_expr_for_schema(
-    plan: &LogicalPlan,
+    plan: LogicalPlan,
     schema: &DFSchema,
 ) -> Result<LogicalPlan> {
     match plan {
         // special case Projection to avoid adding multiple projections
         LogicalPlan::Projection(Projection { expr, input, .. }) => {
-            let new_exprs =
-                coerce_exprs_for_schema(expr.clone(), input.schema(), schema)?;
-            let projection = Projection::try_new(new_exprs, input.clone())?;
+            let new_exprs = coerce_exprs_for_schema(expr, input.schema(), schema)?;
+            let projection = Projection::try_new(new_exprs, input)?;
             Ok(LogicalPlan::Projection(projection))
         }
         _ => {
-            let exprs: Vec<Expr> = plan
-                .schema()
-                .fields()
-                .iter()
-                .map(|field| Expr::Column(field.qualified_column()))
-                .collect();
-
+            let exprs: Vec<Expr> = plan.schema().iter().map(Expr::from).collect();
             let new_exprs = coerce_exprs_for_schema(exprs, plan.schema(), schema)?;
-            let add_project = new_exprs.iter().any(|expr| expr.try_into_col().is_err());
+            let add_project = new_exprs.iter().any(|expr| expr.try_as_col().is_none());
             if add_project {
-                let projection = Projection::try_new(new_exprs, Arc::new(plan.clone()))?;
+                let projection = Projection::try_new(new_exprs, Arc::new(plan))?;
                 Ok(LogicalPlan::Projection(projection))
             } else {
-                Ok(plan.clone())
+                Ok(plan)
             }
         }
     }
@@ -235,10 +259,11 @@ fn coerce_exprs_for_schema(
                     Expr::Alias(Alias { expr, name, .. }) => {
                         Ok(expr.cast_to(new_type, src_schema)?.alias(name))
                     }
+                    Expr::Wildcard { .. } => Ok(expr),
                     _ => expr.cast_to(new_type, src_schema),
                 }
             } else {
-                Ok(expr.clone())
+                Ok(expr)
             }
         })
         .collect::<Result<_>>()
@@ -253,29 +278,90 @@ pub fn unalias(expr: Expr) -> Expr {
     }
 }
 
-/// Rewrites `expr` using `rewriter`, ensuring that the output has the
-/// same name as `expr` prior to rewrite, adding an alias if necessary.
+/// Handles ensuring the name of rewritten expressions is not changed.
 ///
 /// This is important when optimizing plans to ensure the output
-/// schema of plan nodes don't change after optimization
-pub fn rewrite_preserving_name<R>(expr: Expr, rewriter: &mut R) -> Result<Expr>
-where
-    R: TreeNodeRewriter<N = Expr>,
-{
-    let original_name = expr.name_for_alias()?;
-    let expr = expr.rewrite(rewriter)?;
-    expr.alias_if_changed(original_name)
+/// schema of plan nodes don't change after optimization.
+/// For example, if an expression `1 + 2` is rewritten to `3`, the name of the
+/// expression should be preserved: `3 as "1 + 2"`
+///
+/// See <https://github.com/apache/datafusion/issues/3555> for details
+pub struct NamePreserver {
+    use_alias: bool,
+}
+
+/// If the qualified name of an expression is remembered, it will be preserved
+/// when rewriting the expression
+pub enum SavedName {
+    /// Saved qualified name to be preserved
+    Saved {
+        relation: Option<TableReference>,
+        name: String,
+    },
+    /// Name is not preserved
+    None,
+}
+
+impl NamePreserver {
+    /// Create a new NamePreserver for rewriting the `expr` that is part of the specified plan
+    pub fn new(plan: &LogicalPlan) -> Self {
+        Self {
+            // The expressions of these plans do not contribute to their output schema,
+            // so there is no need to preserve expression names to prevent a schema change.
+            use_alias: !matches!(
+                plan,
+                LogicalPlan::Filter(_)
+                    | LogicalPlan::Join(_)
+                    | LogicalPlan::TableScan(_)
+                    | LogicalPlan::Limit(_)
+                    | LogicalPlan::Statement(_)
+            ),
+        }
+    }
+
+    /// Create a new NamePreserver for rewriting the `expr`s in `Projection`
+    ///
+    /// This will use aliases
+    pub fn new_for_projection() -> Self {
+        Self { use_alias: true }
+    }
+
+    pub fn save(&self, expr: &Expr) -> SavedName {
+        if self.use_alias {
+            let (relation, name) = expr.qualified_name();
+            SavedName::Saved { relation, name }
+        } else {
+            SavedName::None
+        }
+    }
+}
+
+impl SavedName {
+    /// Ensures the qualified name of the rewritten expression is preserved
+    pub fn restore(self, expr: Expr) -> Expr {
+        match self {
+            SavedName::Saved { relation, name } => {
+                let (new_relation, new_name) = expr.qualified_name();
+                if new_relation != relation || new_name != name {
+                    expr.alias_qualified(relation, name)
+                } else {
+                    expr
+                }
+            }
+            SavedName::None => expr,
+        }
+    }
 }
 
 #[cfg(test)]
 mod test {
-    use super::*;
-    use crate::expr::Sort;
-    use crate::{col, lit, Cast};
-    use arrow::datatypes::DataType;
-    use datafusion_common::tree_node::{RewriteRecursion, TreeNode, TreeNodeRewriter};
-    use datafusion_common::{DFField, DFSchema, ScalarValue};
     use std::ops::Add;
+
+    use super::*;
+    use crate::{col, lit, Cast};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion_common::tree_node::TreeNodeRewriter;
+    use datafusion_common::ScalarValue;
 
     #[derive(Default)]
     struct RecordingRewriter {
@@ -283,16 +369,16 @@ mod test {
     }
 
     impl TreeNodeRewriter for RecordingRewriter {
-        type N = Expr;
+        type Node = Expr;
 
-        fn pre_visit(&mut self, expr: &Expr) -> Result<RewriteRecursion> {
+        fn f_down(&mut self, expr: Expr) -> Result<Transformed<Expr>> {
             self.v.push(format!("Previsited {expr}"));
-            Ok(RewriteRecursion::Continue)
+            Ok(Transformed::no(expr))
         }
 
-        fn mutate(&mut self, expr: Expr) -> Result<Expr> {
+        fn f_up(&mut self, expr: Expr) -> Result<Transformed<Expr>> {
             self.v.push(format!("Mutated {expr}"));
-            Ok(expr)
+            Ok(Transformed::no(expr))
         }
     }
 
@@ -307,19 +393,27 @@ mod test {
                     } else {
                         utf8_val
                     };
-                    Ok(Transformed::Yes(lit(utf8_val)))
+                    Ok(Transformed::yes(lit(utf8_val)))
                 }
                 // otherwise, return None
-                _ => Ok(Transformed::No(expr)),
+                _ => Ok(Transformed::no(expr)),
             }
         };
 
         // rewrites "foo" --> "bar"
-        let rewritten = col("state").eq(lit("foo")).transform(&transformer).unwrap();
+        let rewritten = col("state")
+            .eq(lit("foo"))
+            .transform(transformer)
+            .data()
+            .unwrap();
         assert_eq!(rewritten, col("state").eq(lit("bar")));
 
         // doesn't rewrite
-        let rewritten = col("state").eq(lit("baz")).transform(&transformer).unwrap();
+        let rewritten = col("state")
+            .eq(lit("baz"))
+            .transform(transformer)
+            .data()
+            .unwrap();
         assert_eq!(rewritten, col("state").eq(lit("baz")));
     }
 
@@ -328,20 +422,21 @@ mod test {
         let expr = col("a") + col("b") + col("c");
 
         // Schemas with some matching and some non matching cols
-        let schema_a = make_schema_with_empty_metadata(vec![
-            make_field("tableA", "a"),
-            make_field("tableA", "aa"),
-        ]);
-        let schema_c = make_schema_with_empty_metadata(vec![
-            make_field("tableC", "cc"),
-            make_field("tableC", "c"),
-        ]);
-        let schema_b = make_schema_with_empty_metadata(vec![make_field("tableB", "b")]);
+        let schema_a = make_schema_with_empty_metadata(
+            vec![Some("tableA".into()), Some("tableA".into())],
+            vec!["a", "aa"],
+        );
+        let schema_c = make_schema_with_empty_metadata(
+            vec![Some("tableC".into()), Some("tableC".into())],
+            vec!["cc", "c"],
+        );
+        let schema_b =
+            make_schema_with_empty_metadata(vec![Some("tableB".into())], vec!["b"]);
         // non matching
-        let schema_f = make_schema_with_empty_metadata(vec![
-            make_field("tableC", "f"),
-            make_field("tableC", "ff"),
-        ]);
+        let schema_f = make_schema_with_empty_metadata(
+            vec![Some("tableC".into()), Some("tableC".into())],
+            vec!["f", "ff"],
+        );
         let schemas = vec![schema_c, schema_f, schema_b, schema_a];
         let schemas = schemas.iter().collect::<Vec<_>>();
 
@@ -355,40 +450,21 @@ mod test {
     }
 
     #[test]
-    #[allow(deprecated)]
-    fn normalize_cols_priority() {
-        let expr = col("a") + col("b");
-        // Schemas with multiple matches for column a, first takes priority
-        let schema_a = make_schema_with_empty_metadata(vec![make_field("tableA", "a")]);
-        let schema_b = make_schema_with_empty_metadata(vec![make_field("tableB", "b")]);
-        let schema_a2 = make_schema_with_empty_metadata(vec![make_field("tableA2", "a")]);
-        let schemas = vec![schema_a2, schema_b, schema_a]
-            .into_iter()
-            .map(Arc::new)
-            .collect::<Vec<_>>();
-        let schemas = schemas.iter().collect::<Vec<_>>();
-
-        let normalized_expr = normalize_col_with_schemas(expr, &schemas, &[]).unwrap();
-        assert_eq!(normalized_expr, col("tableA2.a") + col("tableB.b"));
-    }
-
-    #[test]
     fn normalize_cols_non_exist() {
         // test normalizing columns when the name doesn't exist
         let expr = col("a") + col("b");
         let schema_a =
-            make_schema_with_empty_metadata(vec![make_field("\"tableA\"", "a")]);
-        let schemas = vec![schema_a];
+            make_schema_with_empty_metadata(vec![Some("\"tableA\"".into())], vec!["a"]);
+        let schemas = [schema_a];
         let schemas = schemas.iter().collect::<Vec<_>>();
 
         let error =
             normalize_col_with_schemas_and_ambiguity_check(expr, &[&schemas], &[])
                 .unwrap_err()
                 .strip_backtrace();
-        assert_eq!(
-            error,
-            r#"Schema error: No field named b. Valid fields are "tableA".a."#
-        );
+        let expected = "Schema error: No field named b. \
+            Valid fields are \"tableA\".a.";
+        assert_eq!(error, expected);
     }
 
     #[test]
@@ -398,12 +474,16 @@ mod test {
         assert_eq!(unnormalized_expr, col("a") + col("b"));
     }
 
-    fn make_schema_with_empty_metadata(fields: Vec<DFField>) -> DFSchema {
-        DFSchema::new_with_metadata(fields, HashMap::new()).unwrap()
-    }
-
-    fn make_field(relation: &str, column: &str) -> DFField {
-        DFField::new(Some(relation.to_string()), column, DataType::Int8, false)
+    fn make_schema_with_empty_metadata(
+        qualifiers: Vec<Option<TableReference>>,
+        fields: Vec<&str>,
+    ) -> DFSchema {
+        let fields = fields
+            .iter()
+            .map(|f| Arc::new(Field::new(f.to_string(), DataType::Int8, false)))
+            .collect::<Vec<_>>();
+        let schema = Arc::new(Schema::new(fields));
+        DFSchema::from_field_specific_qualified_schema(qualifiers, &schema).unwrap()
     }
 
     #[test]
@@ -439,45 +519,41 @@ mod test {
         // change literal type from i32 to i64
         test_rewrite(col("a").add(lit(1i32)), col("a").add(lit(1i64)));
 
-        // SortExpr a+1 ==> b + 2
+        // test preserve qualifier
         test_rewrite(
-            Expr::Sort(Sort::new(Box::new(col("a").add(lit(1i32))), true, false)),
-            Expr::Sort(Sort::new(Box::new(col("b").add(lit(2i64))), true, false)),
+            Expr::Column(Column::new(Some("test"), "a")),
+            Expr::Column(Column::new_unqualified("test.a")),
+        );
+        test_rewrite(
+            Expr::Column(Column::new_unqualified("test.a")),
+            Expr::Column(Column::new(Some("test"), "a")),
         );
     }
 
-    /// rewrites `expr_from` to `rewrite_to` using
-    /// `rewrite_preserving_name` verifying the result is `expected_expr`
+    /// rewrites `expr_from` to `rewrite_to` while preserving the original qualified name
+    /// by using the `NamePreserver`
     fn test_rewrite(expr_from: Expr, rewrite_to: Expr) {
         struct TestRewriter {
             rewrite_to: Expr,
         }
 
         impl TreeNodeRewriter for TestRewriter {
-            type N = Expr;
+            type Node = Expr;
 
-            fn mutate(&mut self, _: Expr) -> Result<Expr> {
-                Ok(self.rewrite_to.clone())
+            fn f_up(&mut self, _: Expr) -> Result<Transformed<Expr>> {
+                Ok(Transformed::yes(self.rewrite_to.clone()))
             }
         }
 
         let mut rewriter = TestRewriter {
             rewrite_to: rewrite_to.clone(),
         };
-        let expr = rewrite_preserving_name(expr_from.clone(), &mut rewriter).unwrap();
+        let saved_name = NamePreserver { use_alias: true }.save(&expr_from);
+        let new_expr = expr_from.clone().rewrite(&mut rewriter).unwrap().data;
+        let new_expr = saved_name.restore(new_expr);
 
-        let original_name = match &expr_from {
-            Expr::Sort(Sort { expr, .. }) => expr.display_name(),
-            expr => expr.display_name(),
-        }
-        .unwrap();
-
-        let new_name = match &expr {
-            Expr::Sort(Sort { expr, .. }) => expr.display_name(),
-            expr => expr.display_name(),
-        }
-        .unwrap();
-
+        let original_name = expr_from.qualified_name();
+        let new_name = new_expr.qualified_name();
         assert_eq!(
             original_name, new_name,
             "mismatch rewriting expr_from: {expr_from} to {rewrite_to}"

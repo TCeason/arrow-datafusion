@@ -20,6 +20,11 @@ use datafusion::error::Result;
 
 use structopt::StructOpt;
 
+#[cfg(all(feature = "snmalloc", feature = "mimalloc"))]
+compile_error!(
+    "feature \"snmalloc\" and feature \"mimalloc\" cannot be enabled at the same time"
+);
+
 #[cfg(feature = "snmalloc")]
 #[global_allocator]
 static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
@@ -28,7 +33,9 @@ static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use datafusion_benchmarks::{clickbench, parquet_filter, sort, tpch};
+use datafusion_benchmarks::{
+    clickbench, h2o, imdb, parquet_filter, sort, sort_tpch, tpch,
+};
 
 #[derive(Debug, StructOpt)]
 #[structopt(about = "benchmark command")]
@@ -38,6 +45,9 @@ enum Options {
     Clickbench(clickbench::RunOpt),
     ParquetFilter(parquet_filter::RunOpt),
     Sort(sort::RunOpt),
+    SortTpch(sort_tpch::RunOpt),
+    Imdb(imdb::RunOpt),
+    H2o(h2o::RunOpt),
 }
 
 // Main benchmark runner entrypoint
@@ -51,5 +61,8 @@ pub async fn main() -> Result<()> {
         Options::Clickbench(opt) => opt.run().await,
         Options::ParquetFilter(opt) => opt.run().await,
         Options::Sort(opt) => opt.run().await,
+        Options::SortTpch(opt) => opt.run().await,
+        Options::Imdb(opt) => opt.run().await,
+        Options::H2o(opt) => opt.run().await,
     }
 }

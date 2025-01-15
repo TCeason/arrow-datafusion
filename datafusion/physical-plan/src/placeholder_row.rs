@@ -20,40 +20,48 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use super::expressions::PhysicalSortExpr;
-use super::{common, DisplayAs, SendableRecordBatchStream, Statistics};
+use super::{common, DisplayAs, PlanProperties, SendableRecordBatchStream, Statistics};
+use crate::execution_plan::{Boundedness, EmissionType};
 use crate::{memory::MemoryStream, DisplayFormatType, ExecutionPlan, Partitioning};
 
 use arrow::array::{ArrayRef, NullArray};
 use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow_array::RecordBatchOptions;
-use datafusion_common::{internal_err, DataFusionError, Result};
+use datafusion_common::{internal_err, Result};
 use datafusion_execution::TaskContext;
+use datafusion_physical_expr::EquivalenceProperties;
 
 use log::trace;
 
 /// Execution plan for empty relation with produce_one_row=true
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PlaceholderRowExec {
     /// The schema for the produced row
     schema: SchemaRef,
     /// Number of partitions
     partitions: usize,
+    cache: PlanProperties,
 }
 
 impl PlaceholderRowExec {
     /// Create a new PlaceholderRowExec
     pub fn new(schema: SchemaRef) -> Self {
+        let partitions = 1;
+        let cache = Self::compute_properties(Arc::clone(&schema), partitions);
         PlaceholderRowExec {
             schema,
-            partitions: 1,
+            partitions,
+            cache,
         }
     }
 
     /// Create a new PlaceholderRowExecPlaceholderRowExec with specified partition number
     pub fn with_partitions(mut self, partitions: usize) -> Self {
         self.partitions = partitions;
+        // Update output partitioning when updating partitions:
+        let output_partitioning = Self::output_partitioning_helper(self.partitions);
+        self.cache = self.cache.with_partitioning(output_partitioning);
         self
     }
 
@@ -79,6 +87,20 @@ impl PlaceholderRowExec {
             )?]
         })
     }
+
+    fn output_partitioning_helper(n_partitions: usize) -> Partitioning {
+        Partitioning::UnknownPartitioning(n_partitions)
+    }
+
+    /// This function creates the cache object that stores the plan properties such as schema, equivalence properties, ordering, partitioning, etc.
+    fn compute_properties(schema: SchemaRef, n_partitions: usize) -> PlanProperties {
+        PlanProperties::new(
+            EquivalenceProperties::new(schema),
+            Self::output_partitioning_helper(n_partitions),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        )
+    }
 }
 
 impl DisplayAs for PlaceholderRowExec {
@@ -96,33 +118,28 @@ impl DisplayAs for PlaceholderRowExec {
 }
 
 impl ExecutionPlan for PlaceholderRowExec {
+    fn name(&self) -> &'static str {
+        "PlaceholderRowExec"
+    }
+
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
         self
     }
 
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+    fn properties(&self) -> &PlanProperties {
+        &self.cache
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
-    }
-
-    /// Get the output partitioning of this plan
-    fn output_partitioning(&self) -> Partitioning {
-        Partitioning::UnknownPartitioning(self.partitions)
-    }
-
-    fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        None
     }
 
     fn with_new_children(
         self: Arc<Self>,
         _: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(PlaceholderRowExec::new(self.schema.clone())))
+        Ok(self)
     }
 
     fn execute(
@@ -142,7 +159,7 @@ impl ExecutionPlan for PlaceholderRowExec {
 
         Ok(Box::pin(MemoryStream::try_new(
             self.data()?,
-            self.schema.clone(),
+            Arc::clone(&self.schema),
             None,
         )?))
     }
@@ -162,8 +179,7 @@ impl ExecutionPlan for PlaceholderRowExec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::with_new_children_if_necessary;
-    use crate::{common, test};
+    use crate::{test, with_new_children_if_necessary};
 
     #[test]
     fn with_new_children() -> Result<()> {
@@ -171,8 +187,10 @@ mod tests {
 
         let placeholder = Arc::new(PlaceholderRowExec::new(schema));
 
-        let placeholder_2 =
-            with_new_children_if_necessary(placeholder.clone(), vec![])?.into();
+        let placeholder_2 = with_new_children_if_necessary(
+            Arc::clone(&placeholder) as Arc<dyn ExecutionPlan>,
+            vec![],
+        )?;
         assert_eq!(placeholder.schema(), placeholder_2.schema());
 
         let too_many_kids = vec![placeholder_2];
@@ -189,8 +207,8 @@ mod tests {
         let schema = test::aggr_test_schema();
         let placeholder = PlaceholderRowExec::new(schema);
 
-        // ask for the wrong partition
-        assert!(placeholder.execute(1, task_ctx.clone()).is_err());
+        // Ask for the wrong partition
+        assert!(placeholder.execute(1, Arc::clone(&task_ctx)).is_err());
         assert!(placeholder.execute(20, task_ctx).is_err());
         Ok(())
     }
@@ -204,7 +222,7 @@ mod tests {
         let iter = placeholder.execute(0, task_ctx)?;
         let batches = common::collect(iter).await?;
 
-        // should have one item
+        // Should have one item
         assert_eq!(batches.len(), 1);
 
         Ok(())
@@ -218,10 +236,10 @@ mod tests {
         let placeholder = PlaceholderRowExec::new(schema).with_partitions(partitions);
 
         for n in 0..partitions {
-            let iter = placeholder.execute(n, task_ctx.clone())?;
+            let iter = placeholder.execute(n, Arc::clone(&task_ctx))?;
             let batches = common::collect(iter).await?;
 
-            // should have one item
+            // Should have one item
             assert_eq!(batches.len(), 1);
         }
 

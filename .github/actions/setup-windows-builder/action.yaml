@@ -30,16 +30,16 @@ runs:
       run: |
         mkdir -p $HOME/d/protoc
         cd $HOME/d/protoc
-        export PROTO_ZIP="protoc-21.4-win64.zip"
-        curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v21.4/$PROTO_ZIP
+        export PROTO_ZIP="protoc-29.1-win64.zip"
+        curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v29.1/$PROTO_ZIP
         unzip $PROTO_ZIP
         export PATH=$PATH:$HOME/d/protoc/bin
         protoc.exe --version
     - name: Setup Rust toolchain
       shell: bash
       run: |
-        rustup update stable
-        rustup toolchain install stable
+        # Avoid self update to avoid CI failures: https://github.com/apache/datafusion/issues/9653
+        rustup toolchain install stable --no-self-update
         rustup default stable
         rustup component add rustfmt
     - name: Configure rust runtime env

@@ -36,76 +36,63 @@
 ///    ]
 /// }
 /// ```
+///
+/// Exported functions accept:
+/// - `Vec<Expr>` argument (single argument followed by a comma)
+/// - Variable number of `Expr` arguments (zero or more arguments, must be without commas)
 macro_rules! export_functions {
-    ($(($FUNC:ident,  $($arg:ident)*, $DOC:expr)),*) => {
-        pub mod expr_fn {
-            $(
-                #[doc = $DOC]
-                /// Return $name(arg)
-                pub fn $FUNC($($arg: datafusion_expr::Expr),*) -> datafusion_expr::Expr {
-                    super::$FUNC().call(vec![$($arg),*],)
-                }
-            )*
-        }
+    ($(($FUNC:ident, $DOC:expr, $($arg:tt)*)),*) => {
+        $(
+            // switch to single-function cases below
+            export_functions!(single $FUNC, $DOC, $($arg)*);
+        )*
+    };
 
-        /// Return a list of all functions in this package
-        pub fn functions() -> Vec<std::sync::Arc<datafusion_expr::ScalarUDF>> {
-            vec![
-                $(
-                    $FUNC(),
-                )*
-            ]
+    // single vector argument (a single argument followed by a comma)
+    (single $FUNC:ident, $DOC:expr, $arg:ident,) => {
+        #[doc = $DOC]
+        pub fn $FUNC($arg: Vec<datafusion_expr::Expr>) -> datafusion_expr::Expr {
+            super::$FUNC().call($arg)
+        }
+    };
+
+    // variadic arguments (zero or more arguments, without commas)
+    (single $FUNC:ident, $DOC:expr, $($arg:ident)*) => {
+        #[doc = $DOC]
+        pub fn $FUNC($($arg: datafusion_expr::Expr),*) -> datafusion_expr::Expr {
+            super::$FUNC().call(vec![$($arg),*])
         }
     };
 }
 
-/// Creates a singleton `ScalarUDF` of the `$UDF` function named `$GNAME` and a
-/// function named `$NAME` which returns that function named $NAME.
+/// Creates a singleton `ScalarUDF` of the `$UDF` function and a function
+/// named `$NAME` which returns that singleton.
 ///
 /// This is used to ensure creating the list of `ScalarUDF` only happens once.
 macro_rules! make_udf_function {
-    ($UDF:ty, $GNAME:ident, $NAME:ident) => {
-        /// Singleton instance of the function
-        static $GNAME: std::sync::OnceLock<std::sync::Arc<datafusion_expr::ScalarUDF>> =
-            std::sync::OnceLock::new();
-
-        /// Return a [`ScalarUDF`] for [`$UDF`]
-        ///
-        /// [`ScalarUDF`]: datafusion_expr::ScalarUDF
-        fn $NAME() -> std::sync::Arc<datafusion_expr::ScalarUDF> {
-            $GNAME
-                .get_or_init(|| {
-                    std::sync::Arc::new(datafusion_expr::ScalarUDF::new_from_impl(
-                        <$UDF>::new(),
-                    ))
-                })
-                .clone()
+    ($UDF:ty, $NAME:ident) => {
+        #[doc = concat!("Return a [`ScalarUDF`](datafusion_expr::ScalarUDF) implementation of ", stringify!($NAME))]
+        pub fn $NAME() -> std::sync::Arc<datafusion_expr::ScalarUDF> {
+            // Singleton instance of the function
+            static INSTANCE: std::sync::LazyLock<
+                std::sync::Arc<datafusion_expr::ScalarUDF>,
+            > = std::sync::LazyLock::new(|| {
+                std::sync::Arc::new(datafusion_expr::ScalarUDF::new_from_impl(
+                    <$UDF>::new(),
+                ))
+            });
+            std::sync::Arc::clone(&INSTANCE)
         }
     };
 }
 
-/// Macro creates the named module if the feature is enabled
-/// otherwise creates a stub
-///
-/// Which returns:
-///
-/// 1. The list of actual function implementation when the relevant
-/// feature is activated,
-///
-/// 2. A list of stub function when the feature is not activated that produce
-/// a runtime error (and explain what feature flag is needed to activate them).
+/// Macro creates a sub module if the feature is not enabled
 ///
 /// The rationale for providing stub functions is to help users to configure datafusion
 /// properly (so they get an error telling them why a function is not available)
 /// instead of getting a cryptic "no function found" message at runtime.
-
-macro_rules! make_package {
-    ($name:ident, $feature:literal, $DOC:expr) => {
-        #[cfg(feature = $feature)]
-        #[doc = $DOC ]
-        #[doc = concat!("Enabled via feature flag `", $feature, "`")]
-        pub mod $name;
-
+macro_rules! make_stub_package {
+    ($name:ident, $feature:literal) => {
         #[cfg(not(feature = $feature))]
         #[doc = concat!("Disabled. Enable via feature flag `", $feature, "`")]
         pub mod $name {
@@ -117,6 +104,273 @@ macro_rules! make_package {
             pub fn functions() -> Vec<Arc<ScalarUDF>> {
                 debug!("{} functions disabled", stringify!($name));
                 vec![]
+            }
+        }
+    };
+}
+
+/// Downcast a named argument to a specific array type, returning an internal error
+/// if the cast fails
+///
+/// $ARG: ArrayRef
+/// $NAME: name of the argument (for error messages)
+/// $ARRAY_TYPE: the type of array to cast the argument to
+#[macro_export]
+macro_rules! downcast_named_arg {
+    ($ARG:expr, $NAME:expr, $ARRAY_TYPE:ident) => {{
+        $ARG.as_any().downcast_ref::<$ARRAY_TYPE>().ok_or_else(|| {
+            internal_datafusion_err!(
+                "could not cast {} to {}",
+                $NAME,
+                std::any::type_name::<$ARRAY_TYPE>()
+            )
+        })?
+    }};
+}
+
+/// Downcast an argument to a specific array type, returning an internal error
+/// if the cast fails
+///
+/// $ARG: ArrayRef
+/// $ARRAY_TYPE: the type of array to cast the argument to
+#[macro_export]
+macro_rules! downcast_arg {
+    ($ARG:expr, $ARRAY_TYPE:ident) => {{
+        downcast_named_arg!($ARG, "", $ARRAY_TYPE)
+    }};
+}
+
+/// Macro to create a unary math UDF.
+///
+/// A unary math function takes an argument of type Float32 or Float64,
+/// applies a unary floating function to the argument, and returns a value of the same type.
+///
+/// $UDF: the name of the UDF struct that implements `ScalarUDFImpl`
+/// $NAME: the name of the function
+/// $UNARY_FUNC: the unary function to apply to the argument
+/// $OUTPUT_ORDERING: the output ordering calculation method of the function
+/// $GET_DOC: the function to get the documentation of the UDF
+macro_rules! make_math_unary_udf {
+    ($UDF:ident, $NAME:ident, $UNARY_FUNC:ident, $OUTPUT_ORDERING:expr, $EVALUATE_BOUNDS:expr, $GET_DOC:expr) => {
+        make_udf_function!($NAME::$UDF, $NAME);
+
+        mod $NAME {
+            use std::any::Any;
+            use std::sync::Arc;
+
+            use arrow::array::{ArrayRef, AsArray};
+            use arrow::datatypes::{DataType, Float32Type, Float64Type};
+            use datafusion_common::{exec_err, Result};
+            use datafusion_expr::interval_arithmetic::Interval;
+            use datafusion_expr::sort_properties::{ExprProperties, SortProperties};
+            use datafusion_expr::{
+                ColumnarValue, Documentation, ScalarUDFImpl, Signature, Volatility,
+            };
+
+            #[derive(Debug)]
+            pub struct $UDF {
+                signature: Signature,
+            }
+
+            impl $UDF {
+                pub fn new() -> Self {
+                    use DataType::*;
+                    Self {
+                        signature: Signature::uniform(
+                            1,
+                            vec![Float64, Float32],
+                            Volatility::Immutable,
+                        ),
+                    }
+                }
+            }
+
+            impl ScalarUDFImpl for $UDF {
+                fn as_any(&self) -> &dyn Any {
+                    self
+                }
+                fn name(&self) -> &str {
+                    stringify!($NAME)
+                }
+
+                fn signature(&self) -> &Signature {
+                    &self.signature
+                }
+
+                fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+                    let arg_type = &arg_types[0];
+
+                    match arg_type {
+                        DataType::Float32 => Ok(DataType::Float32),
+                        // For other types (possible values float64/null/int), use Float64
+                        _ => Ok(DataType::Float64),
+                    }
+                }
+
+                fn output_ordering(
+                    &self,
+                    input: &[ExprProperties],
+                ) -> Result<SortProperties> {
+                    $OUTPUT_ORDERING(input)
+                }
+
+                fn evaluate_bounds(&self, inputs: &[&Interval]) -> Result<Interval> {
+                    $EVALUATE_BOUNDS(inputs)
+                }
+
+                fn invoke_batch(
+                    &self,
+                    args: &[ColumnarValue],
+                    _number_rows: usize,
+                ) -> Result<ColumnarValue> {
+                    let args = ColumnarValue::values_to_arrays(args)?;
+                    let arr: ArrayRef = match args[0].data_type() {
+                        DataType::Float64 => Arc::new(
+                            args[0]
+                                .as_primitive::<Float64Type>()
+                                .unary::<_, Float64Type>(|x: f64| f64::$UNARY_FUNC(x)),
+                        ) as ArrayRef,
+                        DataType::Float32 => Arc::new(
+                            args[0]
+                                .as_primitive::<Float32Type>()
+                                .unary::<_, Float32Type>(|x: f32| f32::$UNARY_FUNC(x)),
+                        ) as ArrayRef,
+                        other => {
+                            return exec_err!(
+                                "Unsupported data type {other:?} for function {}",
+                                self.name()
+                            )
+                        }
+                    };
+
+                    Ok(ColumnarValue::Array(arr))
+                }
+
+                fn documentation(&self) -> Option<&Documentation> {
+                    Some($GET_DOC())
+                }
+            }
+        }
+    };
+}
+
+/// Macro to create a binary math UDF.
+///
+/// A binary math function takes two arguments of types Float32 or Float64,
+/// applies a binary floating function to the argument, and returns a value of the same type.
+///
+/// $UDF: the name of the UDF struct that implements `ScalarUDFImpl`
+/// $NAME: the name of the function
+/// $BINARY_FUNC: the binary function to apply to the argument
+/// $OUTPUT_ORDERING: the output ordering calculation method of the function
+/// $GET_DOC: the function to get the documentation of the UDF
+macro_rules! make_math_binary_udf {
+    ($UDF:ident, $NAME:ident, $BINARY_FUNC:ident, $OUTPUT_ORDERING:expr, $GET_DOC:expr) => {
+        make_udf_function!($NAME::$UDF, $NAME);
+
+        mod $NAME {
+            use std::any::Any;
+            use std::sync::Arc;
+
+            use arrow::array::{ArrayRef, AsArray};
+            use arrow::datatypes::{DataType, Float32Type, Float64Type};
+            use datafusion_common::{exec_err, Result};
+            use datafusion_expr::sort_properties::{ExprProperties, SortProperties};
+            use datafusion_expr::TypeSignature;
+            use datafusion_expr::{
+                ColumnarValue, Documentation, ScalarUDFImpl, Signature, Volatility,
+            };
+
+            #[derive(Debug)]
+            pub struct $UDF {
+                signature: Signature,
+            }
+
+            impl $UDF {
+                pub fn new() -> Self {
+                    use DataType::*;
+                    Self {
+                        signature: Signature::one_of(
+                            vec![
+                                TypeSignature::Exact(vec![Float32, Float32]),
+                                TypeSignature::Exact(vec![Float64, Float64]),
+                            ],
+                            Volatility::Immutable,
+                        ),
+                    }
+                }
+            }
+
+            impl ScalarUDFImpl for $UDF {
+                fn as_any(&self) -> &dyn Any {
+                    self
+                }
+                fn name(&self) -> &str {
+                    stringify!($NAME)
+                }
+
+                fn signature(&self) -> &Signature {
+                    &self.signature
+                }
+
+                fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+                    let arg_type = &arg_types[0];
+
+                    match arg_type {
+                        DataType::Float32 => Ok(DataType::Float32),
+                        // For other types (possible values float64/null/int), use Float64
+                        _ => Ok(DataType::Float64),
+                    }
+                }
+
+                fn output_ordering(
+                    &self,
+                    input: &[ExprProperties],
+                ) -> Result<SortProperties> {
+                    $OUTPUT_ORDERING(input)
+                }
+
+                fn invoke_batch(
+                    &self,
+                    args: &[ColumnarValue],
+                    _number_rows: usize,
+                ) -> Result<ColumnarValue> {
+                    let args = ColumnarValue::values_to_arrays(args)?;
+                    let arr: ArrayRef = match args[0].data_type() {
+                        DataType::Float64 => {
+                            let y = args[0].as_primitive::<Float64Type>();
+                            let x = args[1].as_primitive::<Float64Type>();
+                            let result = arrow::compute::binary::<_, _, _, Float64Type>(
+                                y,
+                                x,
+                                |y, x| f64::$BINARY_FUNC(y, x),
+                            )?;
+                            Arc::new(result) as _
+                        }
+                        DataType::Float32 => {
+                            let y = args[0].as_primitive::<Float32Type>();
+                            let x = args[1].as_primitive::<Float32Type>();
+                            let result = arrow::compute::binary::<_, _, _, Float32Type>(
+                                y,
+                                x,
+                                |y, x| f32::$BINARY_FUNC(y, x),
+                            )?;
+                            Arc::new(result) as _
+                        }
+                        other => {
+                            return exec_err!(
+                                "Unsupported data type {other:?} for function {}",
+                                self.name()
+                            )
+                        }
+                    };
+
+                    Ok(ColumnarValue::Array(arr))
+                }
+
+                fn documentation(&self) -> Option<&Documentation> {
+                    Some($GET_DOC())
+                }
             }
         }
     };

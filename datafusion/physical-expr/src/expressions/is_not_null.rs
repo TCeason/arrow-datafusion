@@ -17,12 +17,10 @@
 
 //! IS NOT NULL expression
 
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use std::{any::Any, sync::Arc};
 
-use crate::physical_expr::down_cast_any_ref;
 use crate::PhysicalExpr;
-use arrow::compute;
 use arrow::{
     datatypes::{DataType, Schema},
     record_batch::RecordBatch,
@@ -32,10 +30,23 @@ use datafusion_common::ScalarValue;
 use datafusion_expr::ColumnarValue;
 
 /// IS NOT NULL expression
-#[derive(Debug, Hash)]
+#[derive(Debug, Eq)]
 pub struct IsNotNullExpr {
     /// The input expression
     arg: Arc<dyn PhysicalExpr>,
+}
+
+// Manually derive PartialEq and Hash to work around https://github.com/rust-lang/rust/issues/78808
+impl PartialEq for IsNotNullExpr {
+    fn eq(&self, other: &Self) -> bool {
+        self.arg.eq(&other.arg)
+    }
+}
+
+impl Hash for IsNotNullExpr {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.arg.hash(state);
+    }
 }
 
 impl IsNotNullExpr {
@@ -73,40 +84,28 @@ impl PhysicalExpr for IsNotNullExpr {
     fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
         let arg = self.arg.evaluate(batch)?;
         match arg {
-            ColumnarValue::Array(array) => Ok(ColumnarValue::Array(Arc::new(
-                compute::is_not_null(array.as_ref())?,
-            ))),
+            ColumnarValue::Array(array) => {
+                let is_not_null = arrow::compute::is_not_null(&array)?;
+                Ok(ColumnarValue::Array(Arc::new(is_not_null)))
+            }
             ColumnarValue::Scalar(scalar) => Ok(ColumnarValue::Scalar(
                 ScalarValue::Boolean(Some(!scalar.is_null())),
             )),
         }
     }
 
-    fn children(&self) -> Vec<Arc<dyn PhysicalExpr>> {
-        vec![self.arg.clone()]
+    fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+        vec![&self.arg]
     }
 
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn PhysicalExpr>>,
     ) -> Result<Arc<dyn PhysicalExpr>> {
-        Ok(Arc::new(IsNotNullExpr::new(children[0].clone())))
-    }
-
-    fn dyn_hash(&self, state: &mut dyn Hasher) {
-        let mut s = state;
-        self.hash(&mut s);
+        Ok(Arc::new(IsNotNullExpr::new(Arc::clone(&children[0]))))
     }
 }
 
-impl PartialEq<dyn Any> for IsNotNullExpr {
-    fn eq(&self, other: &dyn Any) -> bool {
-        down_cast_any_ref(other)
-            .downcast_ref::<Self>()
-            .map(|x| self.arg.eq(&x.arg))
-            .unwrap_or(false)
-    }
-}
 /// Create an IS NOT NULL expression
 pub fn is_not_null(arg: Arc<dyn PhysicalExpr>) -> Result<Arc<dyn PhysicalExpr>> {
     Ok(Arc::new(IsNotNullExpr::new(arg)))
@@ -119,10 +118,10 @@ mod tests {
     use arrow::{
         array::{BooleanArray, StringArray},
         datatypes::*,
-        record_batch::RecordBatch,
     };
+    use arrow_array::{Array, Float64Array, Int32Array, UnionArray};
+    use arrow_buffer::ScalarBuffer;
     use datafusion_common::cast::as_boolean_array;
-    use std::sync::Arc;
 
     #[test]
     fn is_not_null_op() -> Result<()> {
@@ -144,5 +143,49 @@ mod tests {
         assert_eq!(expected, result);
 
         Ok(())
+    }
+
+    #[test]
+    fn union_is_not_null_op() {
+        // union of [{A=1}, {A=}, {B=1.1}, {B=1.2}, {B=}]
+        let int_array = Int32Array::from(vec![Some(1), None, None, None, None]);
+        let float_array =
+            Float64Array::from(vec![None, None, Some(1.1), Some(1.2), None]);
+        let type_ids = [0, 0, 1, 1, 1].into_iter().collect::<ScalarBuffer<i8>>();
+
+        let children = vec![Arc::new(int_array) as Arc<dyn Array>, Arc::new(float_array)];
+
+        let union_fields: UnionFields = [
+            (0, Arc::new(Field::new("A", DataType::Int32, true))),
+            (1, Arc::new(Field::new("B", DataType::Float64, true))),
+        ]
+        .into_iter()
+        .collect();
+
+        let array =
+            UnionArray::try_new(union_fields.clone(), type_ids, None, children).unwrap();
+
+        let field = Field::new(
+            "my_union",
+            DataType::Union(union_fields, UnionMode::Sparse),
+            true,
+        );
+
+        let schema = Schema::new(vec![field]);
+        let expr = is_not_null(col("my_union", &schema).unwrap()).unwrap();
+        let batch =
+            RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)]).unwrap();
+
+        // expression: "a is not null"
+        let actual = expr
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .expect("Failed to convert to array");
+        let actual = as_boolean_array(&actual).unwrap();
+
+        let expected = &BooleanArray::from(vec![true, false, true, true, false]);
+
+        assert_eq!(expected, actual);
     }
 }

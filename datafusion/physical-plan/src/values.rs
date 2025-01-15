@@ -20,8 +20,8 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use super::expressions::PhysicalSortExpr;
-use super::{common, DisplayAs, SendableRecordBatchStream, Statistics};
+use super::{common, DisplayAs, PlanProperties, SendableRecordBatchStream, Statistics};
+use crate::execution_plan::{Boundedness, EmissionType};
 use crate::{
     memory::MemoryStream, ColumnarValue, DisplayFormatType, ExecutionPlan, Partitioning,
     PhysicalExpr,
@@ -29,20 +29,25 @@ use crate::{
 
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
-use datafusion_common::{internal_err, plan_err, DataFusionError, Result, ScalarValue};
+use datafusion_common::{internal_err, plan_err, Result, ScalarValue};
 use datafusion_execution::TaskContext;
+use datafusion_physical_expr::EquivalenceProperties;
 
 /// Execution plan for values list based relation (produces constant rows)
-#[derive(Debug)]
+#[deprecated(since = "45.0.0", note = "Use `MemoryExec::try_new_as_values` instead")]
+#[derive(Debug, Clone)]
 pub struct ValuesExec {
     /// The schema
     schema: SchemaRef,
     /// The data
     data: Vec<RecordBatch>,
+    /// Cache holding plan properties like equivalences, output partitioning etc.
+    cache: PlanProperties,
 }
 
+#[allow(deprecated)]
 impl ValuesExec {
-    /// create a new values exec from data as expr
+    /// Create a new values exec from data as expr
     pub fn try_new(
         schema: SchemaRef,
         data: Vec<Vec<Arc<dyn PhysicalExpr>>>,
@@ -52,7 +57,7 @@ impl ValuesExec {
         }
         let n_row = data.len();
         let n_col = schema.fields().len();
-        // we have this single row batch as a placeholder to satisfy evaluation argument
+        // We have this single row batch as a placeholder to satisfy evaluation argument
         // and generate a single output row
         let batch = RecordBatch::try_new_with_options(
             Arc::new(Schema::empty()),
@@ -83,9 +88,13 @@ impl ValuesExec {
                     .and_then(ScalarValue::iter_to_array)
             })
             .collect::<Result<Vec<_>>>()?;
-        let batch = RecordBatch::try_new(schema.clone(), arr)?;
+        let batch = RecordBatch::try_new_with_options(
+            Arc::clone(&schema),
+            arr,
+            &RecordBatchOptions::new().with_row_count(Some(n_row)),
+        )?;
         let data: Vec<RecordBatch> = vec![batch];
-        Ok(Self { schema, data })
+        Self::try_new_from_batches(schema, data)
     }
 
     /// Create a new plan using the provided schema and batches.
@@ -109,18 +118,33 @@ impl ValuesExec {
             }
         }
 
+        let cache = Self::compute_properties(Arc::clone(&schema));
+        #[allow(deprecated)]
         Ok(ValuesExec {
             schema,
             data: batches,
+            cache,
         })
     }
 
-    /// provides the data
+    /// Provides the data
     pub fn data(&self) -> Vec<RecordBatch> {
+        #[allow(deprecated)]
         self.data.clone()
+    }
+
+    /// This function creates the cache object that stores the plan properties such as schema, equivalence properties, ordering, partitioning, etc.
+    fn compute_properties(schema: SchemaRef) -> PlanProperties {
+        PlanProperties::new(
+            EquivalenceProperties::new(schema),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        )
     }
 }
 
+#[allow(deprecated)]
 impl DisplayAs for ValuesExec {
     fn fmt_as(
         &self,
@@ -135,36 +159,33 @@ impl DisplayAs for ValuesExec {
     }
 }
 
+#[allow(deprecated)]
 impl ExecutionPlan for ValuesExec {
+    fn name(&self) -> &'static str {
+        "ValuesExec"
+    }
+
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
         self
     }
 
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+    fn properties(&self) -> &PlanProperties {
+        #[allow(deprecated)]
+        &self.cache
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
-    }
-    /// Get the output partitioning of this plan
-    fn output_partitioning(&self) -> Partitioning {
-        Partitioning::UnknownPartitioning(1)
-    }
-
-    fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        None
     }
 
     fn with_new_children(
         self: Arc<Self>,
         _: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(ValuesExec {
-            schema: self.schema.clone(),
-            data: self.data.clone(),
-        }))
+        #[allow(deprecated)]
+        ValuesExec::try_new_from_batches(Arc::clone(&self.schema), self.data.clone())
+            .map(|e| Arc::new(e) as _)
     }
 
     fn execute(
@@ -181,7 +202,8 @@ impl ExecutionPlan for ValuesExec {
 
         Ok(Box::pin(MemoryStream::try_new(
             self.data(),
-            self.schema.clone(),
+            #[allow(deprecated)]
+            Arc::clone(&self.schema),
             None,
         )?))
     }
@@ -190,6 +212,7 @@ impl ExecutionPlan for ValuesExec {
         let batch = self.data();
         Ok(common::compute_record_batch_statistics(
             &[batch],
+            #[allow(deprecated)]
             &self.schema,
             None,
         ))
@@ -202,11 +225,13 @@ mod tests {
     use crate::expressions::lit;
     use crate::test::{self, make_partition};
 
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_schema::{DataType, Field};
+    use datafusion_common::stats::{ColumnStatistics, Precision};
 
     #[tokio::test]
     async fn values_empty_case() -> Result<()> {
         let schema = test::aggr_test_schema();
+        #[allow(deprecated)]
         let empty = ValuesExec::try_new(schema, vec![]);
         assert!(empty.is_err());
         Ok(())
@@ -217,7 +242,7 @@ mod tests {
         let batch = make_partition(7);
         let schema = batch.schema();
         let batches = vec![batch.clone(), batch];
-
+        #[allow(deprecated)]
         let _exec = ValuesExec::try_new_from_batches(schema, batches).unwrap();
     }
 
@@ -225,6 +250,7 @@ mod tests {
     fn new_exec_with_batches_empty() {
         let batch = make_partition(7);
         let schema = batch.schema();
+        #[allow(deprecated)]
         let _ = ValuesExec::try_new_from_batches(schema, Vec::new()).unwrap_err();
     }
 
@@ -237,10 +263,11 @@ mod tests {
             Field::new("col0", DataType::UInt32, false),
             Field::new("col1", DataType::Utf8, false),
         ]));
+        #[allow(deprecated)]
         let _ = ValuesExec::try_new_from_batches(invalid_schema, batches).unwrap_err();
     }
 
-    // Test issue: https://github.com/apache/arrow-datafusion/issues/8763
+    // Test issue: https://github.com/apache/datafusion/issues/8763
     #[test]
     fn new_exec_with_non_nullable_schema() {
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -248,9 +275,42 @@ mod tests {
             DataType::UInt32,
             false,
         )]));
-        let _ = ValuesExec::try_new(schema.clone(), vec![vec![lit(1u32)]]).unwrap();
+        #[allow(deprecated)]
+        let _ = ValuesExec::try_new(Arc::clone(&schema), vec![vec![lit(1u32)]]).unwrap();
         // Test that a null value is rejected
+        #[allow(deprecated)]
         let _ = ValuesExec::try_new(schema, vec![vec![lit(ScalarValue::UInt32(None))]])
             .unwrap_err();
+    }
+
+    #[test]
+    fn values_stats_with_nulls_only() -> Result<()> {
+        let data = vec![
+            vec![lit(ScalarValue::Null)],
+            vec![lit(ScalarValue::Null)],
+            vec![lit(ScalarValue::Null)],
+        ];
+        let rows = data.len();
+        #[allow(deprecated)]
+        let values = ValuesExec::try_new(
+            Arc::new(Schema::new(vec![Field::new("col0", DataType::Null, true)])),
+            data,
+        )?;
+
+        assert_eq!(
+            values.statistics()?,
+            Statistics {
+                num_rows: Precision::Exact(rows),
+                total_byte_size: Precision::Exact(8), // not important
+                column_statistics: vec![ColumnStatistics {
+                    null_count: Precision::Exact(rows), // there are only nulls
+                    distinct_count: Precision::Absent,
+                    max_value: Precision::Absent,
+                    min_value: Precision::Absent,
+                },],
+            }
+        );
+
+        Ok(())
     }
 }

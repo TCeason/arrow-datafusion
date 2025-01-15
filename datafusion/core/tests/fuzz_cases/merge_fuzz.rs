@@ -16,6 +16,7 @@
 // under the License.
 
 //! Fuzz Test for various corner cases merging streams of RecordBatches
+
 use std::sync::Arc;
 
 use arrow::{
@@ -30,6 +31,7 @@ use datafusion::physical_plan::{
     sorts::sort_preserving_merge::SortPreservingMergeExec,
 };
 use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion_physical_expr_common::sort_expr::LexOrdering;
 use test_utils::{batches_to_vec, partitions_to_sorted_vec, stagger_batch_with_seed};
 
 #[tokio::test]
@@ -89,7 +91,7 @@ async fn test_merge_3_gaps() {
 /// Merge a set of input streams using SortPreservingMergeExec and
 /// `Vec::sort` and ensure the results are the same.
 ///
-/// For each case, the `input` streams are turned into a set of of
+/// For each case, the `input` streams are turned into a set of
 /// streams which are then merged together by [SortPreservingMerge]
 ///
 /// Each `Vec<RecordBatch>` in `input` must be sorted and have a
@@ -106,13 +108,13 @@ async fn run_merge_test(input: Vec<Vec<RecordBatch>>) {
             .expect("at least one batch");
         let schema = first_batch.schema();
 
-        let sort = vec![PhysicalSortExpr {
+        let sort = LexOrdering::new(vec![PhysicalSortExpr {
             expr: col("x", &schema).unwrap(),
             options: SortOptions {
                 descending: false,
                 nulls_first: true,
             },
-        }];
+        }]);
 
         let exec = MemoryExec::try_new(&input, schema, None).unwrap();
         let merge = Arc::new(SortPreservingMergeExec::new(sort, Arc::new(exec)));

@@ -20,21 +20,24 @@
 use std::{any::Any, sync::Arc};
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::execution::context::TaskContext;
 use datafusion::{
     datasource::{TableProvider, TableType},
     error::Result,
     logical_expr::Expr,
     physical_plan::{
-        expressions::PhysicalSortExpr, ColumnStatistics, DisplayAs, DisplayFormatType,
-        ExecutionPlan, Partitioning, SendableRecordBatchStream, Statistics,
+        ColumnStatistics, DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning,
+        PlanProperties, SendableRecordBatchStream, Statistics,
     },
     prelude::SessionContext,
     scalar::ScalarValue,
 };
+use datafusion_catalog::Session;
+use datafusion_common::{project_schema, stats::Precision};
+use datafusion_physical_expr::EquivalenceProperties;
+use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
 
 use async_trait::async_trait;
-use datafusion::execution::context::{SessionState, TaskContext};
-use datafusion_common::{project_schema, stats::Precision};
 
 /// This is a testing structure for statistics
 /// It will act both as a table provider and execution plan
@@ -42,6 +45,7 @@ use datafusion_common::{project_schema, stats::Precision};
 struct StatisticsValidation {
     stats: Statistics,
     schema: Arc<Schema>,
+    cache: PlanProperties,
 }
 
 impl StatisticsValidation {
@@ -51,7 +55,22 @@ impl StatisticsValidation {
             schema.fields().len(),
             "the column statistics vector length should be the number of fields"
         );
-        Self { stats, schema }
+        let cache = Self::compute_properties(schema.clone());
+        Self {
+            stats,
+            schema,
+            cache,
+        }
+    }
+
+    /// This function creates the cache object that stores the plan properties such as schema, equivalence properties, ordering, partitioning, etc.
+    fn compute_properties(schema: SchemaRef) -> PlanProperties {
+        PlanProperties::new(
+            EquivalenceProperties::new(schema),
+            Partitioning::UnknownPartitioning(2),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        )
     }
 }
 
@@ -71,7 +90,7 @@ impl TableProvider for StatisticsValidation {
 
     async fn scan(
         &self,
-        _state: &SessionState,
+        _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         // limit is ignored because it is not mandatory for a `TableProvider` to honor it
@@ -127,23 +146,19 @@ impl DisplayAs for StatisticsValidation {
 }
 
 impl ExecutionPlan for StatisticsValidation {
+    fn name(&self) -> &'static str {
+        Self::static_name()
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
 
-    fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
+    fn properties(&self) -> &PlanProperties {
+        &self.cache
     }
 
-    fn output_partitioning(&self) -> Partitioning {
-        Partitioning::UnknownPartitioning(2)
-    }
-
-    fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        None
-    }
-
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
 

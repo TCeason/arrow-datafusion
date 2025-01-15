@@ -31,35 +31,28 @@
 
 use std::any::Any;
 use std::fmt::{self, Debug, Formatter};
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use std::sync::Arc;
 
-use crate::functions::out_ordering;
-use crate::physical_expr::{down_cast_any_ref, physical_exprs_equal};
-use crate::sort_properties::SortProperties;
 use crate::PhysicalExpr;
 
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
-use datafusion_common::Result;
-use datafusion_expr::{
-    expr_vec_fmt, BuiltinScalarFunction, ColumnarValue, FuncMonotonicity,
-    ScalarFunctionImplementation,
-};
+use arrow_array::Array;
+use datafusion_common::{internal_err, DFSchema, Result, ScalarValue};
+use datafusion_expr::interval_arithmetic::Interval;
+use datafusion_expr::sort_properties::ExprProperties;
+use datafusion_expr::type_coercion::functions::data_types_with_scalar_udf;
+use datafusion_expr::{expr_vec_fmt, ColumnarValue, Expr, ScalarFunctionArgs, ScalarUDF};
 
 /// Physical expression of a scalar function
+#[derive(Eq, PartialEq, Hash)]
 pub struct ScalarFunctionExpr {
-    fun: ScalarFunctionImplementation,
+    fun: Arc<ScalarUDF>,
     name: String,
     args: Vec<Arc<dyn PhysicalExpr>>,
     return_type: DataType,
-    // Keeps monotonicity information of the function.
-    // FuncMonotonicity vector is one to one mapped to `args`,
-    // and it specifies the effect of an increase or decrease in
-    // the corresponding `arg` to the function value.
-    monotonicity: Option<FuncMonotonicity>,
-    // Whether this function can be invoked with zero arguments
-    supports_zero_argument: bool,
+    nullable: bool,
 }
 
 impl Debug for ScalarFunctionExpr {
@@ -77,24 +70,21 @@ impl ScalarFunctionExpr {
     /// Create a new Scalar function
     pub fn new(
         name: &str,
-        fun: ScalarFunctionImplementation,
+        fun: Arc<ScalarUDF>,
         args: Vec<Arc<dyn PhysicalExpr>>,
         return_type: DataType,
-        monotonicity: Option<FuncMonotonicity>,
-        supports_zero_argument: bool,
     ) -> Self {
         Self {
             fun,
             name: name.to_owned(),
             args,
             return_type,
-            monotonicity,
-            supports_zero_argument,
+            nullable: true,
         }
     }
 
     /// Get the scalar function implementation
-    pub fn fun(&self) -> &ScalarFunctionImplementation {
+    pub fn fun(&self) -> &ScalarUDF {
         &self.fun
     }
 
@@ -113,14 +103,18 @@ impl ScalarFunctionExpr {
         &self.return_type
     }
 
-    /// Monotonicity information of the function
-    pub fn monotonicity(&self) -> &Option<FuncMonotonicity> {
-        &self.monotonicity
+    pub fn with_nullable(mut self, nullable: bool) -> Self {
+        self.nullable = nullable;
+        self
+    }
+
+    pub fn nullable(&self) -> bool {
+        self.nullable
     }
 }
 
 impl fmt::Display for ScalarFunctionExpr {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(f, "{}({})", self.name, expr_vec_fmt!(self.args))
     }
 }
@@ -136,87 +130,120 @@ impl PhysicalExpr for ScalarFunctionExpr {
     }
 
     fn nullable(&self, _input_schema: &Schema) -> Result<bool> {
-        Ok(true)
+        Ok(self.nullable)
     }
 
     fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
-        // evaluate the arguments, if there are no arguments we'll instead pass in a null array
-        // indicating the batch size (as a convention)
-        let inputs = match (
-            self.args.is_empty(),
-            self.name.parse::<BuiltinScalarFunction>(),
-        ) {
-            // MakeArray support zero argument but has the different behavior from the array with one null.
-            (true, Ok(scalar_fun))
-                if scalar_fun
-                    .signature()
-                    .type_signature
-                    .supports_zero_argument()
-                    && scalar_fun != BuiltinScalarFunction::MakeArray =>
-            {
-                vec![ColumnarValue::create_null_array(batch.num_rows())]
-            }
-            // If the function supports zero argument, we pass in a null array indicating the batch size.
-            // This is for user-defined functions.
-            (true, Err(_)) if self.supports_zero_argument => {
-                vec![ColumnarValue::create_null_array(batch.num_rows())]
-            }
-            _ => self
-                .args
-                .iter()
-                .map(|e| e.evaluate(batch))
-                .collect::<Result<Vec<_>>>()?,
-        };
+        let args = self
+            .args
+            .iter()
+            .map(|e| e.evaluate(batch))
+            .collect::<Result<Vec<_>>>()?;
+
+        let input_empty = args.is_empty();
+        let input_all_scalar = args
+            .iter()
+            .all(|arg| matches!(arg, ColumnarValue::Scalar(_)));
 
         // evaluate the function
-        let fun = self.fun.as_ref();
-        (fun)(&inputs)
+        let output = self.fun.invoke_with_args(ScalarFunctionArgs {
+            args,
+            number_rows: batch.num_rows(),
+            return_type: &self.return_type,
+        })?;
+
+        if let ColumnarValue::Array(array) = &output {
+            if array.len() != batch.num_rows() {
+                // If the arguments are a non-empty slice of scalar values, we can assume that
+                // returning a one-element array is equivalent to returning a scalar.
+                let preserve_scalar =
+                    array.len() == 1 && !input_empty && input_all_scalar;
+                return if preserve_scalar {
+                    ScalarValue::try_from_array(array, 0).map(ColumnarValue::Scalar)
+                } else {
+                    internal_err!("UDF {} returned a different number of rows than expected. Expected: {}, Got: {}",
+                            self.name, batch.num_rows(), array.len())
+                };
+            }
+        }
+        Ok(output)
     }
 
-    fn children(&self) -> Vec<Arc<dyn PhysicalExpr>> {
-        self.args.clone()
+    fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+        self.args.iter().collect()
     }
 
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn PhysicalExpr>>,
     ) -> Result<Arc<dyn PhysicalExpr>> {
-        Ok(Arc::new(ScalarFunctionExpr::new(
-            &self.name,
-            self.fun.clone(),
-            children,
-            self.return_type().clone(),
-            self.monotonicity.clone(),
-            self.supports_zero_argument,
-        )))
+        Ok(Arc::new(
+            ScalarFunctionExpr::new(
+                &self.name,
+                Arc::clone(&self.fun),
+                children,
+                self.return_type().clone(),
+            )
+            .with_nullable(self.nullable),
+        ))
     }
 
-    fn dyn_hash(&self, state: &mut dyn Hasher) {
-        let mut s = state;
-        self.name.hash(&mut s);
-        self.args.hash(&mut s);
-        self.return_type.hash(&mut s);
-        // Add `self.fun` when hash is available
+    fn evaluate_bounds(&self, children: &[&Interval]) -> Result<Interval> {
+        self.fun.evaluate_bounds(children)
     }
 
-    fn get_ordering(&self, children: &[SortProperties]) -> SortProperties {
-        self.monotonicity
-            .as_ref()
-            .map(|monotonicity| out_ordering(monotonicity, children))
-            .unwrap_or(SortProperties::Unordered)
+    fn propagate_constraints(
+        &self,
+        interval: &Interval,
+        children: &[&Interval],
+    ) -> Result<Option<Vec<Interval>>> {
+        self.fun.propagate_constraints(interval, children)
+    }
+
+    fn get_properties(&self, children: &[ExprProperties]) -> Result<ExprProperties> {
+        let sort_properties = self.fun.output_ordering(children)?;
+        let preserves_lex_ordering = self.fun.preserves_lex_ordering(children)?;
+        let children_range = children
+            .iter()
+            .map(|props| &props.range)
+            .collect::<Vec<_>>();
+        let range = self.fun().evaluate_bounds(&children_range)?;
+
+        Ok(ExprProperties {
+            sort_properties,
+            range,
+            preserves_lex_ordering,
+        })
     }
 }
 
-impl PartialEq<dyn Any> for ScalarFunctionExpr {
-    /// Comparing name, args and return_type
-    fn eq(&self, other: &dyn Any) -> bool {
-        down_cast_any_ref(other)
-            .downcast_ref::<Self>()
-            .map(|x| {
-                self.name == x.name
-                    && physical_exprs_equal(&self.args, &x.args)
-                    && self.return_type == x.return_type
-            })
-            .unwrap_or(false)
-    }
+/// Create a physical expression for the UDF.
+pub fn create_physical_expr(
+    fun: &ScalarUDF,
+    input_phy_exprs: &[Arc<dyn PhysicalExpr>],
+    input_schema: &Schema,
+    args: &[Expr],
+    input_dfschema: &DFSchema,
+) -> Result<Arc<dyn PhysicalExpr>> {
+    let input_expr_types = input_phy_exprs
+        .iter()
+        .map(|e| e.data_type(input_schema))
+        .collect::<Result<Vec<_>>>()?;
+
+    // verify that input data types is consistent with function's `TypeSignature`
+    data_types_with_scalar_udf(&input_expr_types, fun)?;
+
+    // Since we have arg_types, we don't need args and schema.
+    let return_type =
+        fun.return_type_from_exprs(args, input_dfschema, &input_expr_types)?;
+
+    Ok(Arc::new(
+        ScalarFunctionExpr::new(
+            fun.name(),
+            Arc::new(fun.clone()),
+            input_phy_exprs.to_vec(),
+            return_type,
+        )
+        .with_nullable(fun.is_nullable(args, input_dfschema)),
+    ))
 }

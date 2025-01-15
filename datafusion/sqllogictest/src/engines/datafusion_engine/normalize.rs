@@ -15,20 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::engines::output::DFColumnType;
+use arrow::array::{Array, AsArray};
+use arrow::datatypes::Fields;
 use arrow::util::display::ArrayFormatter;
 use arrow::{array, array::ArrayRef, datatypes::DataType, record_batch::RecordBatch};
-use datafusion_common::format::DEFAULT_FORMAT_OPTIONS;
-use datafusion_common::DFField;
+use datafusion_common::format::DEFAULT_CLI_FORMAT_OPTIONS;
 use datafusion_common::DataFusionError;
 use std::path::PathBuf;
-use std::sync::OnceLock;
-
-use crate::engines::output::DFColumnType;
+use std::sync::LazyLock;
 
 use super::super::conversion::*;
 use super::error::{DFSqlLogicTestError, Result};
 
-/// Converts `batches` to a result as expected by sqllogicteset.
+/// Converts `batches` to a result as expected by sqllogictest.
 pub(crate) fn convert_batches(batches: Vec<RecordBatch>) -> Result<Vec<Vec<String>>> {
     if batches.is_empty() {
         Ok(vec![])
@@ -96,14 +96,18 @@ fn expand_row(mut row: Vec<String>) -> impl Iterator<Item = Vec<String>> {
         // form new rows with each additional line
         let new_lines: Vec<_> = lines
             .into_iter()
-            .map(|l| {
+            .enumerate()
+            .map(|(idx, l)| {
                 // replace any leading spaces with '-' as
                 // `sqllogictest` ignores whitespace differences
                 //
-                // See https://github.com/apache/arrow-datafusion/issues/6328
+                // See https://github.com/apache/datafusion/issues/6328
                 let content = l.trim_start();
                 let new_prefix = "-".repeat(l.len() - content.len());
-                vec![format!("{new_prefix}{content}")]
+                // maintain for each line a number, so
+                // reviewing explain result changes is easier
+                let line_num = idx + 1;
+                vec![format!("{line_num:02}){new_prefix}{content}")]
             })
             .collect();
 
@@ -126,7 +130,7 @@ fn expand_row(mut row: Vec<String>) -> impl Iterator<Item = Vec<String>> {
 /// ```
 fn normalize_paths(mut row: Vec<String>) -> Vec<String> {
     row.iter_mut().for_each(|s| {
-        let workspace_root: &str = workspace_root().as_ref();
+        let workspace_root: &str = WORKSPACE_ROOT.as_ref();
         if s.contains(workspace_root) {
             *s = s.replace(workspace_root, "WORKSPACE_ROOT");
         }
@@ -134,34 +138,30 @@ fn normalize_paths(mut row: Vec<String>) -> Vec<String> {
     row
 }
 
-/// return the location of the datafusion checkout
-fn workspace_root() -> &'static object_store::path::Path {
-    static WORKSPACE_ROOT_LOCK: OnceLock<object_store::path::Path> = OnceLock::new();
-    WORKSPACE_ROOT_LOCK.get_or_init(|| {
-        // e.g. /Software/arrow-datafusion/datafusion/core
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+/// The location of the datafusion checkout
+static WORKSPACE_ROOT: LazyLock<object_store::path::Path> = LazyLock::new(|| {
+    // e.g. /Software/datafusion/datafusion/core
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
-        // e.g. /Software/arrow-datafusion/datafusion
-        let workspace_root = dir
-            .parent()
-            .expect("Can not find parent of datafusion/core")
-            // e.g. /Software/arrow-datafusion
-            .parent()
-            .expect("parent of datafusion")
-            .to_string_lossy();
+    // e.g. /Software/datafusion/datafusion
+    let workspace_root = dir
+        .parent()
+        .expect("Can not find parent of datafusion/core")
+        // e.g. /Software/datafusion
+        .parent()
+        .expect("parent of datafusion")
+        .to_string_lossy();
 
-        let sanitized_workplace_root = if cfg!(windows) {
-            // Object store paths are delimited with `/`, e.g. `D:/a/arrow-datafusion/arrow-datafusion/testing/data/csv/aggregate_test_100.csv`.
-            // The default windows delimiter is `\`, so the workplace path is `D:\a\arrow-datafusion\arrow-datafusion`.
-            workspace_root
-                .replace(std::path::MAIN_SEPARATOR, object_store::path::DELIMITER)
-        } else {
-            workspace_root.to_string()
-        };
+    let sanitized_workplace_root = if cfg!(windows) {
+        // Object store paths are delimited with `/`, e.g. `/datafusion/datafusion/testing/data/csv/aggregate_test_100.csv`.
+        // The default windows delimiter is `\`, so the workplace path is `datafusion\datafusion`.
+        workspace_root.replace(std::path::MAIN_SEPARATOR, object_store::path::DELIMITER)
+    } else {
+        workspace_root.to_string()
+    };
 
-        object_store::path::Path::parse(sanitized_workplace_root).unwrap()
-    })
-}
+    object_store::path::Path::parse(sanitized_workplace_root).unwrap()
+});
 
 /// Convert a single batch to a `Vec<Vec<String>>` for comparison
 fn convert_batch(batch: RecordBatch) -> Result<Vec<Vec<String>>> {
@@ -213,13 +213,13 @@ pub fn cell_to_string(col: &ArrayRef, row: usize) -> Result<String> {
             DataType::Float64 => {
                 Ok(f64_to_str(get_row_value!(array::Float64Array, col, row)))
             }
-            DataType::Decimal128(precision, scale) => {
+            DataType::Decimal128(_, scale) => {
                 let value = get_row_value!(array::Decimal128Array, col, row);
-                Ok(i128_to_str(value, precision, scale))
+                Ok(decimal_128_to_str(value, *scale))
             }
-            DataType::Decimal256(precision, scale) => {
+            DataType::Decimal256(_, scale) => {
                 let value = get_row_value!(array::Decimal256Array, col, row);
-                Ok(i256_to_str(value, precision, scale))
+                Ok(decimal_256_to_str(value, *scale))
             }
             DataType::LargeUtf8 => Ok(varchar_to_str(get_row_value!(
                 array::LargeStringArray,
@@ -229,8 +229,19 @@ pub fn cell_to_string(col: &ArrayRef, row: usize) -> Result<String> {
             DataType::Utf8 => {
                 Ok(varchar_to_str(get_row_value!(array::StringArray, col, row)))
             }
+            DataType::Utf8View => Ok(varchar_to_str(get_row_value!(
+                array::StringViewArray,
+                col,
+                row
+            ))),
+            DataType::Dictionary(_, _) => {
+                let dict = col.as_any_dictionary();
+                let key = dict.normalized_keys()[row];
+                Ok(cell_to_string(dict.values(), key)?)
+            }
             _ => {
-                let f = ArrayFormatter::try_new(col.as_ref(), &DEFAULT_FORMAT_OPTIONS);
+                let f =
+                    ArrayFormatter::try_new(col.as_ref(), &DEFAULT_CLI_FORMAT_OPTIONS);
                 Ok(f.unwrap().value(row).to_string())
             }
         }
@@ -239,7 +250,7 @@ pub fn cell_to_string(col: &ArrayRef, row: usize) -> Result<String> {
 }
 
 /// Converts columns to a result as expected by sqllogicteset.
-pub(crate) fn convert_schema_to_types(columns: &[DFField]) -> Vec<DFColumnType> {
+pub(crate) fn convert_schema_to_types(columns: &Fields) -> Vec<DFColumnType> {
     columns
         .iter()
         .map(|f| f.data_type())
@@ -258,12 +269,25 @@ pub(crate) fn convert_schema_to_types(columns: &[DFField]) -> Vec<DFColumnType> 
             | DataType::Float64
             | DataType::Decimal128(_, _)
             | DataType::Decimal256(_, _) => DFColumnType::Float,
-            DataType::Utf8 | DataType::LargeUtf8 => DFColumnType::Text,
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
+                DFColumnType::Text
+            }
             DataType::Date32
             | DataType::Date64
             | DataType::Time32(_)
             | DataType::Time64(_) => DFColumnType::DateTime,
             DataType::Timestamp(_, _) => DFColumnType::Timestamp,
+            DataType::Dictionary(key_type, value_type) => {
+                if key_type.is_integer() {
+                    // mapping dictionary string types to Text
+                    match value_type.as_ref() {
+                        DataType::Utf8 | DataType::LargeUtf8 => DFColumnType::Text,
+                        _ => DFColumnType::Another,
+                    }
+                } else {
+                    DFColumnType::Another
+                }
+            }
             _ => DFColumnType::Another,
         })
         .collect()

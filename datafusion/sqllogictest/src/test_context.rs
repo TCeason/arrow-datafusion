@@ -27,12 +27,12 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::{create_udf, ColumnarValue, Expr, ScalarUDF, Volatility};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionConfig;
 use datafusion::{
-    catalog::{schema::MemorySchemaProvider, CatalogProvider, MemoryCatalogProvider},
+    catalog::CatalogProvider,
+    catalog_common::{memory::MemoryCatalogProvider, memory::MemorySchemaProvider},
     datasource::{MemTable, TableProvider, TableType},
     prelude::{CsvReadOptions, SessionContext},
 };
@@ -40,6 +40,7 @@ use datafusion_common::cast::as_float64_array;
 use datafusion_common::DataFusionError;
 
 use async_trait::async_trait;
+use datafusion::catalog::Session;
 use log::info;
 use tempfile::TempDir;
 
@@ -97,11 +98,16 @@ impl TestContext {
                     return None;
                 }
             }
+            "dynamic_file.slt" => {
+                test_ctx.ctx = test_ctx.ctx.enable_url_table();
+            }
             "joins.slt" => {
                 info!("Registering partition table tables");
                 let example_udf = create_example_udf();
                 test_ctx.ctx.register_udf(example_udf);
                 register_partition_table(&mut test_ctx).await;
+                info!("Registering table with many types");
+                register_table_with_many_types(test_ctx.session_ctx()).await;
             }
             "metadata.slt" => {
                 info!("Registering metadata table tables");
@@ -135,7 +141,7 @@ impl TestContext {
 }
 
 #[cfg(feature = "avro")]
-pub async fn register_avro_tables(ctx: &mut crate::TestContext) {
+pub async fn register_avro_tables(ctx: &mut TestContext) {
     use datafusion::prelude::AvroReadOptions;
 
     ctx.enable_testdir();
@@ -203,6 +209,7 @@ pub async fn register_partition_table(test_ctx: &mut TestContext) {
 
 // registers a LOCAL TEMPORARY table.
 pub async fn register_temp_table(ctx: &SessionContext) {
+    #[derive(Debug)]
     struct TestTable(TableType);
 
     #[async_trait]
@@ -221,7 +228,7 @@ pub async fn register_temp_table(ctx: &SessionContext) {
 
         async fn scan(
             &self,
-            _state: &SessionState,
+            _state: &dyn Session,
             _: Option<&Vec<usize>>,
             _: &[Expr],
             _: Option<usize>,
@@ -246,8 +253,11 @@ pub async fn register_table_with_many_types(ctx: &SessionContext) {
         .unwrap();
     ctx.register_catalog("my_catalog", Arc::new(catalog));
 
-    ctx.register_table("my_catalog.my_schema.t2", table_with_many_types())
-        .unwrap();
+    ctx.register_table(
+        "my_catalog.my_schema.table_with_many_types",
+        table_with_many_types(),
+    )
+    .unwrap();
 }
 
 pub async fn register_table_with_map(ctx: &SessionContext) {
@@ -309,17 +319,49 @@ pub async fn register_metadata_tables(ctx: &SessionContext) {
         String::from("metadata_key"),
         String::from("the name field"),
     )]));
+    let l_name =
+        Field::new("l_name", DataType::Utf8, true).with_metadata(HashMap::from([(
+            String::from("metadata_key"),
+            String::from("the l_name field"),
+        )]));
 
-    let schema = Schema::new(vec![id, name]).with_metadata(HashMap::from([(
-        String::from("metadata_key"),
-        String::from("the entire schema"),
-    )]));
+    let ts = Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false)
+        .with_metadata(HashMap::from([(
+            String::from("metadata_key"),
+            String::from("ts non-nullable field"),
+        )]));
+
+    let nonnull_name =
+        Field::new("nonnull_name", DataType::Utf8, false).with_metadata(HashMap::from([
+            (
+                String::from("metadata_key"),
+                String::from("the nonnull_name field"),
+            ),
+        ]));
+
+    let schema = Schema::new(vec![id, name, l_name, ts, nonnull_name]).with_metadata(
+        HashMap::from([(
+            String::from("metadata_key"),
+            String::from("the entire schema"),
+        )]),
+    );
 
     let batch = RecordBatch::try_new(
         Arc::new(schema),
         vec![
             Arc::new(Int32Array::from(vec![Some(1), None, Some(3)])) as _,
             Arc::new(StringArray::from(vec![None, Some("bar"), Some("baz")])) as _,
+            Arc::new(StringArray::from(vec![None, Some("l_bar"), Some("l_baz")])) as _,
+            Arc::new(TimestampNanosecondArray::from(vec![
+                1599572549190855123,
+                1599572549190855123,
+                1599572549190855123,
+            ])) as _,
+            Arc::new(StringArray::from(vec![
+                Some("no_foo"),
+                Some("no_bar"),
+                Some("no_baz"),
+            ])) as _,
         ],
     )
     .unwrap();
@@ -355,7 +397,7 @@ fn create_example_udf() -> ScalarUDF {
         // Expects two f64 values:
         vec![DataType::Float64, DataType::Float64],
         // Returns an f64 value:
-        Arc::new(DataType::Float64),
+        DataType::Float64,
         Volatility::Immutable,
         adder,
     )

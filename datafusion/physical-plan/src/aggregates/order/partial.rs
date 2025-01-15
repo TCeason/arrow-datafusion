@@ -21,7 +21,9 @@ use arrow_schema::Schema;
 use datafusion_common::Result;
 use datafusion_execution::memory_pool::proxy::VecAllocExt;
 use datafusion_expr::EmitTo;
-use datafusion_physical_expr::PhysicalSortExpr;
+use datafusion_physical_expr_common::sort_expr::LexOrdering;
+use std::mem::size_of;
+use std::sync::Arc;
 
 /// Tracks grouping state when the data is ordered by some subset of
 /// the group keys.
@@ -31,7 +33,7 @@ use datafusion_physical_expr::PhysicalSortExpr;
 /// key and earlier.
 ///
 /// For example, given `SUM(amt) GROUP BY id, state` if the input is
-/// sorted by `state, when a new value of `state` is seen, all groups
+/// sorted by `state`, when a new value of `state` is seen, all groups
 /// with prior values of `state` can be emitted.
 ///
 /// The state is tracked like this:
@@ -59,7 +61,7 @@ use datafusion_physical_expr::PhysicalSortExpr;
 ///      order)                                    recent group index
 ///```
 #[derive(Debug)]
-pub(crate) struct GroupOrderingPartial {
+pub struct GroupOrderingPartial {
     /// State machine
     state: State,
 
@@ -105,7 +107,7 @@ impl GroupOrderingPartial {
     pub fn try_new(
         input_schema: &Schema,
         order_indices: &[usize],
-        ordering: &[PhysicalSortExpr],
+        ordering: &LexOrdering,
     ) -> Result<Self> {
         assert!(!order_indices.is_empty());
         assert!(order_indices.len() <= ordering.len());
@@ -138,7 +140,7 @@ impl GroupOrderingPartial {
         let sort_values: Vec<_> = self
             .order_indices
             .iter()
-            .map(|&idx| group_values[idx].clone())
+            .map(|&idx| Arc::clone(&group_values[idx]))
             .collect();
 
         Ok(self.row_converter.convert_columns(&sort_values)?)
@@ -243,7 +245,7 @@ impl GroupOrderingPartial {
 
     /// Return the size of memory allocated by this structure
     pub(crate) fn size(&self) -> usize {
-        std::mem::size_of::<Self>()
+        size_of::<Self>()
             + self.order_indices.allocated_size()
             + self.row_converter.size()
     }

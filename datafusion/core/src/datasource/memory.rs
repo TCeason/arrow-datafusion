@@ -17,33 +17,38 @@
 
 //! [`MemTable`] for querying `Vec<RecordBatch>` by DataFusion.
 
-use datafusion_physical_plan::metrics::MetricsSet;
-use futures::StreamExt;
-use log::debug;
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::{self, Debug};
 use std::sync::Arc;
 
-use arrow::datatypes::SchemaRef;
-use arrow::record_batch::RecordBatch;
-use async_trait::async_trait;
-use datafusion_common::{
-    not_impl_err, plan_err, Constraints, DataFusionError, SchemaExt,
-};
-use datafusion_execution::TaskContext;
-use tokio::sync::RwLock;
-use tokio::task::JoinSet;
-
 use crate::datasource::{TableProvider, TableType};
 use crate::error::Result;
 use crate::execution::context::SessionState;
 use crate::logical_expr::Expr;
-use crate::physical_plan::insert::{DataSink, FileSinkExec};
+use crate::physical_plan::insert::{DataSink, DataSinkExec};
 use crate::physical_plan::memory::MemoryExec;
-use crate::physical_plan::{common, SendableRecordBatchStream};
-use crate::physical_plan::{repartition::RepartitionExec, Partitioning};
-use crate::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
+use crate::physical_plan::repartition::RepartitionExec;
+use crate::physical_plan::{
+    common, DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties,
+    Partitioning, SendableRecordBatchStream,
+};
+use crate::physical_planner::create_physical_sort_exprs;
+
+use arrow::datatypes::SchemaRef;
+use arrow::record_batch::RecordBatch;
+use datafusion_catalog::Session;
+use datafusion_common::{not_impl_err, plan_err, Constraints, DFSchema, SchemaExt};
+use datafusion_execution::TaskContext;
+use datafusion_expr::dml::InsertOp;
+use datafusion_expr::SortExpr;
+
+use async_trait::async_trait;
+use futures::StreamExt;
+use log::debug;
+use parking_lot::Mutex;
+use tokio::sync::RwLock;
+use tokio::task::JoinSet;
 
 /// Type alias for partition data
 pub type PartitionData = Arc<RwLock<Vec<RecordBatch>>>;
@@ -58,6 +63,9 @@ pub struct MemTable {
     pub(crate) batches: Vec<PartitionData>,
     constraints: Constraints,
     column_defaults: HashMap<String, Expr>,
+    /// Optional pre-known sort order(s). Must be `SortExpr`s.
+    /// inserting data into this table removes the order
+    pub sort_order: Arc<Mutex<Vec<Vec<SortExpr>>>>,
 }
 
 impl MemTable {
@@ -82,6 +90,7 @@ impl MemTable {
                 .collect::<Vec<_>>(),
             constraints: Constraints::empty(),
             column_defaults: HashMap::new(),
+            sort_order: Arc::new(Mutex::new(vec![])),
         })
     }
 
@@ -100,6 +109,21 @@ impl MemTable {
         self
     }
 
+    /// Specify an optional pre-known sort order(s). Must be `SortExpr`s.
+    ///
+    /// If the data is not sorted by this order, DataFusion may produce
+    /// incorrect results.
+    ///
+    /// DataFusion may take advantage of this ordering to omit sorts
+    /// or use more efficient algorithms.
+    ///
+    /// Note that multiple sort orders are supported, if some are known to be
+    /// equivalent,
+    pub fn with_sort_order(self, mut sort_order: Vec<Vec<SortExpr>>) -> Self {
+        std::mem::swap(self.sort_order.lock().as_mut(), &mut sort_order);
+        self
+    }
+
     /// Create a mem table by reading from another data source
     pub async fn load(
         t: Arc<dyn TableProvider>,
@@ -114,7 +138,7 @@ impl MemTable {
 
         for part_idx in 0..partition_count {
             let task = state.task_ctx();
-            let exec = exec.clone();
+            let exec = Arc::clone(&exec);
             join_set.spawn(async move {
                 let stream = exec.execute(part_idx, task)?;
                 common::collect(stream).await
@@ -137,7 +161,7 @@ impl MemTable {
             }
         }
 
-        let exec = MemoryExec::try_new(&data, schema.clone(), None)?;
+        let exec = MemoryExec::try_new(&data, Arc::clone(&schema), None)?;
 
         if let Some(num_partitions) = output_partitions {
             let exec = RepartitionExec::try_new(
@@ -147,7 +171,7 @@ impl MemTable {
 
             // execute and collect results
             let mut output_partitions = vec![];
-            for i in 0..exec.output_partitioning().partition_count() {
+            for i in 0..exec.properties().output_partitioning().partition_count() {
                 // execute this *output* partition and collect all batches
                 let task_ctx = state.task_ctx();
                 let mut stream = exec.execute(i, task_ctx)?;
@@ -158,9 +182,9 @@ impl MemTable {
                 output_partitions.push(batches);
             }
 
-            return MemTable::try_new(schema.clone(), output_partitions);
+            return MemTable::try_new(Arc::clone(&schema), output_partitions);
         }
-        MemTable::try_new(schema.clone(), data)
+        MemTable::try_new(Arc::clone(&schema), data)
     }
 }
 
@@ -171,7 +195,7 @@ impl TableProvider for MemTable {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+        Arc::clone(&self.schema)
     }
 
     fn constraints(&self) -> Option<&Constraints> {
@@ -184,7 +208,7 @@ impl TableProvider for MemTable {
 
     async fn scan(
         &self,
-        _state: &SessionState,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,
@@ -194,11 +218,32 @@ impl TableProvider for MemTable {
             let inner_vec = arc_inner_vec.read().await;
             partitions.push(inner_vec.clone())
         }
-        Ok(Arc::new(MemoryExec::try_new(
-            &partitions,
-            self.schema(),
-            projection.cloned(),
-        )?))
+
+        let mut exec =
+            MemoryExec::try_new(&partitions, self.schema(), projection.cloned())?;
+
+        let show_sizes = state.config_options().explain.show_sizes;
+        exec = exec.with_show_sizes(show_sizes);
+
+        // add sort information if present
+        let sort_order = self.sort_order.lock();
+        if !sort_order.is_empty() {
+            let df_schema = DFSchema::try_from(self.schema.as_ref().clone())?;
+
+            let file_sort_order = sort_order
+                .iter()
+                .map(|sort_exprs| {
+                    create_physical_sort_exprs(
+                        sort_exprs,
+                        &df_schema,
+                        state.execution_props(),
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            exec = exec.try_with_sort_information(file_sort_order)?;
+        }
+
+        Ok(Arc::new(exec))
     }
 
     /// Returns an ExecutionPlan that inserts the execution results of a given [`ExecutionPlan`] into this [`MemTable`].
@@ -215,10 +260,13 @@ impl TableProvider for MemTable {
     /// * A plan that returns the number of rows written.
     async fn insert_into(
         &self,
-        _state: &SessionState,
+        _state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
-        overwrite: bool,
+        insert_op: InsertOp,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        // If we are inserting into the table, any sort order may be messed up so reset it here
+        *self.sort_order.lock() = vec![];
+
         // Create a physical plan from the logical plan.
         // Check that the schema of the plan matches the schema of this table.
         if !self
@@ -226,19 +274,26 @@ impl TableProvider for MemTable {
             .logically_equivalent_names_and_types(&input.schema())
         {
             return plan_err!(
-                "Inserting query must have the same schema with the table."
+                "Inserting query must have the same schema with the table. \
+                Expected: {:?}, got: {:?}",
+                self.schema()
+                    .fields()
+                    .iter()
+                    .map(|field| field.data_type())
+                    .collect::<Vec<_>>(),
+                input
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|field| field.data_type())
+                    .collect::<Vec<_>>()
             );
         }
-        if overwrite {
-            return not_impl_err!("Overwrite not implemented for MemoryTable yet");
+        if insert_op != InsertOp::Append {
+            return not_impl_err!("{insert_op} not implemented for MemoryTable yet");
         }
-        let sink = Arc::new(MemSink::new(self.batches.clone()));
-        Ok(Arc::new(FileSinkExec::new(
-            input,
-            sink,
-            self.schema.clone(),
-            None,
-        )))
+        let sink = MemSink::try_new(self.batches.clone(), Arc::clone(&self.schema))?;
+        Ok(Arc::new(DataSinkExec::new(input, Arc::new(sink), None)))
     }
 
     fn get_column_default(&self, column: &str) -> Option<&Expr> {
@@ -250,6 +305,7 @@ impl TableProvider for MemTable {
 struct MemSink {
     /// Target locations for writing data
     batches: Vec<PartitionData>,
+    schema: SchemaRef,
 }
 
 impl Debug for MemSink {
@@ -272,8 +328,14 @@ impl DisplayAs for MemSink {
 }
 
 impl MemSink {
-    fn new(batches: Vec<PartitionData>) -> Self {
-        Self { batches }
+    /// Creates a new [`MemSink`].
+    ///
+    /// The caller is responsible for ensuring that there is at least one partition to insert into.
+    fn try_new(batches: Vec<PartitionData>, schema: SchemaRef) -> Result<Self> {
+        if batches.is_empty() {
+            return plan_err!("Cannot insert into MemTable with zero partitions");
+        }
+        Ok(Self { batches, schema })
     }
 }
 
@@ -283,8 +345,8 @@ impl DataSink for MemSink {
         self
     }
 
-    fn metrics(&self) -> Option<MetricsSet> {
-        None
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
     }
 
     async fn write_all(
@@ -317,16 +379,17 @@ impl DataSink for MemSink {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::datasource::provider_as_source;
     use crate::physical_plan::collect;
     use crate::prelude::SessionContext;
+
     use arrow::array::{AsArray, Int32Array};
     use arrow::datatypes::{DataType, Field, Schema, UInt64Type};
     use arrow::error::ArrowError;
+    use datafusion_common::DataFusionError;
     use datafusion_expr::LogicalPlanBuilder;
-    use futures::StreamExt;
-    use std::collections::HashMap;
 
     #[tokio::test]
     async fn test_with_projection() -> Result<()> {
@@ -577,7 +640,8 @@ mod tests {
         let scan_plan = LogicalPlanBuilder::scan("source", source, None)?.build()?;
         // Create an insert plan to insert the source data into the initial table
         let insert_into_table =
-            LogicalPlanBuilder::insert_into(scan_plan, "t", &schema, false)?.build()?;
+            LogicalPlanBuilder::insert_into(scan_plan, "t", &schema, InsertOp::Append)?
+                .build()?;
         // Create a physical plan from the insert plan
         let plan = session_ctx
             .state()
@@ -597,7 +661,7 @@ mod tests {
         Ok(partitions)
     }
 
-    /// Returns the value of results. For example, returns 6 given the follwing
+    /// Returns the value of results. For example, returns 6 given the following
     ///
     /// ```text
     /// +-------+,
@@ -714,6 +778,29 @@ mod tests {
         .await?;
         // Ensure that the table now contains two batches of data in the same partition
         assert_eq!(resulting_data_in_table[0].len(), 2);
+        Ok(())
+    }
+
+    // Test inserting a batch into a MemTable without any partitions
+    #[tokio::test]
+    async fn test_insert_into_zero_partition() -> Result<()> {
+        // Create a new schema with one field called "a" of type Int32
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+
+        // Create a new batch of data to insert into the table
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )?;
+        // Run the experiment and expect an error
+        let experiment_result = experiment(schema, vec![], vec![vec![batch.clone()]])
+            .await
+            .unwrap_err();
+        // Ensure that there is a descriptive error message
+        assert_eq!(
+            "Error during planning: Cannot insert into MemTable with zero partitions",
+            experiment_result.strip_backtrace()
+        );
         Ok(())
     }
 }

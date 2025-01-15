@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use datafusion_common::tree_node::{TreeNode, VisitRecursion};
 use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
     num::NonZeroUsize,
 };
 
+use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_expr::LogicalPlan;
 
 /// Non-unique identifier of a [`LogicalPlan`].
@@ -73,9 +73,9 @@ impl LogicalPlanSignature {
 /// Get total number of [`LogicalPlan`]s in the plan.
 fn get_node_number(plan: &LogicalPlan) -> NonZeroUsize {
     let mut node_number = 0;
-    plan.apply(&mut |_plan| {
+    plan.apply_with_subqueries(|_plan| {
         node_number += 1;
-        Ok(VisitRecursion::Continue)
+        Ok(TreeNodeRecursion::Continue)
     })
     // Closure always return Ok
     .unwrap();
@@ -89,7 +89,7 @@ mod tests {
     use std::sync::Arc;
 
     use datafusion_common::{DFSchema, Result};
-    use datafusion_expr::{self, lit, LogicalPlan};
+    use datafusion_expr::{lit, LogicalPlan};
 
     use crate::plan_signature::get_node_number;
 
@@ -100,7 +100,7 @@ mod tests {
         let one_node_plan =
             Arc::new(LogicalPlan::EmptyRelation(datafusion_expr::EmptyRelation {
                 produce_one_row: false,
-                schema: schema.clone(),
+                schema: Arc::clone(&schema),
             }));
 
         assert_eq!(1, get_node_number(&one_node_plan).get());
@@ -112,7 +112,7 @@ mod tests {
         assert_eq!(2, get_node_number(&two_node_plan).get());
 
         let five_node_plan = Arc::new(LogicalPlan::Union(datafusion_expr::Union {
-            inputs: vec![two_node_plan.clone(), two_node_plan],
+            inputs: vec![Arc::clone(&two_node_plan), two_node_plan],
             schema,
         }));
 

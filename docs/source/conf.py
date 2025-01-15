@@ -33,7 +33,7 @@
 
 # -- Project information -----------------------------------------------------
 
-project = 'Apache Arrow DataFusion'
+project = 'Apache DataFusion'
 copyright = '2019-2024, Apache Software Foundation'
 author = 'Apache Software Foundation'
 
@@ -100,7 +100,7 @@ html_context = {
 # so a file named "default.css" will overwrite the builtin "default.css".
 html_static_path = ['_static']
 
-html_logo = "_static/images/DataFusion-Logo-Background-White.png"
+html_logo = "_static/images/2x_bgwhite_original.png"
 
 html_css_files = [
     "theme_overrides.css"
@@ -119,3 +119,9 @@ myst_heading_anchors = 3
 
 # enable nice rendering of checkboxes for the task lists
 myst_enable_extensions = ["colon_fence", "deflist", "tasklist"]
+
+# Some code blocks (sql) are not being highlighted correctly, due to the
+# presence of some special characters like: 🚀, å, {,... But this isn’t a major
+# issue for our documentation. So, suppress these warnings to keep our build
+# log cleaner.
+suppress_warnings = ['misc.highlighting_failure']

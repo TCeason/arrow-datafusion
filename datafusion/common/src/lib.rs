@@ -15,9 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Make cheap clones clear: https://github.com/apache/datafusion/issues/11143
+#![deny(clippy::clone_on_ref_ptr)]
+
 mod column;
 mod dfschema;
-mod error;
 mod functional_dependencies;
 mod join_type;
 mod param_value;
@@ -30,44 +32,66 @@ mod unnest;
 pub mod alias;
 pub mod cast;
 pub mod config;
+pub mod cse;
 pub mod display;
+pub mod error;
 pub mod file_options;
 pub mod format;
 pub mod hash_utils;
+pub mod instant;
 pub mod parsers;
 pub mod rounding;
 pub mod scalar;
 pub mod stats;
 pub mod test_util;
 pub mod tree_node;
+pub mod types;
 pub mod utils;
 
 /// Reexport arrow crate
 pub use arrow;
 pub use column::Column;
-pub use dfschema::{DFField, DFSchema, DFSchemaRef, ExprSchema, SchemaExt, ToDFSchema};
+pub use dfschema::{
+    qualified_name, DFSchema, DFSchemaRef, ExprSchema, SchemaExt, ToDFSchema,
+};
 pub use error::{
     field_not_found, unqualified_field_not_found, DataFusionError, Result, SchemaError,
     SharedResult,
 };
 pub use file_options::file_type::{
-    FileType, GetExt, DEFAULT_ARROW_EXTENSION, DEFAULT_AVRO_EXTENSION,
-    DEFAULT_CSV_EXTENSION, DEFAULT_JSON_EXTENSION, DEFAULT_PARQUET_EXTENSION,
+    GetExt, DEFAULT_ARROW_EXTENSION, DEFAULT_AVRO_EXTENSION, DEFAULT_CSV_EXTENSION,
+    DEFAULT_JSON_EXTENSION, DEFAULT_PARQUET_EXTENSION,
 };
-pub use file_options::FileTypeWriterOptions;
 pub use functional_dependencies::{
     aggregate_functional_dependencies, get_required_group_by_exprs_indices,
     get_target_functional_dependencies, Constraint, Constraints, Dependency,
     FunctionalDependence, FunctionalDependencies,
 };
+use hashbrown::hash_map::DefaultHashBuilder;
 pub use join_type::{JoinConstraint, JoinSide, JoinType};
 pub use param_value::ParamValues;
 pub use scalar::{ScalarType, ScalarValue};
-pub use schema_reference::{OwnedSchemaReference, SchemaReference};
+pub use schema_reference::SchemaReference;
 pub use stats::{ColumnStatistics, Statistics};
-pub use table_reference::{OwnedTableReference, ResolvedTableReference, TableReference};
-pub use unnest::UnnestOptions;
+pub use table_reference::{ResolvedTableReference, TableReference};
+pub use unnest::{RecursionUnnestOption, UnnestOptions};
 pub use utils::project_schema;
+
+// These are hidden from docs purely to avoid polluting the public view of what this crate exports.
+// These are just re-exports of macros by the same name, which gets around the 'cannot refer to
+// macro-expanded macro_export macros by their full path' error.
+// The design to get around this comes from this comment:
+// https://github.com/rust-lang/rust/pull/52234#issuecomment-976702997
+#[doc(hidden)]
+pub use error::{
+    _config_datafusion_err, _exec_datafusion_err, _internal_datafusion_err,
+    _not_impl_datafusion_err, _plan_datafusion_err, _resources_datafusion_err,
+    _substrait_datafusion_err,
+};
+
+// The HashMap and HashSet implementations that should be used as the uniform defaults
+pub type HashMap<K, V, S = DefaultHashBuilder> = hashbrown::HashMap<K, V, S>;
+pub type HashSet<T, S = DefaultHashBuilder> = hashbrown::HashSet<T, S>;
 
 /// Downcast an Arrow Array to a concrete type, return an `DataFusionError::Internal` if the cast is
 /// not possible. In normal usage of DataFusion the downcast should always succeed.

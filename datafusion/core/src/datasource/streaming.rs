@@ -23,16 +23,16 @@ use std::sync::Arc;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 
-use datafusion_common::{plan_err, DataFusionError, Result};
+use crate::datasource::TableProvider;
+use crate::physical_plan::streaming::{PartitionStream, StreamingTableExec};
+use crate::physical_plan::ExecutionPlan;
+use datafusion_catalog::Session;
+use datafusion_common::{plan_err, Result};
 use datafusion_expr::{Expr, TableType};
 use log::debug;
 
-use crate::datasource::TableProvider;
-use crate::execution::context::SessionState;
-use crate::physical_plan::streaming::{PartitionStream, StreamingTableExec};
-use crate::physical_plan::ExecutionPlan;
-
 /// A [`TableProvider`] that streams a set of [`PartitionStream`]
+#[derive(Debug)]
 pub struct StreamingTable {
     schema: SchemaRef,
     partitions: Vec<Arc<dyn PartitionStream>>,
@@ -50,7 +50,7 @@ impl StreamingTable {
             if !schema.contains(partition_schema) {
                 debug!(
                     "target schema does not contain partition schema. \
-                        Target_schema: {schema:?}. Partiton Schema: {partition_schema:?}"
+                        Target_schema: {schema:?}. Partition Schema: {partition_schema:?}"
                 );
                 return plan_err!("Mismatch between schema and batches");
             }
@@ -76,7 +76,7 @@ impl TableProvider for StreamingTable {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+        Arc::clone(&self.schema)
     }
 
     fn table_type(&self) -> TableType {
@@ -85,18 +85,18 @@ impl TableProvider for StreamingTable {
 
     async fn scan(
         &self,
-        _state: &SessionState,
+        _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         _filters: &[Expr],
-        _limit: Option<usize>,
+        limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // TODO: push limit down
         Ok(Arc::new(StreamingTableExec::try_new(
-            self.schema.clone(),
+            Arc::clone(&self.schema),
             self.partitions.clone(),
             projection,
             None,
             self.infinite,
+            limit,
         )?))
     }
 }

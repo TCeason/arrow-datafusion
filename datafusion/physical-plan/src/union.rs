@@ -27,21 +27,21 @@ use std::task::{Context, Poll};
 use std::{any::Any, sync::Arc};
 
 use super::{
-    expressions::PhysicalSortExpr,
     metrics::{ExecutionPlanMetricsSet, MetricsSet},
-    ColumnStatistics, DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning,
-    RecordBatchStream, SendableRecordBatchStream, Statistics,
+    ColumnStatistics, DisplayAs, DisplayFormatType, ExecutionPlan,
+    ExecutionPlanProperties, Partitioning, PlanProperties, RecordBatchStream,
+    SendableRecordBatchStream, Statistics,
 };
-use crate::common::get_meet_of_orderings;
+use crate::execution_plan::{boundedness_from_children, emission_type_from_children};
 use crate::metrics::BaselineMetrics;
 use crate::stream::ObservedStream;
 
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion_common::stats::Precision;
-use datafusion_common::{exec_err, internal_err, DataFusionError, Result};
+use datafusion_common::{exec_err, internal_err, Result};
 use datafusion_execution::TaskContext;
-use datafusion_physical_expr::EquivalenceProperties;
+use datafusion_physical_expr::{calculate_union, EquivalenceProperties};
 
 use futures::Stream;
 use itertools::Itertools;
@@ -85,31 +85,62 @@ use tokio::macros::support::thread_rng_n;
 ///                  │Input 1          │  │Input 2           │
 ///                  └─────────────────┘  └──────────────────┘
 /// ```
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct UnionExec {
     /// Input execution plan
     inputs: Vec<Arc<dyn ExecutionPlan>>,
     /// Execution metrics
     metrics: ExecutionPlanMetricsSet,
-    /// Schema of Union
-    schema: SchemaRef,
+    /// Cache holding plan properties like equivalences, output partitioning etc.
+    cache: PlanProperties,
 }
 
 impl UnionExec {
     /// Create a new UnionExec
     pub fn new(inputs: Vec<Arc<dyn ExecutionPlan>>) -> Self {
         let schema = union_schema(&inputs);
-
+        // The schema of the inputs and the union schema is consistent when:
+        // - They have the same number of fields, and
+        // - Their fields have same types at the same indices.
+        // Here, we know that schemas are consistent and the call below can
+        // not return an error.
+        let cache = Self::compute_properties(&inputs, schema).unwrap();
         UnionExec {
             inputs,
             metrics: ExecutionPlanMetricsSet::new(),
-            schema,
+            cache,
         }
     }
 
     /// Get inputs of the execution plan
     pub fn inputs(&self) -> &Vec<Arc<dyn ExecutionPlan>> {
         &self.inputs
+    }
+
+    /// This function creates the cache object that stores the plan properties such as schema, equivalence properties, ordering, partitioning, etc.
+    fn compute_properties(
+        inputs: &[Arc<dyn ExecutionPlan>],
+        schema: SchemaRef,
+    ) -> Result<PlanProperties> {
+        // Calculate equivalence properties:
+        let children_eqps = inputs
+            .iter()
+            .map(|child| child.equivalence_properties().clone())
+            .collect::<Vec<_>>();
+        let eq_properties = calculate_union(children_eqps, schema)?;
+
+        // Calculate output partitioning; i.e. sum output partitions of the inputs.
+        let num_partitions = inputs
+            .iter()
+            .map(|plan| plan.output_partitioning().partition_count())
+            .sum();
+        let output_partitioning = Partitioning::UnknownPartitioning(num_partitions);
+        Ok(PlanProperties::new(
+            eq_properties,
+            output_partitioning,
+            emission_type_from_children(inputs),
+            boundedness_from_children(inputs),
+        ))
     }
 }
 
@@ -128,43 +159,21 @@ impl DisplayAs for UnionExec {
 }
 
 impl ExecutionPlan for UnionExec {
+    fn name(&self) -> &'static str {
+        "UnionExec"
+    }
+
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
         self
     }
 
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+    fn properties(&self) -> &PlanProperties {
+        &self.cache
     }
 
-    /// Specifies whether this plan generates an infinite stream of records.
-    /// If the plan does not support pipelining, but its input(s) are
-    /// infinite, returns an error to indicate this.
-    fn unbounded_output(&self, children: &[bool]) -> Result<bool> {
-        Ok(children.iter().any(|x| *x))
-    }
-
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        self.inputs.clone()
-    }
-
-    /// Output of the union is the combination of all output partitions of the inputs
-    fn output_partitioning(&self) -> Partitioning {
-        // Output the combination of all output partitions of the inputs if the Union is not partition aware
-        let num_partitions = self
-            .inputs
-            .iter()
-            .map(|plan| plan.output_partitioning().partition_count())
-            .sum();
-
-        Partitioning::UnknownPartitioning(num_partitions)
-    }
-
-    fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        // The output ordering is the "meet" of its input orderings.
-        // The meet is the finest ordering that satisfied by all the input
-        // orderings, see https://en.wikipedia.org/wiki/Join_and_meet.
-        get_meet_of_orderings(&self.inputs)
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        self.inputs.iter().collect()
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
@@ -176,7 +185,7 @@ impl ExecutionPlan for UnionExec {
         // which is the "meet" of all input orderings. In this example, this
         // function will return vec![false, true, true], indicating that we
         // preserve the orderings for the 2nd and the 3rd children.
-        if let Some(output_ordering) = self.output_ordering() {
+        if let Some(output_ordering) = self.properties().output_ordering() {
             self.inputs()
                 .iter()
                 .map(|child| {
@@ -190,46 +199,6 @@ impl ExecutionPlan for UnionExec {
         } else {
             vec![false; self.inputs().len()]
         }
-    }
-
-    fn equivalence_properties(&self) -> EquivalenceProperties {
-        // TODO: In some cases, we should be able to preserve some equivalence
-        //       classes and constants. Add support for such cases.
-        let children_eqs = self
-            .inputs
-            .iter()
-            .map(|child| child.equivalence_properties())
-            .collect::<Vec<_>>();
-        let mut result = EquivalenceProperties::new(self.schema());
-        // Use the ordering equivalence class of the first child as the seed:
-        let mut meets = children_eqs[0]
-            .oeq_class()
-            .iter()
-            .map(|item| item.to_vec())
-            .collect::<Vec<_>>();
-        // Iterate over all the children:
-        for child_eqs in &children_eqs[1..] {
-            // Compute meet orderings of the current meets and the new ordering
-            // equivalence class.
-            let mut idx = 0;
-            while idx < meets.len() {
-                // Find all the meets of `current_meet` with this child's orderings:
-                let valid_meets = child_eqs.oeq_class().iter().filter_map(|ordering| {
-                    child_eqs.get_meet_ordering(ordering, &meets[idx])
-                });
-                // Use the longest of these meets as others are redundant:
-                if let Some(next_meet) = valid_meets.max_by_key(|m| m.len()) {
-                    meets[idx] = next_meet;
-                    idx += 1;
-                } else {
-                    meets.swap_remove(idx);
-                }
-            }
-        }
-        // We know have all the valid orderings after union, remove redundant
-        // entries (implicitly) and return:
-        result.add_new_orderings(meets);
-        result
     }
 
     fn with_new_children(
@@ -288,6 +257,10 @@ impl ExecutionPlan for UnionExec {
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
         vec![false; self.children().len()]
     }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        true
+    }
 }
 
 /// Combines multiple input streams by interleaving them.
@@ -322,37 +295,49 @@ impl ExecutionPlan for UnionExec {
 /// |         |-----------------+
 /// +---------+
 /// ```
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct InterleaveExec {
     /// Input execution plan
     inputs: Vec<Arc<dyn ExecutionPlan>>,
     /// Execution metrics
     metrics: ExecutionPlanMetricsSet,
-    /// Schema of Interleave
-    schema: SchemaRef,
+    /// Cache holding plan properties like equivalences, output partitioning etc.
+    cache: PlanProperties,
 }
 
 impl InterleaveExec {
     /// Create a new InterleaveExec
     pub fn try_new(inputs: Vec<Arc<dyn ExecutionPlan>>) -> Result<Self> {
-        let schema = union_schema(&inputs);
-
         if !can_interleave(inputs.iter()) {
             return internal_err!(
                 "Not all InterleaveExec children have a consistent hash partitioning"
             );
         }
-
+        let cache = Self::compute_properties(&inputs);
         Ok(InterleaveExec {
             inputs,
             metrics: ExecutionPlanMetricsSet::new(),
-            schema,
+            cache,
         })
     }
 
     /// Get inputs of the execution plan
     pub fn inputs(&self) -> &Vec<Arc<dyn ExecutionPlan>> {
         &self.inputs
+    }
+
+    /// This function creates the cache object that stores the plan properties such as schema, equivalence properties, ordering, partitioning, etc.
+    fn compute_properties(inputs: &[Arc<dyn ExecutionPlan>]) -> PlanProperties {
+        let schema = union_schema(inputs);
+        let eq_properties = EquivalenceProperties::new(schema);
+        // Get output partitioning:
+        let output_partitioning = inputs[0].output_partitioning().clone();
+        PlanProperties::new(
+            eq_properties,
+            output_partitioning,
+            emission_type_from_children(inputs),
+            boundedness_from_children(inputs),
+        )
     }
 }
 
@@ -371,35 +356,21 @@ impl DisplayAs for InterleaveExec {
 }
 
 impl ExecutionPlan for InterleaveExec {
+    fn name(&self) -> &'static str {
+        "InterleaveExec"
+    }
+
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
         self
     }
 
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+    fn properties(&self) -> &PlanProperties {
+        &self.cache
     }
 
-    /// Specifies whether this plan generates an infinite stream of records.
-    /// If the plan does not support pipelining, but its input(s) are
-    /// infinite, returns an error to indicate this.
-    fn unbounded_output(&self, children: &[bool]) -> Result<bool> {
-        Ok(children.iter().any(|x| *x))
-    }
-
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        self.inputs.clone()
-    }
-
-    /// All inputs must have the same partitioning. The output partioning of InterleaveExec is the same as the inputs
-    /// (NOT combined). E.g. if there are 10 inputs where each is `Hash(3)`-partitioned, InterleaveExec is also
-    /// `Hash(3)`-partitioned.
-    fn output_partitioning(&self) -> Partitioning {
-        self.inputs[0].output_partitioning()
-    }
-
-    fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        None
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        self.inputs.iter().collect()
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
@@ -410,6 +381,12 @@ impl ExecutionPlan for InterleaveExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        // New children are no longer interleavable, which might be a bug of optimization rewrite.
+        if !can_interleave(children.iter()) {
+            return internal_err!(
+                "Can not create InterleaveExec: new children can not be interleaved"
+            );
+        }
         Ok(Arc::new(InterleaveExec::try_new(children)?))
     }
 
@@ -428,7 +405,7 @@ impl ExecutionPlan for InterleaveExec {
         let mut input_stream_vec = vec![];
         for input in self.inputs.iter() {
             if partition < input.output_partitioning().partition_count() {
-                input_stream_vec.push(input.execute(partition, context.clone())?);
+                input_stream_vec.push(input.execute(partition, Arc::clone(&context))?);
             } else {
                 // Do not find a partition to execute
                 break;
@@ -485,31 +462,46 @@ pub fn can_interleave<T: Borrow<Arc<dyn ExecutionPlan>>>(
     let reference = first.borrow().output_partitioning();
     matches!(reference, Partitioning::Hash(_, _))
         && inputs
-            .map(|plan| plan.borrow().output_partitioning())
-            .all(|partition| partition == reference)
+            .map(|plan| plan.borrow().output_partitioning().clone())
+            .all(|partition| partition == *reference)
 }
 
 fn union_schema(inputs: &[Arc<dyn ExecutionPlan>]) -> SchemaRef {
-    let fields: Vec<Field> = (0..inputs[0].schema().fields().len())
+    let first_schema = inputs[0].schema();
+
+    let fields = (0..first_schema.fields().len())
         .map(|i| {
             inputs
                 .iter()
-                .filter_map(|input| {
-                    if input.schema().fields().len() > i {
-                        Some(input.schema().field(i).clone())
-                    } else {
-                        None
-                    }
+                .enumerate()
+                .map(|(input_idx, input)| {
+                    let field = input.schema().field(i).clone();
+                    let mut metadata = field.metadata().clone();
+
+                    let other_metadatas = inputs
+                        .iter()
+                        .enumerate()
+                        .filter(|(other_idx, _)| *other_idx != input_idx)
+                        .flat_map(|(_, other_input)| {
+                            other_input.schema().field(i).metadata().clone().into_iter()
+                        });
+
+                    metadata.extend(other_metadatas);
+                    field.with_metadata(metadata)
                 })
-                .find_or_first(|f| f.is_nullable())
+                .find_or_first(Field::is_nullable)
+                // We can unwrap this because if inputs was empty, this would've already panic'ed when we
+                // indexed into inputs[0].
                 .unwrap()
         })
+        .collect::<Vec<_>>();
+
+    let all_metadata_merged = inputs
+        .iter()
+        .flat_map(|i| i.schema().metadata().clone().into_iter())
         .collect();
 
-    Arc::new(Schema::new_with_metadata(
-        fields,
-        inputs[0].schema().metadata().clone(),
-    ))
+    Arc::new(Schema::new_with_metadata(fields, all_metadata_merged))
 }
 
 /// CombinedRecordBatchStream can be used to combine a Vec of SendableRecordBatchStreams into one
@@ -529,7 +521,7 @@ impl CombinedRecordBatchStream {
 
 impl RecordBatchStream for CombinedRecordBatchStream {
     fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+        Arc::clone(&self.schema)
     }
 }
 
@@ -610,11 +602,11 @@ mod tests {
     use crate::memory::MemoryExec;
     use crate::test;
 
-    use arrow::record_batch::RecordBatch;
     use arrow_schema::{DataType, SortOptions};
     use datafusion_common::ScalarValue;
     use datafusion_physical_expr::expressions::col;
-    use datafusion_physical_expr::PhysicalExpr;
+    use datafusion_physical_expr::{PhysicalExpr, PhysicalSortExpr};
+    use datafusion_physical_expr_common::sort_expr::LexOrdering;
 
     // Generate a schema which consists of 7 columns (a, b, c, d, e, f, g)
     fn create_test_schema() -> Result<SchemaRef> {
@@ -633,14 +625,14 @@ mod tests {
     // Convert each tuple to PhysicalSortExpr
     fn convert_to_sort_exprs(
         in_data: &[(&Arc<dyn PhysicalExpr>, SortOptions)],
-    ) -> Vec<PhysicalSortExpr> {
+    ) -> LexOrdering {
         in_data
             .iter()
             .map(|(expr, options)| PhysicalSortExpr {
-                expr: (*expr).clone(),
+                expr: Arc::clone(*expr),
                 options: *options,
             })
-            .collect::<Vec<_>>()
+            .collect::<LexOrdering>()
     }
 
     #[tokio::test]
@@ -654,7 +646,13 @@ mod tests {
         let union_exec = Arc::new(UnionExec::new(vec![csv, csv2]));
 
         // Should have 9 partitions and 9 output batches
-        assert_eq!(union_exec.output_partitioning().partition_count(), 9);
+        assert_eq!(
+            union_exec
+                .properties()
+                .output_partitioning()
+                .partition_count(),
+            9
+        );
 
         let result: Vec<RecordBatch> = collect(union_exec, task_ctx).await?;
         assert_eq!(result.len(), 9);
@@ -753,7 +751,7 @@ mod tests {
         let col_e = &col("e", &schema)?;
         let col_f = &col("f", &schema)?;
         let options = SortOptions::default();
-        let test_cases = vec![
+        let test_cases = [
             //-----------TEST CASE 1----------//
             (
                 // First child orderings
@@ -816,31 +814,39 @@ mod tests {
                 .map(|ordering| convert_to_sort_exprs(ordering))
                 .collect::<Vec<_>>();
             let child1 = Arc::new(
-                MemoryExec::try_new(&[], schema.clone(), None)?
-                    .with_sort_information(first_orderings),
+                MemoryExec::try_new(&[], Arc::clone(&schema), None)?
+                    .try_with_sort_information(first_orderings)?,
             );
             let child2 = Arc::new(
-                MemoryExec::try_new(&[], schema.clone(), None)?
-                    .with_sort_information(second_orderings),
+                MemoryExec::try_new(&[], Arc::clone(&schema), None)?
+                    .try_with_sort_information(second_orderings)?,
             );
 
+            let mut union_expected_eq = EquivalenceProperties::new(Arc::clone(&schema));
+            union_expected_eq.add_new_orderings(union_expected_orderings);
+
             let union = UnionExec::new(vec![child1, child2]);
-            let union_eq_properties = union.equivalence_properties();
-            let union_actual_orderings = union_eq_properties.oeq_class();
+            let union_eq_properties = union.properties().equivalence_properties();
             let err_msg = format!(
                 "Error in test id: {:?}, test case: {:?}",
                 test_idx, test_cases[test_idx]
             );
-            assert_eq!(
-                union_actual_orderings.len(),
-                union_expected_orderings.len(),
-                "{}",
-                err_msg
-            );
-            for expected in &union_expected_orderings {
-                assert!(union_actual_orderings.contains(expected), "{}", err_msg);
-            }
+            assert_eq_properties_same(union_eq_properties, &union_expected_eq, err_msg);
         }
         Ok(())
+    }
+
+    fn assert_eq_properties_same(
+        lhs: &EquivalenceProperties,
+        rhs: &EquivalenceProperties,
+        err_msg: String,
+    ) {
+        // Check whether orderings are same.
+        let lhs_orderings = lhs.oeq_class();
+        let rhs_orderings = rhs.oeq_class();
+        assert_eq!(lhs_orderings.len(), rhs_orderings.len(), "{}", err_msg);
+        for rhs_ordering in rhs_orderings.iter() {
+            assert!(lhs_orderings.contains(rhs_ordering), "{}", err_msg);
+        }
     }
 }

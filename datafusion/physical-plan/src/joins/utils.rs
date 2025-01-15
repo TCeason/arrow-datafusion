@@ -20,25 +20,31 @@
 use std::collections::HashSet;
 use std::fmt::{self, Debug};
 use std::future::Future;
+use std::iter::once;
 use std::ops::{IndexMut, Range};
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::usize;
 
 use crate::metrics::{self, ExecutionPlanMetricsSet, MetricBuilder};
-use crate::{ColumnStatistics, ExecutionPlan, Partitioning, Statistics};
+use crate::{
+    ColumnStatistics, ExecutionPlan, ExecutionPlanProperties, Partitioning, Statistics,
+};
+// compatibility
+pub use super::join_filter::JoinFilter;
 
 use arrow::array::{
     downcast_array, new_null_array, Array, BooleanBufferBuilder, UInt32Array,
-    UInt32BufferBuilder, UInt32Builder, UInt64Array, UInt64BufferBuilder,
+    UInt32Builder, UInt64Array,
 };
 use arrow::compute;
-use arrow::datatypes::{Field, Schema, SchemaBuilder};
+use arrow::datatypes::{Field, Schema, SchemaBuilder, UInt32Type, UInt64Type};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
+use arrow_array::builder::UInt64Builder;
 use arrow_array::{ArrowPrimitiveType, NativeAdapter, PrimitiveArray};
 use arrow_buffer::ArrowNativeType;
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::stats::Precision;
+use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{
     plan_err, DataFusionError, JoinSide, JoinType, Result, SharedResult,
 };
@@ -47,10 +53,10 @@ use datafusion_physical_expr::equivalence::add_offset_to_expr;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::utils::{collect_columns, merge_vectors};
 use datafusion_physical_expr::{
-    LexOrdering, LexOrderingRef, PhysicalExpr, PhysicalExprRef, PhysicalSortExpr,
+    LexOrdering, PhysicalExpr, PhysicalExprRef, PhysicalSortExpr,
 };
 
-use datafusion_common::tree_node::{Transformed, TreeNode};
+use crate::projection::ProjectionExec;
 use futures::future::{BoxFuture, Shared};
 use futures::{ready, FutureExt};
 use hashbrown::raw::RawTable;
@@ -64,7 +70,7 @@ use parking_lot::Mutex;
 /// E.g. 1 -> [3, 6, 8] indicates that the column values map to rows 3, 6 and 8 for hash value 1
 /// As the key is a hash value, we need to check possible hash collisions in the probe stage
 /// During this stage it might be the case that a row is contained the same hashmap value,
-/// but the values don't match. Those are checked in the [`equal_rows_arr`](crate::joins::hash_join::equal_rows_arr) method.
+/// but the values don't match. Those are checked in the `equal_rows_arr` method.
 ///
 /// The indices (values) are stored in a separate chained list stored in the `Vec<u64>`.
 ///
@@ -143,7 +149,7 @@ impl JoinHashMap {
 pub(crate) type JoinHashMapOffset = (usize, Option<u64>);
 
 // Macro for traversing chained values with limit.
-// Early returns in case of reacing output tuples limit.
+// Early returns in case of reaching output tuples limit.
 macro_rules! chain_traverse {
     (
         $input_indices:ident, $match_indices:ident, $hash_values:ident, $next_chain:ident,
@@ -161,8 +167,8 @@ macro_rules! chain_traverse {
             } else {
                 i
             };
-            $match_indices.append(match_row_idx);
-            $input_indices.append($input_idx as u32);
+            $match_indices.push(match_row_idx);
+            $input_indices.push($input_idx as u32);
             $remaining_output -= 1;
             // Follow the chain to get the next index value
             let next = $next_chain[match_row_idx as usize];
@@ -236,9 +242,9 @@ pub trait JoinHashMapType {
         &self,
         iter: impl Iterator<Item = (usize, &'a u64)>,
         deleted_offset: Option<usize>,
-    ) -> (UInt32BufferBuilder, UInt64BufferBuilder) {
-        let mut input_indices = UInt32BufferBuilder::new(0);
-        let mut match_indices = UInt64BufferBuilder::new(0);
+    ) -> (Vec<u32>, Vec<u64>) {
+        let mut input_indices = vec![];
+        let mut match_indices = vec![];
 
         let hash_map = self.get_map();
         let next_chain = self.get_list();
@@ -259,8 +265,8 @@ pub trait JoinHashMapType {
                     } else {
                         i
                     };
-                    match_indices.append(match_row_idx);
-                    input_indices.append(row_idx as u32);
+                    match_indices.push(match_row_idx);
+                    input_indices.push(row_idx as u32);
                     // Follow the chain to get the next index value
                     let next = next_chain[match_row_idx as usize];
                     if next == 0 {
@@ -287,13 +293,9 @@ pub trait JoinHashMapType {
         deleted_offset: Option<usize>,
         limit: usize,
         offset: JoinHashMapOffset,
-    ) -> (
-        UInt32BufferBuilder,
-        UInt64BufferBuilder,
-        Option<JoinHashMapOffset>,
-    ) {
-        let mut input_indices = UInt32BufferBuilder::new(0);
-        let mut match_indices = UInt64BufferBuilder::new(0);
+    ) -> (Vec<u32>, Vec<u64>, Option<JoinHashMapOffset>) {
+        let mut input_indices = vec![];
+        let mut match_indices = vec![];
 
         let mut remaining_output = limit;
 
@@ -371,7 +373,7 @@ impl JoinHashMapType for JoinHashMap {
     }
 }
 
-impl fmt::Debug for JoinHashMap {
+impl Debug for JoinHashMap {
     fn fmt(&self, _f: &mut fmt::Formatter) -> fmt::Result {
         Ok(())
     }
@@ -429,44 +431,20 @@ fn check_join_set_is_valid(
     Ok(())
 }
 
-/// Calculate the OutputPartitioning for Partitioned Join
-pub fn partitioned_join_output_partitioning(
-    join_type: JoinType,
-    left_partitioning: Partitioning,
-    right_partitioning: Partitioning,
-    left_columns_len: usize,
-) -> Partitioning {
-    match join_type {
-        JoinType::Inner | JoinType::Left | JoinType::LeftSemi | JoinType::LeftAnti => {
-            left_partitioning
-        }
-        JoinType::RightSemi | JoinType::RightAnti => right_partitioning,
-        JoinType::Right => {
-            adjust_right_output_partitioning(right_partitioning, left_columns_len)
-        }
-        JoinType::Full => {
-            Partitioning::UnknownPartitioning(right_partitioning.partition_count())
-        }
-    }
-}
-
 /// Adjust the right out partitioning to new Column Index
 pub fn adjust_right_output_partitioning(
-    right_partitioning: Partitioning,
+    right_partitioning: &Partitioning,
     left_columns_len: usize,
 ) -> Partitioning {
     match right_partitioning {
-        Partitioning::RoundRobinBatch(size) => Partitioning::RoundRobinBatch(size),
-        Partitioning::UnknownPartitioning(size) => {
-            Partitioning::UnknownPartitioning(size)
-        }
         Partitioning::Hash(exprs, size) => {
             let new_exprs = exprs
-                .into_iter()
-                .map(|expr| add_offset_to_expr(expr, left_columns_len))
+                .iter()
+                .map(|expr| add_offset_to_expr(Arc::clone(expr), left_columns_len))
                 .collect();
-            Partitioning::Hash(new_exprs, size)
+            Partitioning::Hash(new_exprs, *size)
         }
+        result => result.clone(),
     }
 }
 
@@ -474,17 +452,19 @@ pub fn adjust_right_output_partitioning(
 /// the left column (zeroth index in the tuple) inside `right_ordering`.
 fn replace_on_columns_of_right_ordering(
     on_columns: &[(PhysicalExprRef, PhysicalExprRef)],
-    right_ordering: &mut [PhysicalSortExpr],
+    right_ordering: &mut LexOrdering,
 ) -> Result<()> {
     for (left_col, right_col) in on_columns {
-        for item in right_ordering.iter_mut() {
-            let new_expr = item.expr.clone().transform(&|e| {
-                if e.eq(right_col) {
-                    Ok(Transformed::Yes(left_col.clone()))
-                } else {
-                    Ok(Transformed::No(e))
-                }
-            })?;
+        for item in right_ordering.inner.iter_mut() {
+            let new_expr = Arc::clone(&item.expr)
+                .transform(|e| {
+                    if e.eq(right_col) {
+                        Ok(Transformed::yes(Arc::clone(left_col)))
+                    } else {
+                        Ok(Transformed::no(e))
+                    }
+                })
+                .data()?;
             item.expr = new_expr;
         }
     }
@@ -492,28 +472,28 @@ fn replace_on_columns_of_right_ordering(
 }
 
 fn offset_ordering(
-    ordering: LexOrderingRef,
+    ordering: &LexOrdering,
     join_type: &JoinType,
     offset: usize,
-) -> Vec<PhysicalSortExpr> {
+) -> LexOrdering {
     match join_type {
-        // In the case below, right ordering should be offseted with the left
+        // In the case below, right ordering should be offsetted with the left
         // side length, since we append the right table to the left table.
         JoinType::Inner | JoinType::Left | JoinType::Full | JoinType::Right => ordering
             .iter()
             .map(|sort_expr| PhysicalSortExpr {
-                expr: add_offset_to_expr(sort_expr.expr.clone(), offset),
+                expr: add_offset_to_expr(Arc::clone(&sort_expr.expr), offset),
                 options: sort_expr.options,
             })
             .collect(),
-        _ => ordering.to_vec(),
+        _ => ordering.clone(),
     }
 }
 
 /// Calculate the output ordering of a given join operation.
 pub fn calculate_join_output_ordering(
-    left_ordering: LexOrderingRef,
-    right_ordering: LexOrderingRef,
+    left_ordering: &LexOrdering,
+    right_ordering: &LexOrdering,
     join_type: JoinType,
     on_columns: &[(PhysicalExprRef, PhysicalExprRef)],
     left_columns_len: usize,
@@ -526,15 +506,16 @@ pub fn calculate_join_output_ordering(
             if join_type == JoinType::Inner && probe_side == Some(JoinSide::Left) {
                 replace_on_columns_of_right_ordering(
                     on_columns,
-                    &mut right_ordering.to_vec(),
+                    &mut right_ordering.clone(),
                 )
                 .ok()?;
                 merge_vectors(
                     left_ordering,
-                    &offset_ordering(right_ordering, &join_type, left_columns_len),
+                    offset_ordering(right_ordering, &join_type, left_columns_len)
+                        .as_ref(),
                 )
             } else {
-                left_ordering.to_vec()
+                left_ordering.clone()
             }
         }
         [false, true] => {
@@ -542,11 +523,12 @@ pub fn calculate_join_output_ordering(
             if join_type == JoinType::Inner && probe_side == Some(JoinSide::Right) {
                 replace_on_columns_of_right_ordering(
                     on_columns,
-                    &mut right_ordering.to_vec(),
+                    &mut right_ordering.clone(),
                 )
                 .ok()?;
                 merge_vectors(
-                    &offset_ordering(right_ordering, &join_type, left_columns_len),
+                    offset_ordering(right_ordering, &join_type, left_columns_len)
+                        .as_ref(),
                     left_ordering,
                 )
             } else {
@@ -570,65 +552,6 @@ pub struct ColumnIndex {
     pub side: JoinSide,
 }
 
-/// Filter applied before join output
-#[derive(Debug, Clone)]
-pub struct JoinFilter {
-    /// Filter expression
-    expression: Arc<dyn PhysicalExpr>,
-    /// Column indices required to construct intermediate batch for filtering
-    column_indices: Vec<ColumnIndex>,
-    /// Physical schema of intermediate batch
-    schema: Schema,
-}
-
-impl JoinFilter {
-    /// Creates new JoinFilter
-    pub fn new(
-        expression: Arc<dyn PhysicalExpr>,
-        column_indices: Vec<ColumnIndex>,
-        schema: Schema,
-    ) -> JoinFilter {
-        JoinFilter {
-            expression,
-            column_indices,
-            schema,
-        }
-    }
-
-    /// Helper for building ColumnIndex vector from left and right indices
-    pub fn build_column_indices(
-        left_indices: Vec<usize>,
-        right_indices: Vec<usize>,
-    ) -> Vec<ColumnIndex> {
-        left_indices
-            .into_iter()
-            .map(|i| ColumnIndex {
-                index: i,
-                side: JoinSide::Left,
-            })
-            .chain(right_indices.into_iter().map(|i| ColumnIndex {
-                index: i,
-                side: JoinSide::Right,
-            }))
-            .collect()
-    }
-
-    /// Filter expression
-    pub fn expression(&self) -> &Arc<dyn PhysicalExpr> {
-        &self.expression
-    }
-
-    /// Column indices for intermediate batch creation
-    pub fn column_indices(&self) -> &[ColumnIndex] {
-        &self.column_indices
-    }
-
-    /// Intermediate batch schema
-    pub fn schema(&self) -> &Schema {
-        &self.schema
-    }
-}
-
 /// Returns the output field given the input field. Outer joins may
 /// insert nulls even if the input was not null
 ///
@@ -642,6 +565,7 @@ fn output_join_field(old_field: &Field, join_type: &JoinType, is_left: bool) -> 
         JoinType::RightSemi => false, // doesn't introduce nulls
         JoinType::LeftAnti => false, // doesn't introduce nulls (or can it??)
         JoinType::RightAnti => false, // doesn't introduce nulls (or can it??)
+        JoinType::LeftMark => false,
     };
 
     if force_nullable {
@@ -658,44 +582,10 @@ pub fn build_join_schema(
     right: &Schema,
     join_type: &JoinType,
 ) -> (Schema, Vec<ColumnIndex>) {
-    let (fields, column_indices): (SchemaBuilder, Vec<ColumnIndex>) = match join_type {
-        JoinType::Inner | JoinType::Left | JoinType::Full | JoinType::Right => {
-            let left_fields = left
-                .fields()
-                .iter()
-                .map(|f| output_join_field(f, join_type, true))
-                .enumerate()
-                .map(|(index, f)| {
-                    (
-                        f,
-                        ColumnIndex {
-                            index,
-                            side: JoinSide::Left,
-                        },
-                    )
-                });
-            let right_fields = right
-                .fields()
-                .iter()
-                .map(|f| output_join_field(f, join_type, false))
-                .enumerate()
-                .map(|(index, f)| {
-                    (
-                        f,
-                        ColumnIndex {
-                            index,
-                            side: JoinSide::Right,
-                        },
-                    )
-                });
-
-            // left then right
-            left_fields.chain(right_fields).unzip()
-        }
-        JoinType::LeftSemi | JoinType::LeftAnti => left
-            .fields()
+    let left_fields = || {
+        left.fields()
             .iter()
-            .cloned()
+            .map(|f| output_join_field(f, join_type, true))
             .enumerate()
             .map(|(index, f)| {
                 (
@@ -706,11 +596,13 @@ pub fn build_join_schema(
                     },
                 )
             })
-            .unzip(),
-        JoinType::RightSemi | JoinType::RightAnti => right
+    };
+
+    let right_fields = || {
+        right
             .fields()
             .iter()
-            .cloned()
+            .map(|f| output_join_field(f, join_type, false))
             .enumerate()
             .map(|(index, f)| {
                 (
@@ -721,17 +613,49 @@ pub fn build_join_schema(
                     },
                 )
             })
-            .unzip(),
     };
 
-    (fields.finish(), column_indices)
+    let (fields, column_indices): (SchemaBuilder, Vec<ColumnIndex>) = match join_type {
+        JoinType::Inner | JoinType::Left | JoinType::Full | JoinType::Right => {
+            // left then right
+            left_fields().chain(right_fields()).unzip()
+        }
+        JoinType::LeftSemi | JoinType::LeftAnti => left_fields().unzip(),
+        JoinType::LeftMark => {
+            let right_field = once((
+                Field::new("mark", arrow_schema::DataType::Boolean, false),
+                ColumnIndex {
+                    index: 0,
+                    side: JoinSide::None,
+                },
+            ));
+            left_fields().chain(right_field).unzip()
+        }
+        JoinType::RightSemi | JoinType::RightAnti => right_fields().unzip(),
+    };
+
+    let metadata = left
+        .metadata()
+        .clone()
+        .into_iter()
+        .chain(right.metadata().clone())
+        .collect();
+    (fields.finish().with_metadata(metadata), column_indices)
 }
 
-/// A [`OnceAsync`] can be used to run an async closure once, with subsequent calls
-/// to [`OnceAsync::once`] returning a [`OnceFut`] to the same asynchronous computation
+/// A [`OnceAsync`] runs an `async` closure once, where multiple calls to
+/// [`OnceAsync::once`] return a [`OnceFut`] that resolves to the result of the
+/// same computation.
 ///
-/// This is useful for joins where the results of one child are buffered in memory
-/// and shared across potentially multiple output partitions
+/// This is useful for joins where the results of one child are needed to proceed
+/// with multiple output stream
+///
+///
+/// For example, in a hash join, one input is buffered and shared across
+/// potentially multiple output partitions. Each output partition must wait for
+/// the hash table to be built before proceeding.
+///
+/// Each output partition waits on the same `OnceAsync` before proceeding.
 pub(crate) struct OnceAsync<T> {
     fut: Mutex<Option<OnceFut<T>>>,
 }
@@ -744,8 +668,8 @@ impl<T> Default for OnceAsync<T> {
     }
 }
 
-impl<T> std::fmt::Debug for OnceAsync<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<T> Debug for OnceAsync<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "OnceAsync")
     }
 }
@@ -824,35 +748,35 @@ fn estimate_join_cardinality(
     right_stats: Statistics,
     on: &JoinOn,
 ) -> Option<PartialJoinStatistics> {
+    let (left_col_stats, right_col_stats) = on
+        .iter()
+        .map(|(left, right)| {
+            match (
+                left.as_any().downcast_ref::<Column>(),
+                right.as_any().downcast_ref::<Column>(),
+            ) {
+                (Some(left), Some(right)) => (
+                    left_stats.column_statistics[left.index()].clone(),
+                    right_stats.column_statistics[right.index()].clone(),
+                ),
+                _ => (
+                    ColumnStatistics::new_unknown(),
+                    ColumnStatistics::new_unknown(),
+                ),
+            }
+        })
+        .unzip::<_, _, Vec<_>, Vec<_>>();
+
     match join_type {
         JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full => {
-            let (left_col_stats, right_col_stats) = on
-                .iter()
-                .map(|(left, right)| {
-                    match (
-                        left.as_any().downcast_ref::<Column>(),
-                        right.as_any().downcast_ref::<Column>(),
-                    ) {
-                        (Some(left), Some(right)) => (
-                            left_stats.column_statistics[left.index()].clone(),
-                            right_stats.column_statistics[right.index()].clone(),
-                        ),
-                        _ => (
-                            ColumnStatistics::new_unknown(),
-                            ColumnStatistics::new_unknown(),
-                        ),
-                    }
-                })
-                .unzip::<_, _, Vec<_>, Vec<_>>();
-
             let ij_cardinality = estimate_inner_join_cardinality(
                 Statistics {
-                    num_rows: left_stats.num_rows.clone(),
+                    num_rows: left_stats.num_rows,
                     total_byte_size: Precision::Absent,
                     column_statistics: left_col_stats,
                 },
                 Statistics {
-                    num_rows: right_stats.num_rows.clone(),
+                    num_rows: right_stats.num_rows,
                     total_byte_size: Precision::Absent,
                     column_statistics: right_col_stats,
                 },
@@ -887,10 +811,48 @@ fn estimate_join_cardinality(
             })
         }
 
-        JoinType::LeftSemi
-        | JoinType::RightSemi
-        | JoinType::LeftAnti
-        | JoinType::RightAnti => None,
+        // For SemiJoins estimation result is either zero, in cases when inputs
+        // are non-overlapping according to statistics, or equal to number of rows
+        // for outer input
+        JoinType::LeftSemi | JoinType::RightSemi => {
+            let (outer_stats, inner_stats) = match join_type {
+                JoinType::LeftSemi => (left_stats, right_stats),
+                _ => (right_stats, left_stats),
+            };
+            let cardinality = match estimate_disjoint_inputs(&outer_stats, &inner_stats) {
+                Some(estimation) => *estimation.get_value()?,
+                None => *outer_stats.num_rows.get_value()?,
+            };
+
+            Some(PartialJoinStatistics {
+                num_rows: cardinality,
+                column_statistics: outer_stats.column_statistics,
+            })
+        }
+
+        // For AntiJoins estimation always equals to outer statistics, as
+        // non-overlapping inputs won't affect estimation
+        JoinType::LeftAnti | JoinType::RightAnti => {
+            let outer_stats = match join_type {
+                JoinType::LeftAnti => left_stats,
+                _ => right_stats,
+            };
+
+            Some(PartialJoinStatistics {
+                num_rows: *outer_stats.num_rows.get_value()?,
+                column_statistics: outer_stats.column_statistics,
+            })
+        }
+
+        JoinType::LeftMark => {
+            let num_rows = *left_stats.num_rows.get_value()?;
+            let mut column_statistics = left_stats.column_statistics;
+            column_statistics.push(ColumnStatistics::new_unknown());
+            Some(PartialJoinStatistics {
+                num_rows,
+                column_statistics,
+            })
+        }
     }
 }
 
@@ -902,6 +864,11 @@ fn estimate_inner_join_cardinality(
     left_stats: Statistics,
     right_stats: Statistics,
 ) -> Option<Precision<usize>> {
+    // Immediately return if inputs considered as non-overlapping
+    if let Some(estimation) = estimate_disjoint_inputs(&left_stats, &right_stats) {
+        return Some(estimation);
+    };
+
     // The algorithm here is partly based on the non-histogram selectivity estimation
     // from Spark's Catalyst optimizer.
     let mut join_selectivity = Precision::Absent;
@@ -910,30 +877,13 @@ fn estimate_inner_join_cardinality(
         .iter()
         .zip(right_stats.column_statistics.iter())
     {
-        // If there is no overlap in any of the join columns, this means the join
-        // itself is disjoint and the cardinality is 0. Though we can only assume
-        // this when the statistics are exact (since it is a very strong assumption).
-        if left_stat.min_value.get_value()? > right_stat.max_value.get_value()? {
-            return Some(
-                if left_stat.min_value.is_exact().unwrap_or(false)
-                    && right_stat.max_value.is_exact().unwrap_or(false)
-                {
-                    Precision::Exact(0)
-                } else {
-                    Precision::Inexact(0)
-                },
-            );
-        }
-        if left_stat.max_value.get_value()? < right_stat.min_value.get_value()? {
-            return Some(
-                if left_stat.max_value.is_exact().unwrap_or(false)
-                    && right_stat.min_value.is_exact().unwrap_or(false)
-                {
-                    Precision::Exact(0)
-                } else {
-                    Precision::Inexact(0)
-                },
-            );
+        // Break if any of statistics bounds are undefined
+        if left_stat.min_value.get_value().is_none()
+            || left_stat.max_value.get_value().is_none()
+            || right_stat.min_value.get_value().is_none()
+            || right_stat.max_value.get_value().is_none()
+        {
+            return None;
         }
 
         let left_max_distinct = max_distinct_count(&left_stats.num_rows, left_stat);
@@ -967,6 +917,58 @@ fn estimate_inner_join_cardinality(
     }
 }
 
+/// Estimates if inputs are non-overlapping, using input statistics.
+/// If inputs are disjoint, returns zero estimation, otherwise returns None
+fn estimate_disjoint_inputs(
+    left_stats: &Statistics,
+    right_stats: &Statistics,
+) -> Option<Precision<usize>> {
+    for (left_stat, right_stat) in left_stats
+        .column_statistics
+        .iter()
+        .zip(right_stats.column_statistics.iter())
+    {
+        // If there is no overlap in any of the join columns, this means the join
+        // itself is disjoint and the cardinality is 0. Though we can only assume
+        // this when the statistics are exact (since it is a very strong assumption).
+        let left_min_val = left_stat.min_value.get_value();
+        let right_max_val = right_stat.max_value.get_value();
+        if left_min_val.is_some()
+            && right_max_val.is_some()
+            && left_min_val > right_max_val
+        {
+            return Some(
+                if left_stat.min_value.is_exact().unwrap_or(false)
+                    && right_stat.max_value.is_exact().unwrap_or(false)
+                {
+                    Precision::Exact(0)
+                } else {
+                    Precision::Inexact(0)
+                },
+            );
+        }
+
+        let left_max_val = left_stat.max_value.get_value();
+        let right_min_val = right_stat.min_value.get_value();
+        if left_max_val.is_some()
+            && right_min_val.is_some()
+            && left_max_val < right_min_val
+        {
+            return Some(
+                if left_stat.max_value.is_exact().unwrap_or(false)
+                    && right_stat.min_value.is_exact().unwrap_or(false)
+                {
+                    Precision::Exact(0)
+                } else {
+                    Precision::Inexact(0)
+                },
+            );
+        }
+    }
+
+    None
+}
+
 /// Estimate the number of maximum distinct values that can be present in the
 /// given column from its statistics. If distinct_count is available, uses it
 /// directly. Otherwise, if the column is numeric and has min/max values, it
@@ -976,7 +978,7 @@ fn max_distinct_count(
     stats: &ColumnStatistics,
 ) -> Precision<usize> {
     match &stats.distinct_count {
-        dc @ (Precision::Exact(_) | Precision::Inexact(_)) => dc.clone(),
+        &dc @ (Precision::Exact(_) | Precision::Inexact(_)) => dc,
         _ => {
             // The number can never be greater than the number of rows we have
             // minus the nulls (since they don't count as distinct values).
@@ -1072,7 +1074,7 @@ impl<T: 'static> OnceFut<T> {
             OnceFutState::Ready(r) => Poll::Ready(
                 r.as_ref()
                     .map(|r| r.as_ref())
-                    .map_err(|e| DataFusionError::External(Box::new(e.clone()))),
+                    .map_err(|e| DataFusionError::External(Box::new(Arc::clone(e)))),
             ),
         }
     }
@@ -1102,7 +1104,11 @@ impl<T: 'static> OnceFut<T> {
 pub(crate) fn need_produce_result_in_final(join_type: JoinType) -> bool {
     matches!(
         join_type,
-        JoinType::Left | JoinType::LeftAnti | JoinType::LeftSemi | JoinType::Full
+        JoinType::Left
+            | JoinType::LeftAnti
+            | JoinType::LeftSemi
+            | JoinType::LeftMark
+            | JoinType::Full
     )
 }
 
@@ -1120,6 +1126,13 @@ pub(crate) fn get_final_indices_from_bit_map(
     join_type: JoinType,
 ) -> (UInt64Array, UInt32Array) {
     let left_size = left_bit_map.len();
+    if join_type == JoinType::LeftMark {
+        let left_indices = (0..left_size as u64).collect::<UInt64Array>();
+        let right_indices = (0..left_size)
+            .map(|idx| left_bit_map.get_bit(idx).then_some(0))
+            .collect::<UInt32Array>();
+        return (left_indices, right_indices);
+    }
     let left_indices = if join_type == JoinType::LeftSemi {
         (0..left_size)
             .filter_map(|idx| (left_bit_map.get_bit(idx)).then_some(idx as u64))
@@ -1203,7 +1216,10 @@ pub(crate) fn build_batch_from_indices(
     let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(schema.fields().len());
 
     for column_index in column_indices {
-        let array = if column_index.side == build_side {
+        let array = if column_index.side == JoinSide::None {
+            // LeftMark join, the mark column is a true if the indices is not null, otherwise it will be false
+            Arc::new(compute::is_not_null(probe_indices)?)
+        } else if column_index.side == build_side {
             let array = build_input_buffer.column(column_index.index);
             if array.is_empty() || build_indices.null_count() == build_indices.len() {
                 // Outer join would generate a null index when finding no match at our side.
@@ -1235,72 +1251,133 @@ pub(crate) fn adjust_indices_by_join_type(
     right_indices: UInt32Array,
     adjust_range: Range<usize>,
     join_type: JoinType,
-) -> (UInt64Array, UInt32Array) {
+    preserve_order_for_right: bool,
+) -> Result<(UInt64Array, UInt32Array)> {
     match join_type {
         JoinType::Inner => {
             // matched
-            (left_indices, right_indices)
+            Ok((left_indices, right_indices))
         }
         JoinType::Left => {
             // matched
-            (left_indices, right_indices)
+            Ok((left_indices, right_indices))
             // unmatched left row will be produced in the end of loop, and it has been set in the left visited bitmap
         }
-        JoinType::Right | JoinType::Full => {
-            // matched
-            // unmatched right row will be produced in this batch
-            let right_unmatched_indices = get_anti_indices(adjust_range, &right_indices);
+        JoinType::Right => {
             // combine the matched and unmatched right result together
-            append_right_indices(left_indices, right_indices, right_unmatched_indices)
+            append_right_indices(
+                left_indices,
+                right_indices,
+                adjust_range,
+                preserve_order_for_right,
+            )
+        }
+        JoinType::Full => {
+            append_right_indices(left_indices, right_indices, adjust_range, false)
         }
         JoinType::RightSemi => {
             // need to remove the duplicated record in the right side
             let right_indices = get_semi_indices(adjust_range, &right_indices);
             // the left_indices will not be used later for the `right semi` join
-            (left_indices, right_indices)
+            Ok((left_indices, right_indices))
         }
         JoinType::RightAnti => {
             // need to remove the duplicated record in the right side
             // get the anti index for the right side
             let right_indices = get_anti_indices(adjust_range, &right_indices);
             // the left_indices will not be used later for the `right anti` join
-            (left_indices, right_indices)
+            Ok((left_indices, right_indices))
         }
-        JoinType::LeftSemi | JoinType::LeftAnti => {
+        JoinType::LeftSemi | JoinType::LeftAnti | JoinType::LeftMark => {
             // matched or unmatched left row will be produced in the end of loop
             // When visit the right batch, we can output the matched left row and don't need to wait the end of loop
-            (
+            Ok((
                 UInt64Array::from_iter_values(vec![]),
                 UInt32Array::from_iter_values(vec![]),
-            )
+            ))
         }
     }
 }
 
-/// Appends the `right_unmatched_indices` to the `right_indices`,
-/// and fills Null to tail of `left_indices` to
-/// keep the length of `right_indices` and `left_indices` consistent.
+/// Appends right indices to left indices based on the specified order mode.
+///
+/// The function operates in two modes:
+/// 1. If `preserve_order_for_right` is true, probe matched and unmatched indices
+///    are inserted in order using the `append_probe_indices_in_order()` method.
+/// 2. Otherwise, unmatched probe indices are simply appended after matched ones.
+///
+/// # Parameters
+/// - `left_indices`: UInt64Array of left indices.
+/// - `right_indices`: UInt32Array of right indices.
+/// - `adjust_range`: Range to adjust the right indices.
+/// - `preserve_order_for_right`: Boolean flag to determine the mode of operation.
+///
+/// # Returns
+/// A tuple of updated `UInt64Array` and `UInt32Array`.
 pub(crate) fn append_right_indices(
     left_indices: UInt64Array,
     right_indices: UInt32Array,
-    right_unmatched_indices: UInt32Array,
-) -> (UInt64Array, UInt32Array) {
-    // left_indices, right_indices and right_unmatched_indices must not contain the null value
-    if right_unmatched_indices.is_empty() {
-        (left_indices, right_indices)
+    adjust_range: Range<usize>,
+    preserve_order_for_right: bool,
+) -> Result<(UInt64Array, UInt32Array)> {
+    if preserve_order_for_right {
+        Ok(append_probe_indices_in_order(
+            left_indices,
+            right_indices,
+            adjust_range,
+        ))
     } else {
-        let unmatched_size = right_unmatched_indices.len();
-        // the new left indices: left_indices + null array
-        // the new right indices: right_indices + right_unmatched_indices
-        let new_left_indices = left_indices
-            .iter()
-            .chain(std::iter::repeat(None).take(unmatched_size))
-            .collect::<UInt64Array>();
-        let new_right_indices = right_indices
-            .iter()
-            .chain(right_unmatched_indices.iter())
-            .collect::<UInt32Array>();
-        (new_left_indices, new_right_indices)
+        let right_unmatched_indices = get_anti_indices(adjust_range, &right_indices);
+
+        if right_unmatched_indices.is_empty() {
+            Ok((left_indices, right_indices))
+        } else {
+            // `into_builder()` can fail here when there is nothing to be filtered and
+            // left_indices or right_indices has the same reference to the cached indices.
+            // In that case, we use a slower alternative.
+
+            // the new left indices: left_indices + null array
+            let mut new_left_indices_builder =
+                left_indices.into_builder().unwrap_or_else(|left_indices| {
+                    let mut builder = UInt64Builder::with_capacity(
+                        left_indices.len() + right_unmatched_indices.len(),
+                    );
+                    debug_assert_eq!(
+                        left_indices.null_count(),
+                        0,
+                        "expected left indices to have no nulls"
+                    );
+                    builder.append_slice(left_indices.values());
+                    builder
+                });
+            new_left_indices_builder.append_nulls(right_unmatched_indices.len());
+            let new_left_indices = UInt64Array::from(new_left_indices_builder.finish());
+
+            // the new right indices: right_indices + right_unmatched_indices
+            let mut new_right_indices_builder = right_indices
+                .into_builder()
+                .unwrap_or_else(|right_indices| {
+                    let mut builder = UInt32Builder::with_capacity(
+                        right_indices.len() + right_unmatched_indices.len(),
+                    );
+                    debug_assert_eq!(
+                        right_indices.null_count(),
+                        0,
+                        "expected right indices to have no nulls"
+                    );
+                    builder.append_slice(right_indices.values());
+                    builder
+                });
+            debug_assert_eq!(
+                right_unmatched_indices.null_count(),
+                0,
+                "expected right unmatched indices to have no nulls"
+            );
+            new_right_indices_builder.append_slice(right_unmatched_indices.values());
+            let new_right_indices = UInt32Array::from(new_right_indices_builder.finish());
+
+            Ok((new_left_indices, new_right_indices))
+        }
     }
 }
 
@@ -1330,7 +1407,7 @@ where
         .filter_map(|idx| {
             (!bitmap.get_bit(idx - offset)).then_some(T::Native::from_usize(idx))
         })
-        .collect::<PrimitiveArray<T>>()
+        .collect()
 }
 
 /// Returns intersection of `range` and `input_indices` omitting duplicates
@@ -1359,7 +1436,61 @@ where
         .filter_map(|idx| {
             (bitmap.get_bit(idx - offset)).then_some(T::Native::from_usize(idx))
         })
-        .collect::<PrimitiveArray<T>>()
+        .collect()
+}
+
+/// Appends probe indices in order by considering the given build indices.
+///
+/// This function constructs new build and probe indices by iterating through
+/// the provided indices, and appends any missing values between previous and
+/// current probe index with a corresponding null build index.
+///
+/// # Parameters
+///
+/// - `build_indices`: `PrimitiveArray` of `UInt64Type` containing build indices.
+/// - `probe_indices`: `PrimitiveArray` of `UInt32Type` containing probe indices.
+/// - `range`: The range of indices to consider.
+///
+/// # Returns
+///
+/// A tuple of two arrays:
+/// - A `PrimitiveArray` of `UInt64Type` with the newly constructed build indices.
+/// - A `PrimitiveArray` of `UInt32Type` with the newly constructed probe indices.
+fn append_probe_indices_in_order(
+    build_indices: PrimitiveArray<UInt64Type>,
+    probe_indices: PrimitiveArray<UInt32Type>,
+    range: Range<usize>,
+) -> (PrimitiveArray<UInt64Type>, PrimitiveArray<UInt32Type>) {
+    // Builders for new indices:
+    let mut new_build_indices = UInt64Builder::new();
+    let mut new_probe_indices = UInt32Builder::new();
+    // Set previous index as the start index for the initial loop:
+    let mut prev_index = range.start as u32;
+    // Zip the two iterators.
+    debug_assert!(build_indices.len() == probe_indices.len());
+    for (build_index, probe_index) in build_indices
+        .values()
+        .into_iter()
+        .zip(probe_indices.values().into_iter())
+    {
+        // Append values between previous and current probe index with null build index:
+        for value in prev_index..*probe_index {
+            new_probe_indices.append_value(value);
+            new_build_indices.append_null();
+        }
+        // Append current indices:
+        new_probe_indices.append_value(*probe_index);
+        new_build_indices.append_value(*build_index);
+        // Set current probe index as previous for the next iteration:
+        prev_index = probe_index + 1;
+    }
+    // Append remaining probe indices after the last valid probe index with null build index.
+    for value in prev_index..range.end as u32 {
+        new_probe_indices.append_value(value);
+        new_build_indices.append_null();
+    }
+    // Build arrays and return:
+    (new_build_indices.finish(), new_probe_indices.finish())
 }
 
 /// Metrics for build & probe joins
@@ -1425,10 +1556,9 @@ impl BuildProbeJoinMetrics {
 }
 
 /// The `handle_state` macro is designed to process the result of a state-changing
-/// operation, encountered e.g. in implementations of `EagerJoinStream`. It
-/// operates on a `StatefulStreamResult` by matching its variants and executing
-/// corresponding actions. This macro is used to streamline code that deals with
-/// state transitions, reducing boilerplate and improving readability.
+/// operation. It operates on a `StatefulStreamResult` by matching its variants and
+/// executing corresponding actions. This macro is used to streamline code that deals
+/// with state transitions, reducing boilerplate and improving readability.
 ///
 /// # Cases
 ///
@@ -1456,28 +1586,9 @@ macro_rules! handle_state {
     };
 }
 
-/// The `handle_async_state` macro adapts the `handle_state` macro for use in
-/// asynchronous operations, particularly when dealing with `Poll` results within
-/// async traits like `EagerJoinStream`. It polls the asynchronous state-changing
-/// function using `poll_unpin` and then passes the result to `handle_state` for
-/// further processing.
+/// Represents the result of a stateful operation.
 ///
-/// # Arguments
-///
-/// * `$state_func`: An async function or future that returns a
-///   `Result<StatefulStreamResult<_>>`.
-/// * `$cx`: The context to be passed for polling, usually of type `&mut Context`.
-///
-#[macro_export]
-macro_rules! handle_async_state {
-    ($state_func:expr, $cx:expr) => {
-        $crate::handle_state!(ready!($state_func.poll_unpin($cx)))
-    };
-}
-
-/// Represents the result of an operation on stateful join stream.
-///
-/// This enumueration indicates whether the state produced a result that is
+/// This enumeration indicates whether the state produced a result that is
 /// ready for use (`Ready`) or if the operation requires continuation (`Continue`).
 ///
 /// Variants:
@@ -1491,6 +1602,179 @@ pub enum StatefulStreamResult<T> {
     Continue,
 }
 
+pub(crate) fn symmetric_join_output_partitioning(
+    left: &Arc<dyn ExecutionPlan>,
+    right: &Arc<dyn ExecutionPlan>,
+    join_type: &JoinType,
+) -> Partitioning {
+    let left_columns_len = left.schema().fields.len();
+    let left_partitioning = left.output_partitioning();
+    let right_partitioning = right.output_partitioning();
+    match join_type {
+        JoinType::Left | JoinType::LeftSemi | JoinType::LeftAnti | JoinType::LeftMark => {
+            left_partitioning.clone()
+        }
+        JoinType::RightSemi | JoinType::RightAnti => right_partitioning.clone(),
+        JoinType::Inner | JoinType::Right => {
+            adjust_right_output_partitioning(right_partitioning, left_columns_len)
+        }
+        JoinType::Full => {
+            // We could also use left partition count as they are necessarily equal.
+            Partitioning::UnknownPartitioning(right_partitioning.partition_count())
+        }
+    }
+}
+
+pub(crate) fn asymmetric_join_output_partitioning(
+    left: &Arc<dyn ExecutionPlan>,
+    right: &Arc<dyn ExecutionPlan>,
+    join_type: &JoinType,
+) -> Partitioning {
+    match join_type {
+        JoinType::Inner | JoinType::Right => adjust_right_output_partitioning(
+            right.output_partitioning(),
+            left.schema().fields().len(),
+        ),
+        JoinType::RightSemi | JoinType::RightAnti => right.output_partitioning().clone(),
+        JoinType::Left
+        | JoinType::LeftSemi
+        | JoinType::LeftAnti
+        | JoinType::Full
+        | JoinType::LeftMark => Partitioning::UnknownPartitioning(
+            right.output_partitioning().partition_count(),
+        ),
+    }
+}
+
+/// Trait for incrementally generating Join output.
+///
+/// This trait is used to limit some join outputs
+/// so it does not produce single large batches
+pub(crate) trait BatchTransformer: Debug + Clone {
+    /// Sets the next `RecordBatch` to be processed.
+    fn set_batch(&mut self, batch: RecordBatch);
+
+    /// Retrieves the next `RecordBatch` from the transformer.
+    /// Returns `None` if all batches have been produced.
+    /// The boolean flag indicates whether the batch is the last one.
+    fn next(&mut self) -> Option<(RecordBatch, bool)>;
+}
+
+#[derive(Debug, Clone)]
+/// A batch transformer that does nothing.
+pub(crate) struct NoopBatchTransformer {
+    /// RecordBatch to be processed
+    batch: Option<RecordBatch>,
+}
+
+impl NoopBatchTransformer {
+    pub fn new() -> Self {
+        Self { batch: None }
+    }
+}
+
+impl BatchTransformer for NoopBatchTransformer {
+    fn set_batch(&mut self, batch: RecordBatch) {
+        self.batch = Some(batch);
+    }
+
+    fn next(&mut self) -> Option<(RecordBatch, bool)> {
+        self.batch.take().map(|batch| (batch, true))
+    }
+}
+
+#[derive(Debug, Clone)]
+/// Splits large batches into smaller batches with a maximum number of rows.
+pub(crate) struct BatchSplitter {
+    /// RecordBatch to be split
+    batch: Option<RecordBatch>,
+    /// Maximum number of rows in a split batch
+    batch_size: usize,
+    /// Current row index
+    row_index: usize,
+}
+
+impl BatchSplitter {
+    /// Creates a new `BatchSplitter` with the specified batch size.
+    pub(crate) fn new(batch_size: usize) -> Self {
+        Self {
+            batch: None,
+            batch_size,
+            row_index: 0,
+        }
+    }
+}
+
+impl BatchTransformer for BatchSplitter {
+    fn set_batch(&mut self, batch: RecordBatch) {
+        self.batch = Some(batch);
+        self.row_index = 0;
+    }
+
+    fn next(&mut self) -> Option<(RecordBatch, bool)> {
+        let Some(batch) = &self.batch else {
+            return None;
+        };
+
+        let remaining_rows = batch.num_rows() - self.row_index;
+        let rows_to_slice = remaining_rows.min(self.batch_size);
+        let sliced_batch = batch.slice(self.row_index, rows_to_slice);
+        self.row_index += rows_to_slice;
+
+        let mut last = false;
+        if self.row_index >= batch.num_rows() {
+            self.batch = None;
+            last = true;
+        }
+
+        Some((sliced_batch, last))
+    }
+}
+
+/// When the order of the join inputs are changed, the output order of columns
+/// must remain the same.
+///
+/// Joins output columns from their left input followed by their right input.
+/// Thus if the inputs are reordered, the output columns must be reordered to
+/// match the original order.
+pub(crate) fn reorder_output_after_swap(
+    plan: Arc<dyn ExecutionPlan>,
+    left_schema: &Schema,
+    right_schema: &Schema,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let proj = ProjectionExec::try_new(
+        swap_reverting_projection(left_schema, right_schema),
+        plan,
+    )?;
+    Ok(Arc::new(proj))
+}
+
+/// When the order of the join is changed, the output order of columns must
+/// remain the same.
+///
+/// Returns the expressions that will allow to swap back the values from the
+/// original left as the first columns and those on the right next.
+fn swap_reverting_projection(
+    left_schema: &Schema,
+    right_schema: &Schema,
+) -> Vec<(Arc<dyn PhysicalExpr>, String)> {
+    let right_cols = right_schema.fields().iter().enumerate().map(|(i, f)| {
+        (
+            Arc::new(Column::new(f.name(), i)) as Arc<dyn PhysicalExpr>,
+            f.name().to_owned(),
+        )
+    });
+    let right_len = right_cols.len();
+    let left_cols = left_schema.fields().iter().enumerate().map(|(i, f)| {
+        (
+            Arc::new(Column::new(f.name(), right_len + i)) as Arc<dyn PhysicalExpr>,
+            f.name().to_owned(),
+        )
+    });
+
+    left_cols.chain(right_cols).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::pin::Pin;
@@ -1499,10 +1783,12 @@ mod tests {
 
     use arrow::datatypes::{DataType, Fields};
     use arrow::error::{ArrowError, Result as ArrowResult};
+    use arrow_array::Int32Array;
     use arrow_schema::SortOptions;
-
     use datafusion_common::stats::Precision::{Absent, Exact, Inexact};
     use datafusion_common::{arrow_datafusion_err, arrow_err, ScalarValue};
+
+    use rstest::rstest;
 
     fn check(
         left: &[Column],
@@ -1677,13 +1963,13 @@ mod tests {
     ) -> Statistics {
         Statistics {
             num_rows: if is_exact {
-                num_rows.map(Precision::Exact)
+                num_rows.map(Exact)
             } else {
-                num_rows.map(Precision::Inexact)
+                num_rows.map(Inexact)
             }
-            .unwrap_or(Precision::Absent),
+            .unwrap_or(Absent),
             column_statistics: column_stats,
-            total_byte_size: Precision::Absent,
+            total_byte_size: Absent,
         }
     }
 
@@ -1715,9 +2001,11 @@ mod tests {
     #[test]
     fn test_inner_join_cardinality_single_column() -> Result<()> {
         let cases: Vec<(PartialStats, PartialStats, Option<Precision<usize>>)> = vec![
-            // -----------------------------------------------------------------------------
-            // | left(rows, min, max, distinct), right(rows, min, max, distinct), expected |
-            // -----------------------------------------------------------------------------
+            // ------------------------------------------------
+            // | left(rows, min, max, distinct, null_count),  |
+            // | right(rows, min, max, distinct, null_count), |
+            // | expected,                                    |
+            // ------------------------------------------------
 
             // Cardinality computation
             // =======================
@@ -1824,6 +2112,11 @@ mod tests {
             ),
             // Non overlapping min/max (when exact=False).
             (
+                (10, Absent, Inexact(4), Absent, Absent),
+                (10, Inexact(5), Absent, Absent, Absent),
+                Some(Inexact(0)),
+            ),
+            (
                 (10, Inexact(0), Inexact(10), Absent, Absent),
                 (10, Inexact(11), Inexact(20), Absent, Absent),
                 Some(Inexact(0)),
@@ -1899,9 +2192,7 @@ mod tests {
             );
             assert_eq!(
                 partial_join_stats.map(|s| s.column_statistics),
-                expected_cardinality
-                    .clone()
-                    .map(|_| [left_col_stats, right_col_stats].concat())
+                expected_cardinality.map(|_| [left_col_stats, right_col_stats].concat())
             );
         }
         Ok(())
@@ -1924,17 +2215,17 @@ mod tests {
         assert_eq!(
             estimate_inner_join_cardinality(
                 Statistics {
-                    num_rows: Precision::Inexact(400),
-                    total_byte_size: Precision::Absent,
+                    num_rows: Inexact(400),
+                    total_byte_size: Absent,
                     column_statistics: left_col_stats,
                 },
                 Statistics {
-                    num_rows: Precision::Inexact(400),
-                    total_byte_size: Precision::Absent,
+                    num_rows: Inexact(400),
+                    total_byte_size: Absent,
                     column_statistics: right_col_stats,
                 },
             ),
-            Some(Precision::Inexact((400 * 400) / 200))
+            Some(Inexact((400 * 400) / 200))
         );
         Ok(())
     }
@@ -1942,33 +2233,33 @@ mod tests {
     #[test]
     fn test_inner_join_cardinality_decimal_range() -> Result<()> {
         let left_col_stats = vec![ColumnStatistics {
-            distinct_count: Precision::Absent,
-            min_value: Precision::Inexact(ScalarValue::Decimal128(Some(32500), 14, 4)),
-            max_value: Precision::Inexact(ScalarValue::Decimal128(Some(35000), 14, 4)),
+            distinct_count: Absent,
+            min_value: Inexact(ScalarValue::Decimal128(Some(32500), 14, 4)),
+            max_value: Inexact(ScalarValue::Decimal128(Some(35000), 14, 4)),
             ..Default::default()
         }];
 
         let right_col_stats = vec![ColumnStatistics {
-            distinct_count: Precision::Absent,
-            min_value: Precision::Inexact(ScalarValue::Decimal128(Some(33500), 14, 4)),
-            max_value: Precision::Inexact(ScalarValue::Decimal128(Some(34000), 14, 4)),
+            distinct_count: Absent,
+            min_value: Inexact(ScalarValue::Decimal128(Some(33500), 14, 4)),
+            max_value: Inexact(ScalarValue::Decimal128(Some(34000), 14, 4)),
             ..Default::default()
         }];
 
         assert_eq!(
             estimate_inner_join_cardinality(
                 Statistics {
-                    num_rows: Precision::Inexact(100),
-                    total_byte_size: Precision::Absent,
+                    num_rows: Inexact(100),
+                    total_byte_size: Absent,
                     column_statistics: left_col_stats,
                 },
                 Statistics {
-                    num_rows: Precision::Inexact(100),
-                    total_byte_size: Precision::Absent,
+                    num_rows: Inexact(100),
+                    total_byte_size: Absent,
                     column_statistics: right_col_stats,
                 },
             ),
-            Some(Precision::Inexact(100))
+            Some(Inexact(100))
         );
         Ok(())
     }
@@ -2106,9 +2397,207 @@ mod tests {
     }
 
     #[test]
+    fn test_anti_semi_join_cardinality() -> Result<()> {
+        let cases: Vec<(JoinType, PartialStats, PartialStats, Option<usize>)> = vec![
+            // ------------------------------------------------
+            // | join_type ,                                   |
+            // | left(rows, min, max, distinct, null_count), |
+            // | right(rows, min, max, distinct, null_count), |
+            // | expected,                                    |
+            // ------------------------------------------------
+
+            // Cardinality computation
+            // =======================
+            (
+                JoinType::LeftSemi,
+                (50, Inexact(10), Inexact(20), Absent, Absent),
+                (10, Inexact(15), Inexact(25), Absent, Absent),
+                Some(50),
+            ),
+            (
+                JoinType::RightSemi,
+                (50, Inexact(10), Inexact(20), Absent, Absent),
+                (10, Inexact(15), Inexact(25), Absent, Absent),
+                Some(10),
+            ),
+            (
+                JoinType::LeftSemi,
+                (10, Absent, Absent, Absent, Absent),
+                (50, Absent, Absent, Absent, Absent),
+                Some(10),
+            ),
+            (
+                JoinType::LeftSemi,
+                (50, Inexact(10), Inexact(20), Absent, Absent),
+                (10, Inexact(30), Inexact(40), Absent, Absent),
+                Some(0),
+            ),
+            (
+                JoinType::LeftSemi,
+                (50, Inexact(10), Absent, Absent, Absent),
+                (10, Absent, Inexact(5), Absent, Absent),
+                Some(0),
+            ),
+            (
+                JoinType::LeftSemi,
+                (50, Absent, Inexact(20), Absent, Absent),
+                (10, Inexact(30), Absent, Absent, Absent),
+                Some(0),
+            ),
+            (
+                JoinType::LeftAnti,
+                (50, Inexact(10), Inexact(20), Absent, Absent),
+                (10, Inexact(15), Inexact(25), Absent, Absent),
+                Some(50),
+            ),
+            (
+                JoinType::RightAnti,
+                (50, Inexact(10), Inexact(20), Absent, Absent),
+                (10, Inexact(15), Inexact(25), Absent, Absent),
+                Some(10),
+            ),
+            (
+                JoinType::LeftAnti,
+                (10, Absent, Absent, Absent, Absent),
+                (50, Absent, Absent, Absent, Absent),
+                Some(10),
+            ),
+            (
+                JoinType::LeftAnti,
+                (50, Inexact(10), Inexact(20), Absent, Absent),
+                (10, Inexact(30), Inexact(40), Absent, Absent),
+                Some(50),
+            ),
+            (
+                JoinType::LeftAnti,
+                (50, Inexact(10), Absent, Absent, Absent),
+                (10, Absent, Inexact(5), Absent, Absent),
+                Some(50),
+            ),
+            (
+                JoinType::LeftAnti,
+                (50, Absent, Inexact(20), Absent, Absent),
+                (10, Inexact(30), Absent, Absent, Absent),
+                Some(50),
+            ),
+        ];
+
+        let join_on = vec![(
+            Arc::new(Column::new("l_col", 0)) as _,
+            Arc::new(Column::new("r_col", 0)) as _,
+        )];
+
+        for (join_type, outer_info, inner_info, expected) in cases {
+            let outer_num_rows = outer_info.0;
+            let outer_col_stats = vec![create_column_stats(
+                outer_info.1,
+                outer_info.2,
+                outer_info.3,
+                outer_info.4,
+            )];
+
+            let inner_num_rows = inner_info.0;
+            let inner_col_stats = vec![create_column_stats(
+                inner_info.1,
+                inner_info.2,
+                inner_info.3,
+                inner_info.4,
+            )];
+
+            let output_cardinality = estimate_join_cardinality(
+                &join_type,
+                Statistics {
+                    num_rows: Inexact(outer_num_rows),
+                    total_byte_size: Absent,
+                    column_statistics: outer_col_stats,
+                },
+                Statistics {
+                    num_rows: Inexact(inner_num_rows),
+                    total_byte_size: Absent,
+                    column_statistics: inner_col_stats,
+                },
+                &join_on,
+            )
+            .map(|cardinality| cardinality.num_rows);
+
+            assert_eq!(
+                output_cardinality, expected,
+                "failure for join_type: {}",
+                join_type
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_semi_join_cardinality_absent_rows() -> Result<()> {
+        let dummy_column_stats =
+            vec![create_column_stats(Absent, Absent, Absent, Absent)];
+        let join_on = vec![(
+            Arc::new(Column::new("l_col", 0)) as _,
+            Arc::new(Column::new("r_col", 0)) as _,
+        )];
+
+        let absent_outer_estimation = estimate_join_cardinality(
+            &JoinType::LeftSemi,
+            Statistics {
+                num_rows: Absent,
+                total_byte_size: Absent,
+                column_statistics: dummy_column_stats.clone(),
+            },
+            Statistics {
+                num_rows: Exact(10),
+                total_byte_size: Absent,
+                column_statistics: dummy_column_stats.clone(),
+            },
+            &join_on,
+        );
+        assert!(
+            absent_outer_estimation.is_none(),
+            "Expected \"None\" estimated SemiJoin cardinality for absent outer num_rows"
+        );
+
+        let absent_inner_estimation = estimate_join_cardinality(
+            &JoinType::LeftSemi,
+            Statistics {
+                num_rows: Inexact(500),
+                total_byte_size: Absent,
+                column_statistics: dummy_column_stats.clone(),
+            },
+            Statistics {
+                num_rows: Absent,
+                total_byte_size: Absent,
+                column_statistics: dummy_column_stats.clone(),
+            },
+            &join_on,
+        ).expect("Expected non-empty PartialJoinStatistics for SemiJoin with absent inner num_rows");
+
+        assert_eq!(absent_inner_estimation.num_rows, 500, "Expected outer.num_rows estimated SemiJoin cardinality for absent inner num_rows");
+
+        let absent_inner_estimation = estimate_join_cardinality(
+            &JoinType::LeftSemi,
+            Statistics {
+                num_rows: Absent,
+                total_byte_size: Absent,
+                column_statistics: dummy_column_stats.clone(),
+            },
+            Statistics {
+                num_rows: Absent,
+                total_byte_size: Absent,
+                column_statistics: dummy_column_stats,
+            },
+            &join_on,
+        );
+        assert!(absent_inner_estimation.is_none(), "Expected \"None\" estimated SemiJoin cardinality for absent outer and inner num_rows");
+
+        Ok(())
+    }
+
+    #[test]
     fn test_calculate_join_output_ordering() -> Result<()> {
         let options = SortOptions::default();
-        let left_ordering = vec![
+        let left_ordering = LexOrdering::new(vec![
             PhysicalSortExpr {
                 expr: Arc::new(Column::new("a", 0)),
                 options,
@@ -2121,8 +2610,8 @@ mod tests {
                 expr: Arc::new(Column::new("d", 3)),
                 options,
             },
-        ];
-        let right_ordering = vec![
+        ]);
+        let right_ordering = LexOrdering::new(vec![
             PhysicalSortExpr {
                 expr: Arc::new(Column::new("z", 2)),
                 options,
@@ -2131,7 +2620,7 @@ mod tests {
                 expr: Arc::new(Column::new("y", 1)),
                 options,
             },
-        ];
+        ]);
         let join_type = JoinType::Inner;
         let on_columns = [(
             Arc::new(Column::new("b", 1)) as _,
@@ -2142,7 +2631,7 @@ mod tests {
         let probe_sides = [Some(JoinSide::Left), Some(JoinSide::Right)];
 
         let expected = [
-            Some(vec![
+            Some(LexOrdering::new(vec![
                 PhysicalSortExpr {
                     expr: Arc::new(Column::new("a", 0)),
                     options,
@@ -2163,8 +2652,8 @@ mod tests {
                     expr: Arc::new(Column::new("y", 6)),
                     options,
                 },
-            ]),
-            Some(vec![
+            ])),
+            Some(LexOrdering::new(vec![
                 PhysicalSortExpr {
                     expr: Arc::new(Column::new("z", 7)),
                     options,
@@ -2185,7 +2674,7 @@ mod tests {
                     expr: Arc::new(Column::new("d", 3)),
                     options,
                 },
-            ]),
+            ])),
         ];
 
         for (i, (maintains_input_order, probe_side)) in
@@ -2193,18 +2682,98 @@ mod tests {
         {
             assert_eq!(
                 calculate_join_output_ordering(
-                    &left_ordering,
-                    &right_ordering,
+                    left_ordering.as_ref(),
+                    right_ordering.as_ref(),
                     join_type,
                     &on_columns,
                     left_columns_len,
                     maintains_input_order,
-                    probe_side
+                    probe_side,
                 ),
                 expected[i]
             );
         }
 
         Ok(())
+    }
+
+    fn create_test_batch(num_rows: usize) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let data = Arc::new(Int32Array::from_iter_values(0..num_rows as i32));
+        RecordBatch::try_new(schema, vec![data]).unwrap()
+    }
+
+    fn assert_split_batches(
+        batches: Vec<(RecordBatch, bool)>,
+        batch_size: usize,
+        num_rows: usize,
+    ) {
+        let mut row_count = 0;
+        for (batch, last) in batches.into_iter() {
+            assert_eq!(batch.num_rows(), (num_rows - row_count).min(batch_size));
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                assert_eq!(column.value(i), i as i32 + row_count as i32);
+            }
+            row_count += batch.num_rows();
+            assert_eq!(last, row_count == num_rows);
+        }
+    }
+
+    #[rstest]
+    #[test]
+    fn test_batch_splitter(
+        #[values(1, 3, 11)] batch_size: usize,
+        #[values(1, 6, 50)] num_rows: usize,
+    ) {
+        let mut splitter = BatchSplitter::new(batch_size);
+        splitter.set_batch(create_test_batch(num_rows));
+
+        let mut batches = Vec::with_capacity(num_rows.div_ceil(batch_size));
+        while let Some(batch) = splitter.next() {
+            batches.push(batch);
+        }
+
+        assert!(splitter.next().is_none());
+        assert_split_batches(batches, batch_size, num_rows);
+    }
+
+    #[tokio::test]
+    async fn test_swap_reverting_projection() {
+        let left_schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]);
+
+        let right_schema = Schema::new(vec![Field::new("c", DataType::Int32, false)]);
+
+        let proj = swap_reverting_projection(&left_schema, &right_schema);
+
+        assert_eq!(proj.len(), 3);
+
+        let (col, name) = &proj[0];
+        assert_eq!(name, "a");
+        assert_col_expr(col, "a", 1);
+
+        let (col, name) = &proj[1];
+        assert_eq!(name, "b");
+        assert_col_expr(col, "b", 2);
+
+        let (col, name) = &proj[2];
+        assert_eq!(name, "c");
+        assert_col_expr(col, "c", 0);
+    }
+
+    fn assert_col_expr(expr: &Arc<dyn PhysicalExpr>, name: &str, index: usize) {
+        let col = expr
+            .as_any()
+            .downcast_ref::<Column>()
+            .expect("Projection items should be Column expression");
+        assert_eq!(col.name(), name);
+        assert_eq!(col.index(), index);
     }
 }

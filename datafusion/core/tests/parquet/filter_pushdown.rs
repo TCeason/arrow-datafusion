@@ -26,7 +26,7 @@
 //! select * from data limit 10;
 //! ```
 
-use std::time::Instant;
+use std::path::Path;
 
 use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
@@ -34,7 +34,9 @@ use datafusion::physical_plan::collect;
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::prelude::{col, lit, lit_timestamp_nano, Expr, SessionContext};
 use datafusion::test_util::parquet::{ParquetScanOptions, TestParquetFile};
+use datafusion_common::instant::Instant;
 use datafusion_expr::utils::{conjunction, disjunction, split_conjunction};
+
 use itertools::Itertools;
 use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
@@ -63,12 +65,11 @@ fn generate_file(tempdir: &TempDir, props: WriterProperties) -> TestParquetFile 
     test_parquet_file
 }
 
-#[cfg(not(target_family = "windows"))]
 #[tokio::test]
 async fn single_file() {
     // Only create the parquet file once as it is fairly large
 
-    let tempdir = TempDir::new().unwrap();
+    let tempdir = TempDir::new_in(Path::new(".")).unwrap();
     // Set row group size smaller so can test with fewer rows
     let props = WriterProperties::builder()
         .set_max_row_group_size(1024)
@@ -222,10 +223,9 @@ async fn single_file() {
     case.run().await;
 }
 
-#[cfg(not(target_family = "windows"))]
 #[tokio::test]
 async fn single_file_small_data_pages() {
-    let tempdir = TempDir::new().unwrap();
+    let tempdir = TempDir::new_in(Path::new(".")).unwrap();
 
     // Set low row count limit to improve page filtering
     let props = WriterProperties::builder()
@@ -510,7 +510,7 @@ impl<'a> TestCase<'a> {
         let ctx = SessionContext::new_with_config(scan_options.config());
         let exec = self
             .test_parquet_file
-            .create_scan(Some(filter.clone()))
+            .create_scan(&ctx, Some(filter.clone()))
             .await
             .unwrap();
         let result = collect(exec.clone(), ctx.task_ctx()).await.unwrap();
@@ -531,7 +531,7 @@ impl<'a> TestCase<'a> {
 
         // verify expected pushdown
         let metrics =
-            TestParquetFile::parquet_metrics(exec).expect("found parquet metrics");
+            TestParquetFile::parquet_metrics(&exec).expect("found parquet metrics");
 
         let pushdown_expected = if scan_options.pushdown_filters {
             self.pushdown_expected
@@ -540,24 +540,28 @@ impl<'a> TestCase<'a> {
             PushdownExpected::None
         };
 
-        let pushdown_rows_filtered = get_value(&metrics, "pushdown_rows_filtered");
-        println!("  pushdown_rows_filtered: {pushdown_rows_filtered}");
+        let pushdown_rows_pruned = get_value(&metrics, "pushdown_rows_pruned");
+        println!("  pushdown_rows_pruned: {pushdown_rows_pruned}");
+        let pushdown_rows_matched = get_value(&metrics, "pushdown_rows_matched");
+        println!("  pushdown_rows_matched: {pushdown_rows_matched}");
 
         match pushdown_expected {
             PushdownExpected::None => {
-                assert_eq!(pushdown_rows_filtered, 0, "{}", self.name);
+                assert_eq!(pushdown_rows_pruned, 0, "{}", self.name);
             }
             PushdownExpected::Some => {
                 assert!(
-                    pushdown_rows_filtered > 0,
+                    pushdown_rows_pruned > 0,
                     "{}: Expected to filter rows via pushdown, but none were",
                     self.name
                 );
             }
         };
 
-        let page_index_rows_filtered = get_value(&metrics, "page_index_rows_filtered");
-        println!(" page_index_rows_filtered: {page_index_rows_filtered}");
+        let page_index_rows_pruned = get_value(&metrics, "page_index_rows_pruned");
+        println!(" page_index_rows_pruned: {page_index_rows_pruned}");
+        let page_index_rows_matched = get_value(&metrics, "page_index_rows_matched");
+        println!(" page_index_rows_matched: {page_index_rows_matched}");
 
         let page_index_filtering_expected = if scan_options.enable_page_index {
             self.page_index_filtering_expected
@@ -569,11 +573,11 @@ impl<'a> TestCase<'a> {
 
         match page_index_filtering_expected {
             PageIndexFilteringExpected::None => {
-                assert_eq!(page_index_rows_filtered, 0);
+                assert_eq!(page_index_rows_pruned, 0);
             }
             PageIndexFilteringExpected::Some => {
                 assert!(
-                    page_index_rows_filtered > 0,
+                    page_index_rows_pruned > 0,
                     "Expected to filter rows via page index but none were",
                 );
             }

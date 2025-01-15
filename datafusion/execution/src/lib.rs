@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Make cheap clones clear: https://github.com/apache/datafusion/issues/11143
+#![deny(clippy::clone_on_ref_ptr)]
+
 //! DataFusion execution configuration and runtime structures
 
 pub mod cache;
@@ -22,10 +25,15 @@ pub mod config;
 pub mod disk_manager;
 pub mod memory_pool;
 pub mod object_store;
-pub mod registry;
 pub mod runtime_env;
 mod stream;
 mod task;
+
+pub mod registry {
+    pub use datafusion_expr::registry::{
+        FunctionRegistry, MemoryFunctionRegistry, SerializerRegistry,
+    };
+}
 
 pub use disk_manager::DiskManager;
 pub use registry::FunctionRegistry;

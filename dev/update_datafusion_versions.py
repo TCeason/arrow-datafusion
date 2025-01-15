@@ -1,21 +1,20 @@
 #!/usr/bin/env python
-
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
 #
-# Licensed to the Apache Software Foundation (ASF) under one or more
-# contributor license agreements.  See the NOTICE file distributed with
-# this work for additional information regarding copyright ownership.
-# The ASF licenses this file to You under the Apache License, Version 2.0
-# (the "License"); you may not use this file except in compliance with
-# the License.  You may obtain a copy of the License at
+#   http://www.apache.org/licenses/LICENSE-2.0
 #
-#    http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
 
 # Script that updates versions for datafusion crates, locally
 #
@@ -28,20 +27,26 @@ from pathlib import Path
 import tomlkit
 
 crates = {
-    'datafusion': 'datafusion/core/Cargo.toml',
-    'datafusion-cli': 'datafusion-cli/Cargo.toml',
     'datafusion-common': 'datafusion/common/Cargo.toml',
-    'datafusion-expr': 'datafusion/expr/Cargo.toml',
+    'datafusion-common-runtime': 'datafusion/common-runtime/Cargo.toml',
+    'datafusion': 'datafusion/core/Cargo.toml',
     'datafusion-execution': 'datafusion/execution/Cargo.toml',
+    'datafusion-expr': 'datafusion/expr/Cargo.toml',
+    'datafusion-ffi': 'datafusion/ffi/Cargo.toml',
+    'datafusion-functions': 'datafusion/functions/Cargo.toml',
+    'datafusion-functions-aggregate': 'datafusion/functions-aggregate/Cargo.toml',
+    'datafusion-functions-nested': 'datafusion/functions-nested/Cargo.toml',
     'datafusion-optimizer': 'datafusion/optimizer/Cargo.toml',
     'datafusion-physical-expr': 'datafusion/physical-expr/Cargo.toml',
+    'datafusion-physical-expr-common': 'datafusion/physical-expr-common/Cargo.toml',
     'datafusion-physical-plan': 'datafusion/physical-plan/Cargo.toml',
     'datafusion-proto': 'datafusion/proto/Cargo.toml',
-    'datafusion-substrait': 'datafusion/substrait/Cargo.toml',
     'datafusion-sql': 'datafusion/sql/Cargo.toml',
     'datafusion-sqllogictest': 'datafusion/sqllogictest/Cargo.toml',
+    'datafusion-substrait': 'datafusion/substrait/Cargo.toml',
     'datafusion-wasmtest': 'datafusion/wasmtest/Cargo.toml',
     'datafusion-benchmarks': 'benchmarks/Cargo.toml',
+    'datafusion-cli': 'datafusion-cli/Cargo.toml',
     'datafusion-examples': 'datafusion-examples/Cargo.toml',
     'datafusion-docs': 'docs/Cargo.toml',
 }
@@ -55,8 +60,17 @@ def update_workspace_version(new_version: str):
     doc = tomlkit.parse(data)
     pkg = doc.get('workspace').get('package')
 
-    print('workspace pacakge', pkg)
+    print('workspace package', pkg)
     pkg['version'] = new_version
+
+    doc = tomlkit.parse(data)
+
+    for crate in crates.keys():
+        df_dep = doc.get('workspace').get('dependencies', {}).get(crate)
+        # skip crates that pin datafusion using git hash
+        if df_dep is not None and df_dep.get('version') is not None:
+            print(f'updating {crate} dependency in {cargo_toml}')
+            df_dep['version'] = new_version
 
     with open(cargo_toml, 'w') as f:
         f.write(tomlkit.dumps(doc))

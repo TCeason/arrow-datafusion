@@ -17,13 +17,27 @@
 
 //! Function module contains typing and signature for built-in and user defined functions.
 
-use crate::{Accumulator, BuiltinScalarFunction, PartitionEvaluator, Signature};
-use crate::{AggregateFunction, BuiltInWindowFunction, ColumnarValue};
+use crate::ColumnarValue;
+use crate::{Expr, PartitionEvaluator};
 use arrow::datatypes::DataType;
-use datafusion_common::utils::datafusion_strsim;
 use datafusion_common::Result;
 use std::sync::Arc;
-use strum::IntoEnumIterator;
+
+pub use datafusion_functions_aggregate_common::accumulator::{
+    AccumulatorArgs, AccumulatorFactoryFunction, StateFieldsArgs,
+};
+
+pub use datafusion_functions_window_common::expr::ExpressionArgs;
+pub use datafusion_functions_window_common::field::WindowUDFFieldArgs;
+pub use datafusion_functions_window_common::partition::PartitionEvaluatorArgs;
+
+#[derive(Debug, Clone, Copy)]
+pub enum Hint {
+    /// Indicates the argument needs to be padded if it is scalar
+    Pad,
+    /// Indicates the argument can be converted to an array of length 1
+    AcceptsSingular,
+}
 
 /// Scalar function
 ///
@@ -40,11 +54,6 @@ pub type ScalarFunctionImplementation =
 pub type ReturnTypeFunction =
     Arc<dyn Fn(&[DataType]) -> Result<Arc<DataType>> + Send + Sync>;
 
-/// Factory that returns an accumulator for the given aggregate, given
-/// its return datatype.
-pub type AccumulatorFactoryFunction =
-    Arc<dyn Fn(&DataType) -> Result<Box<dyn Accumulator>> + Send + Sync>;
-
 /// Factory that creates a PartitionEvaluator for the given window
 /// function
 pub type PartitionEvaluatorFactory =
@@ -55,53 +64,28 @@ pub type PartitionEvaluatorFactory =
 pub type StateTypeFunction =
     Arc<dyn Fn(&DataType) -> Result<Arc<Vec<DataType>>> + Send + Sync>;
 
-/// Returns the datatype of the scalar function
-#[deprecated(
-    since = "27.0.0",
-    note = "please use `BuiltinScalarFunction::return_type` instead"
-)]
-pub fn return_type(
-    fun: &BuiltinScalarFunction,
-    input_expr_types: &[DataType],
-) -> Result<DataType> {
-    fun.return_type(input_expr_types)
-}
+/// [crate::udaf::AggregateUDFImpl::simplify] simplifier closure
+/// A closure with two arguments:
+/// * 'aggregate_function': [crate::expr::AggregateFunction] for which simplified has been invoked
+/// * 'info': [crate::simplify::SimplifyInfo]
+///
+/// Closure returns simplified [Expr] or an error.
+pub type AggregateFunctionSimplification = Box<
+    dyn Fn(
+        crate::expr::AggregateFunction,
+        &dyn crate::simplify::SimplifyInfo,
+    ) -> Result<Expr>,
+>;
 
-/// Return the [`Signature`] supported by the function `fun`.
-#[deprecated(
-    since = "27.0.0",
-    note = "please use `BuiltinScalarFunction::signature` instead"
-)]
-pub fn signature(fun: &BuiltinScalarFunction) -> Signature {
-    fun.signature()
-}
-
-/// Suggest a valid function based on an invalid input function name
-pub fn suggest_valid_function(input_function_name: &str, is_window_func: bool) -> String {
-    let valid_funcs = if is_window_func {
-        // All aggregate functions and builtin window functions
-        AggregateFunction::iter()
-            .map(|func| func.to_string())
-            .chain(BuiltInWindowFunction::iter().map(|func| func.to_string()))
-            .collect()
-    } else {
-        // All scalar functions and aggregate functions
-        BuiltinScalarFunction::iter()
-            .map(|func| func.to_string())
-            .chain(AggregateFunction::iter().map(|func| func.to_string()))
-            .collect()
-    };
-    find_closest_match(valid_funcs, input_function_name)
-}
-
-/// Find the closest matching string to the target string in the candidates list, using edit distance(case insensitve)
-/// Input `candidates` must not be empty otherwise it will panic
-fn find_closest_match(candidates: Vec<String>, target: &str) -> String {
-    let target = target.to_lowercase();
-    candidates
-        .into_iter()
-        .min_by_key(|candidate| {
-            datafusion_strsim::levenshtein(&candidate.to_lowercase(), &target)
-        })
-        .expect("No candidates provided.") // Panic if `candidates` argument is empty
-}
+/// [crate::udwf::WindowUDFImpl::simplify] simplifier closure
+/// A closure with two arguments:
+/// * 'window_function': [crate::expr::WindowFunction] for which simplified has been invoked
+/// * 'info': [crate::simplify::SimplifyInfo]
+///
+/// Closure returns simplified [Expr] or an error.
+pub type WindowFunctionSimplification = Box<
+    dyn Fn(
+        crate::expr::WindowFunction,
+        &dyn crate::simplify::SimplifyInfo,
+    ) -> Result<Expr>,
+>;

@@ -18,7 +18,7 @@
 //! Partition evaluation module
 
 use arrow::array::ArrayRef;
-use datafusion_common::{exec_err, not_impl_err, DataFusionError, Result, ScalarValue};
+use datafusion_common::{exec_err, not_impl_err, Result, ScalarValue};
 use std::fmt::Debug;
 use std::ops::Range;
 
@@ -135,7 +135,7 @@ pub trait PartitionEvaluator: Debug + Send {
     /// must produce an output column with one output row for every
     /// input row.
     ///
-    /// `num_rows` is requied to correctly compute the output in case
+    /// `num_rows` is required to correctly compute the output in case
     /// `values.len() == 0`
     ///
     /// Implementing this function is an optimization: certain window

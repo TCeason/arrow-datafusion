@@ -24,12 +24,12 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
-use parking_lot::Mutex;
-
 use chrono::{DateTime, Utc};
+use datafusion_common::instant::Instant;
+use parking_lot::Mutex;
 
 /// A counter to record things such as number of input or output rows
 ///
@@ -37,7 +37,7 @@ use chrono::{DateTime, Utc};
 #[derive(Debug, Clone)]
 pub struct Count {
     /// value of the metric counter
-    value: std::sync::Arc<AtomicUsize>,
+    value: Arc<AtomicUsize>,
 }
 
 impl PartialEq for Count {
@@ -86,7 +86,7 @@ impl Count {
 #[derive(Debug, Clone)]
 pub struct Gauge {
     /// value of the metric gauge
-    value: std::sync::Arc<AtomicUsize>,
+    value: Arc<AtomicUsize>,
 }
 
 impl PartialEq for Gauge {
@@ -168,7 +168,7 @@ impl PartialEq for Time {
 
 impl Display for Time {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        let duration = std::time::Duration::from_nanos(self.value() as u64);
+        let duration = Duration::from_nanos(self.value() as u64);
         write!(f, "{duration:?}")
     }
 }
@@ -313,7 +313,7 @@ pub struct ScopedTimerGuard<'a> {
     start: Option<Instant>,
 }
 
-impl<'a> ScopedTimerGuard<'a> {
+impl ScopedTimerGuard<'_> {
     /// Stop the timer timing and record the time taken
     pub fn stop(&mut self) {
         if let Some(start) = self.start.take() {
@@ -332,7 +332,7 @@ impl<'a> ScopedTimerGuard<'a> {
     }
 }
 
-impl<'a> Drop for ScopedTimerGuard<'a> {
+impl Drop for ScopedTimerGuard<'_> {
     fn drop(&mut self) {
         self.stop()
     }
@@ -364,13 +364,15 @@ pub enum MetricValue {
     /// Note 2: *Does* includes time when the thread could have made
     /// progress but the OS did not schedule it (e.g. due to CPU
     /// contention), thus making this value different than the
-    /// classical defintion of "cpu_time", which is the time reported
+    /// classical definition of "cpu_time", which is the time reported
     /// from `clock_gettime(CLOCK_THREAD_CPUTIME_ID, ..)`.
     ElapsedCompute(Time),
     /// Number of spills produced: "spill_count" metric
     SpillCount(Count),
     /// Total size of spilled bytes produced: "spilled_bytes" metric
     SpilledBytes(Count),
+    /// Total size of spilled rows produced: "spilled_rows" metric
+    SpilledRows(Count),
     /// Current memory used
     CurrentMemoryUsage(Gauge),
     /// Operator defined count.
@@ -407,6 +409,7 @@ impl MetricValue {
             Self::OutputRows(_) => "output_rows",
             Self::SpillCount(_) => "spill_count",
             Self::SpilledBytes(_) => "spilled_bytes",
+            Self::SpilledRows(_) => "spilled_rows",
             Self::CurrentMemoryUsage(_) => "mem_used",
             Self::ElapsedCompute(_) => "elapsed_compute",
             Self::Count { name, .. } => name.borrow(),
@@ -423,6 +426,7 @@ impl MetricValue {
             Self::OutputRows(count) => count.value(),
             Self::SpillCount(count) => count.value(),
             Self::SpilledBytes(bytes) => bytes.value(),
+            Self::SpilledRows(count) => count.value(),
             Self::CurrentMemoryUsage(used) => used.value(),
             Self::ElapsedCompute(time) => time.value(),
             Self::Count { count, .. } => count.value(),
@@ -448,6 +452,7 @@ impl MetricValue {
             Self::OutputRows(_) => Self::OutputRows(Count::new()),
             Self::SpillCount(_) => Self::SpillCount(Count::new()),
             Self::SpilledBytes(_) => Self::SpilledBytes(Count::new()),
+            Self::SpilledRows(_) => Self::SpilledRows(Count::new()),
             Self::CurrentMemoryUsage(_) => Self::CurrentMemoryUsage(Gauge::new()),
             Self::ElapsedCompute(_) => Self::ElapsedCompute(Time::new()),
             Self::Count { name, .. } => Self::Count {
@@ -481,6 +486,7 @@ impl MetricValue {
             (Self::OutputRows(count), Self::OutputRows(other_count))
             | (Self::SpillCount(count), Self::SpillCount(other_count))
             | (Self::SpilledBytes(count), Self::SpilledBytes(other_count))
+            | (Self::SpilledRows(count), Self::SpilledRows(other_count))
             | (
                 Self::Count { count, .. },
                 Self::Count {
@@ -526,12 +532,13 @@ impl MetricValue {
             Self::ElapsedCompute(_) => 1, // show second
             Self::SpillCount(_) => 2,
             Self::SpilledBytes(_) => 3,
-            Self::CurrentMemoryUsage(_) => 4,
-            Self::Count { .. } => 5,
-            Self::Gauge { .. } => 6,
-            Self::Time { .. } => 7,
-            Self::StartTimestamp(_) => 8, // show timestamps last
-            Self::EndTimestamp(_) => 9,
+            Self::SpilledRows(_) => 4,
+            Self::CurrentMemoryUsage(_) => 5,
+            Self::Count { .. } => 6,
+            Self::Gauge { .. } => 7,
+            Self::Time { .. } => 8,
+            Self::StartTimestamp(_) => 9, // show timestamps last
+            Self::EndTimestamp(_) => 10,
         }
     }
 
@@ -541,13 +548,14 @@ impl MetricValue {
     }
 }
 
-impl std::fmt::Display for MetricValue {
+impl Display for MetricValue {
     /// Prints the value of this metric
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             Self::OutputRows(count)
             | Self::SpillCount(count)
             | Self::SpilledBytes(count)
+            | Self::SpilledRows(count)
             | Self::Count { count, .. } => {
                 write!(f, "{count}")
             }

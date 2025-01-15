@@ -24,7 +24,7 @@ use sqlparser::ast::Expr as SQLExpr;
 use sqlparser::ast::Query;
 use std::sync::Arc;
 
-impl<'a, S: ContextProvider> SqlToRel<'a, S> {
+impl<S: ContextProvider> SqlToRel<'_, S> {
     pub(super) fn parse_exists_subquery(
         &self,
         subquery: Query,
@@ -33,7 +33,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         planner_context: &mut PlannerContext,
     ) -> Result<Expr> {
         let old_outer_query_schema =
-            planner_context.set_outer_query_schema(Some(input_schema.clone()));
+            planner_context.set_outer_query_schema(Some(input_schema.clone().into()));
         let sub_plan = self.query_to_plan(subquery, planner_context)?;
         let outer_ref_columns = sub_plan.all_out_ref_exprs();
         planner_context.set_outer_query_schema(old_outer_query_schema);
@@ -55,7 +55,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         planner_context: &mut PlannerContext,
     ) -> Result<Expr> {
         let old_outer_query_schema =
-            planner_context.set_outer_query_schema(Some(input_schema.clone()));
+            planner_context.set_outer_query_schema(Some(input_schema.clone().into()));
         let sub_plan = self.query_to_plan(subquery, planner_context)?;
         let outer_ref_columns = sub_plan.all_out_ref_exprs();
         planner_context.set_outer_query_schema(old_outer_query_schema);
@@ -77,7 +77,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         planner_context: &mut PlannerContext,
     ) -> Result<Expr> {
         let old_outer_query_schema =
-            planner_context.set_outer_query_schema(Some(input_schema.clone()));
+            planner_context.set_outer_query_schema(Some(input_schema.clone().into()));
         let sub_plan = self.query_to_plan(subquery, planner_context)?;
         let outer_ref_columns = sub_plan.all_out_ref_exprs();
         planner_context.set_outer_query_schema(old_outer_query_schema);
